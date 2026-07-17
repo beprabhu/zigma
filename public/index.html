@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SKU Compositor</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div class="app">
+  <header class="app-header">
+    <h1>SKU Compositor</h1>
+    <p class="sub">Bulk-generate composite product tiles with Azure GPT-Image-2</p>
+  </header>
+
+  <main class="layout">
+    <!-- LEFT: controls -->
+    <section class="panel controls">
+
+      <div class="block">
+        <label class="block-title">Template <button id="tplReset" class="tpl-reset" title="Reset template to default">Reset</button></label>
+        <div class="template-row">
+          <div class="template-left">
+            <canvas id="templateCanvas"></canvas>
+            <div id="layersList" class="layers-list"></div>
+          </div>
+          <div class="template-fields">
+            <label>Default title
+              <input type="text" id="tplTitle" value="Product title" />
+            </label>
+            <label>Default offer text
+              <input type="text" id="tplOffer" value="20% OFF" />
+            </label>
+            <label class="check"><input type="checkbox" id="tplOfferVisible" checked /> Show offer bar</label>
+            <div id="inspector" class="inspector"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="block">
+        <label class="block-title">CSV file</label>
+        <div id="dropZone" class="dropzone">
+          <input type="file" id="csvInput" accept=".csv,text/csv" hidden />
+          <span id="dropLabel">Drop CSV here or <u>browse</u></span>
+        </div>
+      </div>
+
+      <div class="block" id="settingsBlock" hidden>
+        <label class="block-title">Settings</label>
+        <div class="tabs">
+          <button class="tab active" data-tab="auto">Auto</button>
+          <button class="tab" data-tab="custom">Custom</button>
+        </div>
+        <div id="tab-auto" class="tab-content">
+          <div class="hint" id="autoSummary">—</div>
+        </div>
+        <div id="tab-custom" class="tab-content" hidden>
+          <label class="block-sub">Image URL columns</label>
+          <div id="colChecks" class="col-checks"></div>
+          <label class="block-sub">Title column
+            <select id="titleCol"><option value="">(none)</option></select>
+          </label>
+          <label class="block-sub">Offer / discount column
+            <select id="offerCol"><option value="">(none)</option></select>
+          </label>
+        </div>
+      </div>
+
+      <div class="block" id="queueBlock" hidden>
+        <label class="block-title">Queue <span id="queueCount"></span></label>
+        <div id="queueList" class="queue"></div>
+      </div>
+
+      <div class="block">
+        <label class="block-title">Prompt</label>
+        <textarea id="prompt" rows="5"></textarea>
+      </div>
+
+      <div class="block">
+        <label class="block-title">Keys</label>
+        <label class="block-sub">Azure endpoint
+          <input type="text" id="azureEndpoint" placeholder="https://kernel-krew-east-us-resource.services.ai.azure.com/openai/v1/images/edits" />
+        </label>
+        <label class="block-sub">Azure API key
+          <input type="password" id="azureKey" placeholder="Azure OpenAI key" />
+        </label>
+        <label class="block-sub">TinyPNG API key
+          <input type="password" id="tinyKey" placeholder="TinyPNG key (for compression)" />
+        </label>
+      </div>
+
+      <footer class="footer">
+        <button id="generateBtn" class="primary" disabled>Generate &amp; Populate</button>
+        <div id="progressWrap" class="progress-wrap" hidden>
+          <div class="progress"><div id="progressBar" class="bar"></div></div>
+          <div id="progressText" class="progress-text"></div>
+        </div>
+      </footer>
+    </section>
+
+    <!-- RIGHT: output grid -->
+    <section class="panel output">
+      <div class="output-head">
+        <label class="block-title">Generated tiles</label>
+        <div class="output-actions">
+          <button id="compressBtn" disabled>Compress with TinyPNG</button>
+          <button id="downloadBtn" class="primary" disabled>Download ZIP</button>
+        </div>
+      </div>
+      <div id="compressSummary" class="hint"></div>
+      <div id="tileGrid" class="tile-grid"></div>
+    </section>
+  </main>
+</div>
+<script src="csv.js"></script>
+<script src="tile.js"></script>
+<script src="zip.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

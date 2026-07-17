@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "zepto-preview-3060",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--prefix", "zepto-internal", "--", "--port", "3060"],
+      "port": 3060,
+      "autoPort": false
+    }
+  ]
+}
