@@ -1,0 +1,2057 @@
+'use client';
+
+import * as React from 'react';
+import { toast } from 'sonner';
+import {
+  CircleAlertIcon,
+  CircleStopIcon,
+  CloudDownloadIcon,
+  DownloadIcon,
+  ImagesIcon,
+  SaveIcon,
+  TriangleAlertIcon,
+  WandSparklesIcon,
+} from 'lucide-react';
+
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import {
+  Card, CardContent, CardFooter, CardHeader, CardTitle,
+} from '@/components/ui/card';
+import { Hint } from '@/components/hint';
+import { HintCardHeader } from '@/components/hint-card-header';
+import { Checkbox } from '@/components/ui/checkbox';
+import {
+  Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle,
+} from '@/components/ui/empty';
+import {
+  Field, FieldContent, FieldDescription, FieldGroup, FieldLabel,
+} from '@/components/ui/field';
+import { Input } from '@/components/ui/input';
+import { Progress } from '@/components/ui/progress';
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from '@/components/ui/select';
+import { Separator } from '@/components/ui/separator';
+import { Spinner } from '@/components/ui/spinner';
+import { Switch } from '@/components/ui/switch';
+import { Textarea } from '@/components/ui/textarea';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
+
+import { ProductHeader } from '@/components/product-header';
+import { ResultCell } from '@/components/result-cell';
+import {
+  CompareDialog, CutoutImage, SourceImage, backdropStyle, statusLine,
+} from '@/components/bg-remover/bg-queue-list';
+import { ImageDropzone, type CsvPayload } from '@/components/bg-remover/image-dropzone';
+import { SafeAreaControls } from '@/components/bg-remover/safe-area-controls';
+import { TilePreview } from '@/components/bg-remover/tile-preview';
+import { VirtualGrid } from '@/components/bg-remover/virtual-grid';
+
+import {
+  BG_MODELS, BG_MODEL_ORDER, DEFAULT_MODEL_ID, getModelBackend, isModelLoaded,
+  probeServerModel, removeBackground, warmModel,
+  type BgModelId, type LoadProgress, type RemoveResult, type RemoveStage,
+} from '@/lib/bg/engine';
+import {
+  DEFAULT_SAFE_AREA, TRANSPARENT, renderTile, scaleBounds, subjectBounds,
+  type SafeAreaConfig,
+} from '@/lib/bg/safe-area';
+import {
+  SETUP_HINT, canRetry, canvasToPngBlob, canvasToPngBytes, createItems, describeDownload, draftsFromCsv, errorMessage,
+  exportFileNames, extractTinifyKey, flattenOnBackground, formatKb, isAbortError,
+  decodeCutout, loadImageFromFile, looksLikeMissingWeights, mapWithLimit, needsCutout,
+  nextItemId, pickSave, previewScale, releaseCanvas, releaseItem, releaseOriginal, saveTo, withCutout,
+  type BgCutout, type BgItem, type BgItemDraft, type BgItemStatus, type CutoutItem,
+} from '@/lib/bg/batch';
+import { describeBudget, fitToBudget, type BudgetResult } from '@/lib/bg/budget';
+import { isPng8Supported } from '@/lib/bg/png8';
+import {
+  disposePool, getPoolBackend, isPoolSupported, poolRemoveBackground, warmPool,
+  type PoolCutout,
+} from '@/lib/bg/pool';
+import { PROJECT_EXTENSION, loadProject, saveProject } from '@/lib/bg/project';
+import { assessQuality, countFlagged, sortByQuality } from '@/lib/bg/quality';
+import { clearPreviews, dropPreview, usePreview } from '@/lib/bg/preview-store';
+import { STORE_TYPE } from '@/lib/bg/constants';
+import { callAzure, loadImageFromUrl, mockComposite } from '@/lib/pipeline';
+import { buildZip, type ZipFileEntry } from '@/lib/zip';
+import { cn } from '@/lib/utils';
+
+type BgTab = 'remove' | 'tile';
+
+// Pane height = viewport minus ProductHeader (h-12 + border), the tab bar (h-11 + border) and
+// the work grid's own vertical padding (p-5 top 1.25rem + pb-6 bottom 1.5rem). Same trick as
+// app/compositor/page.tsx — if any of those change, this arithmetic changes with them.
+const PANE_HEIGHT = 'calc(100dvh - 3rem - 1px - 2.75rem - 1px - 2.75rem)';
+
+const WHITE = '#ffffff';
+const DEFAULT_CUSTOM_BG = '#f4f4f5';
+// Select sentinel for "no name column" — Base UI Select values must be non-empty strings.
+const NONE = '__none__';
+// Two pooled workers plus two images decoding ahead of them.
+const POOL_CONCURRENCY = 4;
+// Bounds how many full-size canvases are encoding at once during export.
+const ENCODE_CONCURRENCY = 8;
+// TinyPNG rate-limits; stay well under the encode fan-out.
+const COMPRESS_CONCURRENCY = 4;
+// PNG size budget. The ceiling is tuned in 50 KB steps because that is the granularity the CDN
+// conversation happens at; MIN is a floor the export re-applies, since a number input does not
+// enforce `min` on a typed value.
+const BUDGET_KB_DEFAULT = 150;
+const BUDGET_KB_MIN = 50;
+const BUDGET_KB_STEP = 50;
+// Names listed in a budget toast before it collapses into "+N more".
+const BUDGET_TOAST_NAMES = 3;
+// Decode edges for the two tile previews. Both go through the shared preview cache.
+const TILE_PREVIEW_EDGE = 512;
+const TILE_CELL_EDGE = 256;
+// Result-grid geometry. Rows must be uniform for windowing, so these are fixed rather than
+// breakpoint-driven; the column count is measured from the pane width instead.
+const GRID_MIN_CELL = 150;
+const GRID_GAP = 14;
+// Two text lines now: the name and the status line the old queue rows carried.
+const GRID_LABEL_HEIGHT = 40;
+const TILE_CELL_HEIGHT = 236;
+/** Settings a single redo may override without touching the global ones. */
+interface RunOverrides {
+  model?: BgModelId;
+  refine?: boolean;
+}
+
+// Stable identities so the inactive tab's grid does not remount its (empty) contents.
+const EMPTY_ITEMS: BgItem[] = [];
+const EMPTY_CUTOUTS: CutoutItem[] = [];
+
+// Ships as the AI-edit prompt so the flow works out of the box. The reference image carries the
+// product's identity, so one generic prompt covers every SKU; fidelity comes first and loudest
+// because label drift (garbled pack text) is the model's main failure mode on catalogue work.
+const DEFAULT_AI_PROMPT = `Recreate this exact product as a clean e-commerce studio packshot.
+
+PRODUCT FIDELITY (most important):
+- Show EXACTLY what the reference shows, nothing more. If the product is unpackaged
+  (loose produce, a bare fruit or vegetable), it stays unpackaged — NEVER add any
+  packaging, wrapper, label, sticker, band, tag, or brand text that is not in the
+  reference. Inventing a brand or label is the worst possible failure.
+- If the reference DOES show packaging, keep it IDENTICAL: same shape, proportions,
+  colors, label layout, logos, and all printed text exactly as shown. Do not redesign,
+  restyle, translate, or invent any text or graphics on the pack.
+- If part of the product is cut off in the reference, complete it plausibly and
+  consistently with the visible portion (e.g. the base of a jar or bottle).
+
+SCENE:
+- Pure white seamless background (#FFFFFF), professional studio product photography.
+- Soft, even, diffused lighting; a subtle natural contact shadow under the product only.
+- Product centered, fully visible, front label facing camera, straight-on angle,
+  occupying about 80% of the frame with even margins on all sides.
+
+REMOVE EVERYTHING ELSE:
+- No props, no hands or people, no surfaces or tables, no plates, bowls or serving
+  dishes (unless the dish itself IS the product), no plants, no decorative items.
+- No added text, watermarks, badges, banners, or graphic overlays on the image.
+- Show the product plus at most ONE cut/open piece beside it — never scattered pieces
+  or repeated duplicates. Shrunk to a 40x40 thumbnail, the image must still read
+  instantly as this product.`;
+
+/** Parallel Azure requests during "AI-fix flagged" — enough to hide per-request latency
+ *  without tripping the deployment's rate limit. */
+const AI_EDIT_CONCURRENCY = 6;
+
+/** Padding around the hero region's bbox when focus-cropping the AI-edit reference. */
+const HERO_CROP_PAD = 0.08;
+/** Skip the crop when the hero already covers this much of the frame — nothing to gain. */
+const HERO_CROP_MAX_COVERAGE = 0.9;
+
+/**
+ * Crop the AI-edit reference down to the hero region before it goes to Azure.
+ *
+ * The images/edits endpoint anchors hard to the reference's composition: four prompt versions
+ * all failed to talk it out of reproducing a bowl of pieces sitting next to the product. The
+ * reliable fix is to never show it the props — crop to the largest region the matte kept (the
+ * product cluster) and the model cannot draw what it never saw. Falls back to the whole-subject
+ * bbox when product-only analysis didn't run, and to the uncropped source when there is no
+ * cutout data or the crop would keep ~the whole frame anyway. Known limit: pieces that touch
+ * the product merge into one region, and a crop cannot split those apart.
+ */
+async function cropToHero(item: BgItem, source: HTMLImageElement): Promise<HTMLImageElement> {
+  const cutout = item.cutout;
+  if (!cutout || !cutout.width || !cutout.height) return source;
+  const kept = item.regionReport?.filter((r) => !r.removed) ?? [];
+  const hero = kept.length
+    ? kept.reduce((m, r) => (r.area > m.area ? r : m)).bounds
+    : cutout.bounds;
+  if (!hero) return source;
+
+  // Region bounds live in cutout (post-cap) space; the reference is the original source image.
+  const sx = source.naturalWidth / cutout.width;
+  const sy = source.naturalHeight / cutout.height;
+  const padX = hero.w * HERO_CROP_PAD;
+  const padY = hero.h * HERO_CROP_PAD;
+  const x0 = Math.max(0, Math.floor((hero.x - padX) * sx));
+  const y0 = Math.max(0, Math.floor((hero.y - padY) * sy));
+  const x1 = Math.min(source.naturalWidth, Math.ceil((hero.x + hero.w + padX) * sx));
+  const y1 = Math.min(source.naturalHeight, Math.ceil((hero.y + hero.h + padY) * sy));
+  const w = x1 - x0;
+  const h = y1 - y0;
+  if (w < 2 || h < 2) return source;
+  if ((w * h) / (source.naturalWidth * source.naturalHeight) >= HERO_CROP_MAX_COVERAGE) {
+    return source;
+  }
+
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  c.getContext('2d')!.drawImage(source, x0, y0, w, h, 0, 0, w, h);
+  const url = c.toDataURL('image/png');
+  releaseCanvas(c);
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('Hero crop decode failed'));
+    img.src = url;
+  });
+}
+
+// localStorage-backed state. Reads after mount (not in the initializer) so the server-rendered
+// HTML matches the first client render and hydration stays clean. Copied from the compositor.
+function usePersistedState<T>(key: string, initial: T): [T, (v: T | ((p: T) => T)) => void] {
+  const [value, setValue] = React.useState<T>(initial);
+  React.useEffect(() => {
+    let saved: string | null = null;
+    try { saved = localStorage.getItem(key); } catch { /* private mode etc. */ }
+    if (saved !== null) {
+      try {
+        const parsed = JSON.parse(saved) as T;
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- one-time hydration from external store
+        setValue(parsed);
+      } catch {
+        if (typeof initial === 'string') {
+           
+          setValue(saved as unknown as T);
+        }
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const set = React.useCallback((v: T | ((p: T) => T)) => {
+    setValue((prev) => {
+      const next = typeof v === 'function' ? (v as (p: T) => T)(prev) : v;
+      try { localStorage.setItem(key, JSON.stringify(next)); } catch { /* quota / private mode */ }
+      return next;
+    });
+  }, [key]);
+  return [value, set];
+}
+
+export default function BgRemover() {
+  const [tab, setTab] = React.useState<BgTab>('remove');
+
+  // ---- Settings (persisted) ----
+  const [storedModel, setModelId] = usePersistedState<BgModelId>('skuc_bgModel', DEFAULT_MODEL_ID);
+  const [refine, setRefine] = usePersistedState('skuc_bgRefine', false);
+  // Second inference on a tight subject crop for sharper edges. Off by default: it doubles the
+  // per-image cost, which is the wrong trade for a batch.
+  const [highDetail, setHighDetail] = usePersistedState('skuc_bgHighDetail', false);
+  // Drops flat graphic panels (colour strips, badges) the matte kept as foreground. Off by
+  // default: it is a heuristic, so it only ever runs where it was asked for.
+  const [productOnly, setProductOnly] = usePersistedState('skuc_bgProductOnly', false);
+  const [outputBg, setOutputBg] = usePersistedState('skuc_bgOutput', TRANSPARENT);
+  const [safeArea, setSafeArea] = usePersistedState<SafeAreaConfig>('skuc_bgSafeArea', DEFAULT_SAFE_AREA);
+  // Shared with the compositor — the TinyPNG key is entered once for the whole suite.
+  const [tinyKey, setTinyKey] = usePersistedState('skuc_tinyKey', '');
+  // Azure credentials are the compositor's own keys, read from the same storage so the two
+  // products never hold different values; only the default prompt is this product's.
+  const [azureEndpoint, setAzureEndpoint] = usePersistedState('skuc_azureEndpoint', '');
+  const [azureKey, setAzureKey] = usePersistedState('skuc_azureKey', '');
+  // Crop the AI-edit reference to the hero region so the model never sees scene props. On by
+  // default — it is the only lever that has actually beaten the edit endpoint's layout anchor.
+  const [aiFocusCrop, setAiFocusCrop] = usePersistedState('skuc_bgAiFocusCrop', true);
+  const [storedAiPrompt, setAiPrompt] = usePersistedState('skuc_bgAiPrompt', DEFAULT_AI_PROMPT);
+  // A blank stored prompt (saved before the default existed, or cleared) falls back to the
+  // default — with a bulk AI-fix button on the page, "no prompt" must never be a reachable state.
+  const aiPrompt = storedAiPrompt.trim() ? storedAiPrompt : DEFAULT_AI_PROMPT;
+  // PNG file-size ceiling. Off by default: on, an export can lose colours or pixels, and that
+  // has to be something the user asked for rather than something they discover on the CDN.
+  const [budgetOn, setBudgetOn] = usePersistedState('skuc_bgBudgetOn', false);
+  const [budgetKb, setBudgetKb] = usePersistedState('skuc_bgBudgetKb', BUDGET_KB_DEFAULT);
+  const [budgetShrink, setBudgetShrink] = usePersistedState('skuc_bgBudgetShrink', true);
+  // Zero-padded position in front of each exported filename. On by default: one CSV row can
+  // yield several images sharing a title, and without it they collide inside the ZIP.
+  const [numberFiles, setNumberFiles] = usePersistedState('skuc_bgNumberFiles', true);
+
+  // isPng8Supported() reads a browser global, so it must not decide the server-rendered markup.
+  // Same mount-gate trick as components/theme-toggle.tsx.
+  const png8Ready = React.useSyncExternalStore(
+    React.useCallback(() => () => {}, []),
+    isPng8Supported,
+    () => false,
+  );
+  // A stored `true` must not arm the budget on a runtime that cannot quantise: without PNG-8 the
+  // ladder has no rungs, so the export would silently be today's export under a different label.
+  const budgetActive = budgetOn && png8Ready;
+  // `min` on a number input constrains the spinner, not what can be typed — and localStorage can
+  // hold anything at all — so the value the export actually uses is resolved here, not at edit
+  // time, where re-clamping on every keystroke would fight the user mid-type.
+  const budgetKbSafe = Number.isFinite(budgetKb)
+    ? Math.max(BUDGET_KB_MIN, Math.round(budgetKb))
+    : BUDGET_KB_DEFAULT;
+
+  // ---- Queue ----
+  const [items, setItems] = React.useState<BgItem[]>([]);
+  const [selectedId, setSelectedId] = React.useState<number | null>(null);
+  // Display-only reordering for the results grid — never touches `items`, so export naming and
+  // retry-by-id are unaffected. Worst-first; ties keep queue order (Array#sort is stable).
+  const [qualitySort, setQualitySort] = React.useState(false);
+  const flaggedCount = React.useMemo(() => countFlagged(items), [items]);
+  // What "AI-fix flagged" operates on. Archived items are excluded — they have no original
+  // image left to send to the model.
+  const flaggedItems = React.useMemo(
+    () => items.filter((item) => canRetry(item) && assessQuality(item).level !== 'ok'),
+    [items],
+  );
+  const displayItems = React.useMemo(
+    () => (qualitySort ? sortByQuality(items) : items),
+    [items, qualitySort],
+  );
+
+  // ---- Run state ----
+  const [running, setRunning] = React.useState(false);
+  const [exporting, setExporting] = React.useState(false);
+  const [warming, setWarming] = React.useState(false);
+  /** True while "AI-fix flagged" is mid-flight through Azure (before the re-removal batch). */
+  const [aiFixing, setAiFixing] = React.useState(false);
+  const [progress, setProgress] = React.useState<{ pct: number; text: string } | null>(null);
+  const [download, setDownload] = React.useState<LoadProgress | null>(null);
+  const [stage, setStage] = React.useState<RemoveStage | null>(null);
+  const [setupError, setSetupError] = React.useState<string | null>(null);
+  const [compressSummary, setCompressSummary] = React.useState('');
+
+  // ---- Model availability ----
+  const [serverUp, setServerUp] = React.useState<boolean | null>(null);
+  // isModelLoaded() reads a module cache that React cannot subscribe to; this list is what
+  // re-renders the "ready" affordance after a download finishes.
+  const [loadedModels, setLoadedModels] = React.useState<BgModelId[]>([]);
+
+  // Each tab has its own results pane element; the grids window against whichever is mounted.
+  const removeScrollRef = React.useRef<HTMLDivElement>(null);
+  const tileScrollRef = React.useRef<HTMLDivElement>(null);
+
+  const abortRef = React.useRef<AbortController | null>(null);
+  // The run loop reads the queue across awaits, so it needs the committed value, not a closure.
+  const itemsRef = React.useRef<BgItem[]>(items);
+  React.useEffect(() => { itemsRef.current = items; }, [items]);
+
+  // Leaving the product must stop inference (the models hold the main thread otherwise) and hand
+  // back every object URL the decoded originals are holding — a client-side route change keeps
+  // the document alive, so nothing else ever revokes them.
+  React.useEffect(
+    () => () => {
+      abortRef.current?.abort();
+      itemsRef.current.forEach(releaseItem);
+      // Decoded previews are cache-owned; nothing else would ever close them.
+      clearPreviews();
+      // Pooled workers hold a model instance each; leaving them alive would pin GPU memory
+      // for the rest of the session.
+      disposePool();
+    },
+    [],
+  );
+
+  React.useEffect(() => {
+    const ctrl = new AbortController();
+    probeServerModel(ctrl.signal).then(setServerUp, () => setServerUp(false));
+    return () => ctrl.abort();
+  }, []);
+
+  // A persisted id can be stale (a model that no longer exists) or momentarily unusable (rmbg2
+  // while the sidecar is down). Both are resolved here rather than written back, so the stored
+  // choice returns by itself the moment the sidecar answers again.
+  const knownModel = BG_MODELS[storedModel] ? storedModel : DEFAULT_MODEL_ID;
+  const serverBlocked = serverUp === false && BG_MODELS[knownModel].server === true;
+  const modelId = serverBlocked ? DEFAULT_MODEL_ID : knownModel;
+
+  const spec = BG_MODELS[modelId];
+  // The sidecar model has no worker path, and neither does a browser without OffscreenCanvas.
+  const usePool = isPoolSupported() && !spec.server;
+  const modelReady = isModelLoaded(modelId) || loadedModels.includes(modelId);
+  // Resolved fresh each render: any load completing bumps loadedModels, which re-renders.
+  // Batches run in the pool, so its workers are the ones that know the real backend; the
+  // main-thread engine only reports when it has loaded the model itself.
+  const backend = (usePool ? getPoolBackend() : null) ?? getModelBackend(modelId);
+  const backendLabel =
+    backend === 'webgpu' ? 'GPU' : backend === 'wasm' ? 'CPU' : backend === 'server' ? 'server' : '';
+  const busy = running || exporting || warming || aiFixing;
+
+  // Offered in the compare dialog's redo picker. Mirrors the main model select, including the
+  // sidecar being unavailable, but choosing one here does not change the global setting.
+  const redoModels = React.useMemo(
+    () =>
+      BG_MODEL_ORDER.map((id) => {
+        const option = BG_MODELS[id];
+        const offline = option.server === true && serverUp !== true;
+        return {
+          id,
+          label: option.label,
+          disabled: offline,
+          hint: offline ? 'Local sidecar is not running' : option.description,
+        };
+      }),
+    [serverUp],
+  );
+
+  const cutouts = React.useMemo(() => withCutout(items), [items]);
+  const pending = React.useMemo(() => items.filter(needsCutout), [items]);
+  const selected = React.useMemo(
+    // Falls back to the first finished cutout so the tile preview always has a subject.
+    () => cutouts.find((item) => item.id === selectedId) ?? cutouts.at(0) ?? null,
+    [cutouts, selectedId],
+  );
+  // The preview's fallback must not drive the highlight: clicking a row that has no cutout yet
+  // would otherwise ring a different, already-finished row.
+  const highlightId = selectedId ?? selected?.id ?? null;
+  // The tile preview draws the small preview bitmap, so the bbox has to come along in the same
+  // coordinate space; bounds themselves are stored at full resolution for export.
+  // The tile preview draws a decoded preview, so the bbox has to be mapped into that same
+  // coordinate space; bounds themselves stay at full resolution for export.
+  const selectedPreview = usePreview(
+    selected?.cutout ? { key: selected.id, blob: selected.cutout.blob, edge: TILE_PREVIEW_EDGE } : null,
+  );
+  const selectedPreviewBounds = React.useMemo(() => {
+    const cutout = selected?.cutout;
+    if (!cutout?.bounds || !selectedPreview) return null;
+    return scaleBounds(cutout.bounds, previewScale(cutout, selectedPreview));
+  }, [selected, selectedPreview]);
+
+  // Stable so the memoised result cells are not invalidated on every render.
+  const selectById = React.useCallback((id: number) => setSelectedId(id), []);
+  const removeById = React.useCallback((id: number) => {
+    const item = itemsRef.current.find((it) => it.id === id);
+    if (!item) return;
+    releaseItem(item);
+    dropPreview(item.id);
+    setItems((prev) => prev.filter((it) => it.id !== item.id));
+    setSelectedId((prev) => (prev === item.id ? null : prev));
+  }, []);
+
+  // The before/after dialog lives here rather than inside the queue list, so a click on a result
+  // image opens the same one. Held by id: the item object is replaced on every status patch,
+  // which is exactly what lets the dialog update live during a redo.
+  const [compareId, setCompareId] = React.useState<number | null>(null);
+  const compareIndex = items.findIndex((it) => it.id === compareId);
+  const compareItem = compareIndex < 0 ? null : items[compareIndex];
+  const compareById = React.useCallback((id: number) => setCompareId(id), []);
+
+  const patchItem = React.useCallback((id: number, patch: Partial<BgItem>) => {
+    setItems((prev) => prev.map((item) => (item.id === id ? { ...item, ...patch } : item)));
+  }, []);
+
+  const handleAdd = React.useCallback((drafts: BgItemDraft[]) => {
+    setItems((prev) => [...prev, ...createItems(drafts, nextItemId(prev))]);
+  }, []);
+
+  // ---- CSV column mapping ----
+  // The page owns CSV imports (not the dropzone) so the user can remap which column names the
+  // images and which columns hold URLs. One CSV batch at a time: remapping — or dropping a new
+  // CSV — replaces the previous CSV's items while file/paste items stay untouched.
+  const [csvInfo, setCsvInfo] = React.useState<{
+    fileName: string;
+    text: string;
+    headers: string[];
+    imageColumns: string[];
+    nameColumn: string;
+  } | null>(null);
+  const replaceCsvItems = React.useCallback((drafts: BgItemDraft[]) => {
+    // Everything is computed OUTSIDE the updater: updaters must be pure, and StrictMode runs
+    // them twice. CSV membership is the source kind itself — URLs only ever enter through a
+    // CSV, so kind 'url' IS "belongs to the current CSV" and no id bookkeeping can go stale.
+    const current = itemsRef.current;
+    const prevCsv = current.filter((it) => it.source.kind === 'url');
+
+    // Remapping must not throw finished work away. Rows are matched to the new drafts by URL:
+    // a name-column change maps every row onto itself and only renames it, cutouts intact; an
+    // image-column change keeps whatever URLs survive. Duplicate URLs pair off in order — the
+    // cursor map walks each URL's rows front to back.
+    const byUrl = new Map<string, BgItem[]>();
+    for (const it of prevCsv) {
+      if (it.source.kind !== 'url') continue;
+      const list = byUrl.get(it.source.url);
+      if (list) list.push(it);
+      else byUrl.set(it.source.url, [it]);
+    }
+    const cursor = new Map<string, number>();
+    const reused = new Set<number>();
+    let nextId = nextItemId(current);
+    const fresh: BgItem[] = [];
+    for (const draft of drafts) {
+      let match: BgItem | undefined;
+      if (draft.source.kind === 'url') {
+        const list = byUrl.get(draft.source.url);
+        const at = cursor.get(draft.source.url) ?? 0;
+        if (list && at < list.length) {
+          match = list[at];
+          cursor.set(draft.source.url, at + 1);
+        }
+      }
+      if (match) {
+        reused.add(match.id);
+        fresh.push(match.name === draft.name ? match : { ...match, name: draft.name });
+      } else {
+        fresh.push(createItems([draft], nextId)[0]);
+        nextId += 1;
+      }
+    }
+
+    // Both halves matter for the rows that did NOT survive: releaseItem frees the decoded
+    // original, dropPreview frees whatever the preview cache holds for that id.
+    for (const it of prevCsv) {
+      if (reused.has(it.id)) continue;
+      releaseItem(it);
+      dropPreview(it.id);
+    }
+    const kept = current.filter((it) => it.source.kind !== 'url');
+    setItems([...kept, ...fresh]);
+  }, []);
+
+  const handleCsv = React.useCallback(
+    ({ fileName, text, imported }: CsvPayload) => {
+      setCsvInfo({
+        fileName,
+        text,
+        headers: imported.headers,
+        imageColumns: imported.imageColumns,
+        nameColumn: imported.titleColumn,
+      });
+      replaceCsvItems(imported.drafts);
+      if (!imported.drafts.length) {
+        toast.warning(`No image URLs auto-detected in ${fileName} — pick the columns below.`);
+      }
+    },
+    [replaceCsvItems],
+  );
+
+  function updateCsvMapping(next: { nameColumn?: string; imageColumns?: string[] }) {
+    if (!csvInfo) return;
+    const nameColumn = next.nameColumn ?? csvInfo.nameColumn;
+    const imageColumns = next.imageColumns ?? csvInfo.imageColumns;
+    const imported = draftsFromCsv(csvInfo.text, { nameColumn: nameColumn || null, imageColumns });
+    setCsvInfo({ ...csvInfo, nameColumn, imageColumns });
+    replaceCsvItems(imported.drafts);
+    if (!imported.drafts.length) toast.warning('No image URLs under the selected columns.');
+  }
+
+  // ---- Working file (.zesku): everything needed to resume tile fitting later -------------
+  async function handleSaveProject() {
+    const ready = withCutout(itemsRef.current);
+    if (!ready.length || busy) return;
+    const projectName = `zesku-project-${new Date().toISOString().slice(0, 10)}${PROJECT_EXTENSION}`;
+    const dest = await pickSave(projectName);
+    if (dest === 'cancelled') return;
+    setExporting(true);
+    try {
+      const blob = await saveProject(ready, safeArea, outputBg);
+      await saveTo(dest, blob, projectName);
+      const skipped = itemsRef.current.length - ready.length;
+      toast.success(
+        `Saved ${ready.length} cutout${ready.length === 1 ? '' : 's'} with bounds and safe-area settings${skipped ? ` (${skipped} unprocessed item${skipped === 1 ? '' : 's'} not included)` : ''}.`,
+      );
+    } catch (e) {
+      toast.error(`Could not save the project: ${errorMessage(e)}`);
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  async function handleProject(file: File) {
+    if (busy) return;
+    setExporting(true);
+    try {
+      const restored = await loadProject(file);
+      // Ids are allocated inside the updater from `prev`, like handleAdd. itemsRef lags the
+      // committed queue until its sync effect runs, so a base taken from it here could collide
+      // with ids handed out in that window (duplicate keys, patch/release cross-talk).
+      setItems((prev) => {
+        const base = nextItemId(prev);
+        return [
+          ...prev,
+          ...restored.items.map(
+            (r, i): BgItem => ({
+              id: base + i,
+              name: r.name,
+              source: r.source,
+              original: null,
+              cutout: r.cutout,
+              status: 'done',
+            }),
+          ),
+        ];
+      });
+      setSafeArea(restored.safeArea);
+      setOutputBg(restored.outputBg);
+      setTab('tile');
+      const count = restored.items.length;
+      toast.success(
+        `${file.name}: restored ${count} cutout${count === 1 ? '' : 's'} — safe-area settings applied, ready for tile fit.`,
+      );
+    } catch (e) {
+      toast.error(errorMessage(e));
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  // ---- Processing --------------------------------------------------------
+
+  /**
+   * Brings a main-thread engine result into the same compressed shape the workers produce, so
+   * the fallback path (no workers, or the sidecar model) stores no more than the pooled one.
+   */
+  async function toCutout(result: RemoveResult): Promise<PoolCutout> {
+    const blob = await new Promise<Blob>((resolve, reject) =>
+      result.canvas.toBlob(
+        (b) => (b ? resolve(b) : reject(new Error('Encoding the cutout failed'))),
+        STORE_TYPE,
+        1,
+      ),
+    );
+    const bounds = subjectBounds(result.pixels);
+    // The engine's canvas is a full-resolution buffer we are done with.
+    releaseCanvas(result.canvas);
+    return {
+      blob,
+      bounds,
+      width: result.width,
+      height: result.height,
+      durationMs: result.durationMs,
+      backend: result.backend,
+      model: result.model,
+      removedRegions: result.removedRegions,
+      // The main-thread engine does not run band detection; the pooled worker path does.
+      bands: [],
+      regionReport: result.regionReport,
+    };
+  }
+
+  function decodeOriginal(item: BgItem): Promise<HTMLImageElement> {
+    if (item.original) return Promise.resolve(item.original);
+    if (item.source.kind === 'file') return loadImageFromFile(item.source.file);
+    if (item.source.kind === 'url') return loadImageFromUrl(item.source.url);
+    // Unreachable through the UI (retry is disabled for archived items) but a plain error
+    // beats a crash if a new code path ever gets here.
+    return Promise.reject(new Error('This item was restored from a project — the original was not saved.'));
+  }
+
+  async function cutOut(
+    item: BgItem,
+    signal: AbortSignal,
+    preloaded?: Promise<HTMLImageElement>,
+    overrides?: RunOverrides,
+  ) {
+    // A redo from the compare dialog picks its own settings without touching the global ones.
+    const runModel = overrides?.model ?? modelId;
+    const runRefine = overrides?.refine ?? refine;
+    patchItem(item.id, {
+      status: modelReady ? 'removing' : 'loading-model',
+      error: undefined,
+    });
+    const original = await (preloaded ?? decodeOriginal(item));
+    patchItem(item.id, { original });
+
+    // Every stage fires a callback, but the row only has two states to show. Patching on each
+    // one rebuilt the items array several times per image — pure re-render cost with nothing
+    // new on screen — so a no-op patch is skipped here.
+    let shown: BgItemStatus | null = null;
+    const showStatus = (next: BgItemStatus) => {
+      if (shown === next) return;
+      shown = next;
+      patchItem(item.id, { status: next });
+    };
+
+    const shared = {
+      model: runModel,
+      refine: runRefine,
+      zoomPass: highDetail,
+      productOnly,
+      signal,
+      onLoadProgress: setDownload,
+      onStage: (next: RemoveStage) => {
+        setStage(next);
+        if (next === 'loading') {
+          showStatus('loading-model');
+          return;
+        }
+        // Weights are resident by the time inference starts; drop the download line.
+        setDownload(null);
+        if (next !== 'done') showStatus('removing');
+      },
+    };
+    // Pooled workers keep the GPU fed across images; the main-thread engine is the fallback
+    // when workers/OffscreenCanvas are unavailable, and the only path for the server model.
+    const produced: PoolCutout = usePool
+      ? await poolRemoveBackground(original, shared)
+      : await toCutout(await removeBackground(original, shared));
+
+    // The decoded original is the largest thing an item holds and nothing needs it once a
+    // cutout exists — the before/after view re-decodes from item.source on demand.
+    // `item` is the snapshot the run loop captured, taken BEFORE the decode, so its `original`
+    // is still null; releasing it must be handed the element we actually decoded or the object
+    // URL loadImageFromFile minted is never revoked.
+    releaseOriginal({ ...item, original });
+    patchItem(item.id, {
+      cutout: {
+        blob: produced.blob,
+        bounds: produced.bounds,
+        width: produced.width,
+        height: produced.height,
+      },
+      original: null,
+      status: 'done',
+      durationMs: produced.durationMs,
+      removedRegions: produced.removedRegions,
+      regionReport: produced.regionReport,
+      error: undefined,
+    });
+    setLoadedModels((prev) => (prev.includes(runModel) ? prev : [...prev, runModel]));
+  }
+
+  async function runBatchInner(
+    targets: BgItem[],
+    verb: string,
+    ctrl: AbortController,
+    overrides?: RunOverrides,
+  ) {
+    let done = 0;
+    let failed = 0;
+    let cancelled = false;
+
+    // How many images may be in flight. Pooled: enough to keep both workers busy plus a couple
+    // decoding ahead, so the GPU never waits on a fetch. Unpooled: strictly one, since a single
+    // main-thread engine gains nothing from overlap and only inflates peak memory.
+    const inFlight = usePool ? POOL_CONCURRENCY : 1;
+    let started = 0;
+    let finished = 0;
+
+    const settleOne = (item: BgItem, e?: unknown) => {
+      finished++;
+      if (!e) {
+        done++;
+      } else if (isAbortError(e)) {
+        patchItem(item.id, { status: 'cancelled' });
+        cancelled = true;
+      } else {
+        // One bad image must never end the batch.
+        const message = errorMessage(e);
+        failed++;
+        patchItem(item.id, { status: 'error', error: message });
+        // A dead image URL also says 404/fetch — only blame the weights when the model
+        // itself never became resident.
+        if (!isModelLoaded(modelId) && looksLikeMissingWeights(message)) setSetupError(message);
+        toast.error(`${item.name || 'Image'}: ${message}`);
+      }
+      setProgress({
+        pct: (finished / targets.length) * 100,
+        text: `${verb} ${Math.min(finished + 1, targets.length)} of ${targets.length}`,
+      });
+    };
+
+    // A promise-per-lane worker loop: each lane pulls the next index until the queue drains,
+    // which keeps exactly `inFlight` images alive regardless of how uneven their run times are.
+    const lane = async () => {
+      for (;;) {
+        if (ctrl.signal.aborted) {
+          cancelled = true;
+          return;
+        }
+        const index = started++;
+        if (index >= targets.length) return;
+        const item = targets[index];
+        try {
+          await cutOut(item, ctrl.signal, undefined, overrides);
+          settleOne(item);
+        } catch (e) {
+          settleOne(item, e);
+          if (isAbortError(e)) return;
+        }
+      }
+    };
+
+    await Promise.all(Array.from({ length: Math.min(inFlight, targets.length) }, lane));
+
+    setDownload(null);
+    setStage(null);
+    setProgress({
+      pct: 100,
+      text: cancelled
+        ? `Cancelled — ${done} finished, ${targets.length - done} left in the queue.`
+        : failed
+          ? `${done} of ${targets.length} done, ${failed} failed.`
+          : `${done} of ${targets.length} done.`,
+    });
+  }
+
+  async function runBatch(targets: BgItem[], verb: string, overrides?: RunOverrides) {
+    if (busy || !targets.length) return;
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    setRunning(true);
+    setSetupError(null);
+    setCompressSummary('');
+    try {
+      await runBatchInner(targets, verb, ctrl, overrides);
+    } finally {
+      // The lock must release even if something outside cutOut's own catch throws, or every
+      // button on the page stays disabled until a reload — which also drops the queue.
+      setRunning(false);
+      abortRef.current = null;
+    }
+  }
+
+  function handleRun() {
+    void runBatch(pending, tab === 'tile' ? 'Preparing' : 'Removing');
+  }
+
+  function aiEditGuards(): { prompt: string; mock: boolean } | null {
+    // aiPrompt always resolves (blank falls back to DEFAULT_AI_PROMPT), so only the
+    // credentials can block an edit.
+    const prompt = aiPrompt.trim();
+    const mock =
+      typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('mock');
+    if (!mock && (!azureEndpoint.trim() || !azureKey.trim())) {
+      toast.error('Enter the Azure endpoint and API key (shared with the Compositor), or use ?mock=1.');
+      return null;
+    }
+    return { prompt, mock };
+  }
+
+  /**
+   * One image through Azure: the generated image REPLACES the item's source, so every later
+   * step — thumbnails, a redo, exports, a saved project — sees the updated image and never the
+   * old one. Returns the updated item (background not yet re-removed), or null on failure —
+   * failures mark the item and keep going, one bad request must not sink a batch.
+   */
+  async function aiEditOne(item: BgItem, prompt: string, mock: boolean): Promise<BgItem | null> {
+    patchItem(item.id, { status: 'editing', error: undefined });
+    try {
+      const src = item.source;
+      if (src.kind === 'archived') return null; // callers exclude this via canRetry
+      const loaded =
+        src.kind === 'url' ? await loadImageFromUrl(src.url) : await loadImageFromFile(src.file);
+      const source = aiFocusCrop ? await cropToHero(item, loaded) : loaded;
+      const edited = mock
+        ? await mockComposite([source])
+        : await callAzure([source], {
+            endpoint: azureEndpoint,
+            apiKey: azureKey,
+            prompt,
+            quality: 'medium',
+            // The focus crop makes the reference non-square; without an explicit size the
+            // edits endpoint mirrors that aspect and returns rectangular images.
+            size: '1024x1024',
+          });
+
+      const canvas = document.createElement('canvas');
+      canvas.width = edited.naturalWidth;
+      canvas.height = edited.naturalHeight;
+      canvas.getContext('2d')!.drawImage(edited, 0, 0);
+      const blob = await canvasToPngBlob(canvas);
+      releaseCanvas(canvas);
+      const file = new File([blob], `${item.name || 'image'}-ai-edit.png`, { type: 'image/png' });
+
+      dropPreview(item.id);
+      const updated: BgItem = {
+        ...item,
+        source: { kind: 'file', file },
+        original: edited,
+        cutout: null,
+        status: 'ready',
+        error: undefined,
+        durationMs: undefined,
+      };
+      patchItem(item.id, updated);
+      return updated;
+    } catch (e) {
+      patchItem(item.id, { status: 'error', error: `AI edit failed: ${errorMessage(e)}` });
+      return null;
+    }
+  }
+
+  /** ?mock=1 short-circuits Azure, same as the compositor. */
+  async function handleAiEdit(item: BgItem) {
+    if (busy || item.status === 'editing' || !canRetry(item)) return;
+    const guards = aiEditGuards();
+    if (!guards) return;
+    const updated = await aiEditOne(item, guards.prompt, guards.mock);
+    if (!updated) {
+      toast.error('AI edit failed — see the image for the error.');
+      return;
+    }
+    await runBatch([updated], 'AI edit');
+  }
+
+  /**
+   * Every quality-flagged image through Azure, AI_EDIT_CONCURRENCY at a time, then one normal
+   * removal batch over the regenerated images. Per-image failures mark their own tile and never
+   * stop the rest; the re-removal only sees the successes.
+   */
+  async function handleAiEditFlagged() {
+    if (busy || !flaggedItems.length) return;
+    const guards = aiEditGuards();
+    if (!guards) return;
+    setAiFixing(true);
+    let finished = 0;
+    setProgress({ pct: 0, text: `AI edit 1 of ${flaggedItems.length}` });
+    try {
+      const results = await mapWithLimit(flaggedItems, AI_EDIT_CONCURRENCY, async (item) => {
+        const updated = await aiEditOne(item, guards.prompt, guards.mock);
+        finished++;
+        setProgress({
+          pct: (finished / flaggedItems.length) * 100,
+          text: `AI edit ${Math.min(finished + 1, flaggedItems.length)} of ${flaggedItems.length}`,
+        });
+        return updated;
+      });
+      const updated = results.filter((r): r is BgItem => r !== null);
+      const failed = flaggedItems.length - updated.length;
+      if (failed) {
+        toast.error(`${failed} AI edit${failed === 1 ? '' : 's'} failed — their tiles show the error.`);
+      }
+      // Release the lock BEFORE the removal batch: runBatch takes running for itself, and this
+      // handler's stale `busy` closure would otherwise not matter — but the flag must not
+      // outlive the Azure phase it describes.
+      setAiFixing(false);
+      if (updated.length) await runBatch(updated, 'Re-removing');
+    } finally {
+      setAiFixing(false);
+    }
+  }
+
+  function handleRetry(item: BgItem, overrides?: RunOverrides) {
+    if (busy) return;
+    // The cache owns decoded previews; drop this item's so a redo does not show the old one.
+    dropPreview(item.id);
+    const reset: BgItem = {
+      ...item,
+      cutout: null,
+      status: 'ready',
+      error: undefined,
+      durationMs: undefined,
+    };
+    patchItem(item.id, reset);
+    void runBatch([reset], 'Redoing', overrides);
+  }
+
+  function handleCancel() {
+    abortRef.current?.abort();
+    // from_pretrained takes no signal, so a download in flight runs to completion and the abort
+    // only lands at the next checkpoint. Say so, or a 452 MB fetch looks like a hung button.
+    if (stage === 'loading') {
+      toast.info('Cancelling — the model download has to finish first.');
+    }
+  }
+
+  async function handleWarm() {
+    if (spec.server || modelReady || busy) return;
+    setWarming(true);
+    setSetupError(null);
+    try {
+      await warmModel(modelId, setDownload);
+      // Each pooled worker loads its own copy; doing it now means a batch starts at full speed
+      // instead of stalling on the first two images.
+      if (usePool) await warmPool(modelId);
+      setLoadedModels((prev) => (prev.includes(modelId) ? prev : [...prev, modelId]));
+      toast.success(`${spec.label} is loaded and ready.`);
+    } catch (e) {
+      const message = errorMessage(e);
+      if (looksLikeMissingWeights(message)) setSetupError(message);
+      toast.error(`${spec.label}: ${message}`);
+    } finally {
+      setDownload(null);
+      setWarming(false);
+    }
+  }
+
+  // ---- Export: render, optionally compress, zip ---------------------------
+
+  async function handleExport() {
+    const ready = withCutout(itemsRef.current);
+    if (!ready.length || busy) return;
+    const key = extractTinifyKey(tinyKey);
+    const tiles = tab === 'tile';
+    // The save dialog opens now, while the click still counts as user activation — after
+    // minutes of encoding Chrome would refuse it. Cancelling the dialog cancels the export.
+    const zipName = tiles ? 'safe-area-tiles.zip' : 'bg-cutouts.zip';
+    const dest = await pickSave(zipName);
+    if (dest === 'cancelled') return;
+    // Snapshotted once: editing the ceiling mid-export must not give the ZIP two different rules.
+    const budget = budgetActive
+      ? { maxBytes: budgetKbSafe * 1024, allowDownscale: budgetShrink, dither: false }
+      : null;
+
+    setExporting(true);
+    setCompressSummary('');
+    const files: ZipFileEntry[] = [];
+    let inTotal = 0;
+    let outTotal = 0;
+    let failed = 0;
+
+    try {
+      // canvas.toBlob's latency is per-call and overlaps almost perfectly across calls, so
+      // encoding sequentially made a batch wait N times over for work that costs the same done
+      // at once. The limit is what bounds peak memory: at most this many full-size canvases and
+      // their encoded copies are alive together.
+      let encoded = 0;
+      // One slot per file, filled in whatever order the lanes finish; null means the budget was
+      // off for this run, so nothing about the file was negotiated.
+      const outcomes = new Array<BudgetResult | null>(ready.length).fill(null);
+      const pngs = await mapWithLimit(ready, ENCODE_CONCURRENCY, async (item, n) => {
+        // Cutouts are stored compressed, so export decodes the master back to full resolution
+        // here — briefly, for one image at a time per lane — rather than keeping every image's
+        // pixels alive for the whole session.
+        const full = await decodeCutout(item.cutout);
+        try {
+          const canvas = tiles
+            ? renderTile(full, safeArea, { bounds: item.cutout.bounds })
+            : flattenOnBackground(full, outputBg);
+          // fitToBudget owns the encode when the budget is on: its first rung is the same
+          // truecolor PNG canvasToPngBytes produces, so a file that already fits is byte-identical
+          // to today's export and only a miss costs anything.
+          const budgeted = budget ? await fitToBudget(canvas, budget) : null;
+          outcomes[n] = budgeted;
+          const data = budgeted ? budgeted.bytes : await canvasToPngBytes(canvas);
+          releaseCanvas(canvas);
+          encoded++;
+          // The compress half only exists when a TinyPNG key is set; without one the encode
+          // stage owns the whole bar, or it would stall at 50% until the run ended.
+          const span = key ? 50 : 100;
+          setProgress({
+            pct: (encoded / ready.length) * span,
+            text: `Encoding ${encoded} of ${ready.length}…`,
+          });
+          return data;
+        } finally {
+          full.close();
+        }
+      });
+
+      // TinyPNG is a rate-limited third-party API, so this stays deliberately narrower than the
+      // encode fan-out. A failure here keeps the uncompressed PNG rather than dropping an image.
+      let compressed = 0;
+      const finalBytes = key
+        ? await mapWithLimit(pngs, COMPRESS_CONCURRENCY, async (data, n) => {
+            try {
+              const res = await fetch('/api/compress', {
+                method: 'POST',
+                headers: { 'x-tinify-key': key, 'Content-Type': 'application/octet-stream' },
+                body: data as unknown as BodyInit,
+              });
+              if (!res.ok) {
+                const detail = (await res.json().catch(() => null)) as { error?: string } | null;
+                throw new Error(detail?.error || `Compression failed (${res.status})`);
+              }
+              const out = new Uint8Array(await res.arrayBuffer());
+              inTotal += data.length;
+              outTotal += out.length;
+              return out;
+            } catch (e) {
+              failed++;
+              toast.error(`${ready[n].name || `Image ${n + 1}`}: ${errorMessage(e)}`);
+              return data;
+            } finally {
+              compressed++;
+              setProgress({
+                pct: 50 + (compressed / ready.length) * 50,
+                text: `Compressing ${compressed} of ${ready.length} with TinyPNG…`,
+              });
+            }
+          })
+        : pngs;
+
+      const names = exportFileNames(
+        ready.map((item) => item.name),
+        { numbered: numberFiles },
+      );
+      ready.forEach((item, n) => files.push({ name: names[n], data: finalBytes[n] }));
+
+      // Quantising and downscaling leave no mark on the file itself, so this report is the only
+      // place a user can learn a tile was degraded — anything unsaid here gets discovered on the
+      // CDN instead.
+      const fitted = outcomes
+        .map((result, index) => ({ result, index }))
+        .filter((entry): entry is { result: BudgetResult; index: number } => entry.result !== null);
+      const shrunk = fitted.filter((entry) => entry.result.scale !== 1);
+      // Judged on the bytes that actually go into the ZIP, not on what the ladder returned:
+      // TinyPNG runs after the budget pass and can pull a near-miss back under the ceiling.
+      const missed = fitted.filter((entry) => finalBytes[entry.index].length > budgetKbSafe * 1024);
+      let budgetLine = '';
+      if (fitted.length) {
+        const quantised = fitted.filter(
+          (entry) => entry.result.colors !== null && entry.result.scale === 1,
+        ).length;
+        const parts = [`${fitted.length - quantised - shrunk.length} untouched`];
+        if (quantised) parts.push(`${quantised} quantised`);
+        if (shrunk.length) {
+          const smallest = shrunk.reduce((a, b) =>
+            a.result.width * a.result.height <= b.result.width * b.result.height ? a : b,
+          );
+          const sizes = new Set(shrunk.map((entry) => `${entry.result.width}×${entry.result.height}`));
+          const size = `${smallest.result.width}×${smallest.result.height}`;
+          parts.push(`${shrunk.length} downscaled (${sizes.size === 1 ? 'to' : 'smallest'} ${size})`);
+        }
+        if (missed.length) parts.push(`${missed.length} STILL OVER`);
+        budgetLine = `Budget ${budgetKbSafe} KB: ${parts.join(', ')}`;
+      }
+
+      // The status line truncates, so anything a user must not miss is also named in a toast.
+      const listNames = (entries: typeof fitted) => {
+        const shown = entries
+          .slice(0, BUDGET_TOAST_NAMES)
+          .map((entry) => names[entry.index])
+          .join(', ');
+        const rest = entries.length - BUDGET_TOAST_NAMES;
+        return rest > 0 ? `${shown} (+${rest} more)` : shown;
+      };
+      if (shrunk.length) {
+        toast.warning(
+          `${shrunk.length} file${shrunk.length > 1 ? 's were' : ' was'} downscaled to fit ${budgetKbSafe} KB: ${listNames(shrunk)}`,
+        );
+      }
+      if (missed.length) {
+        const worst = missed.reduce((a, b) =>
+          finalBytes[a.index].length >= finalBytes[b.index].length ? a : b,
+        );
+        toast.error(
+          `${missed.length} file${missed.length > 1 ? 's are' : ' is'} still over ${budgetKbSafe} KB — largest is ${formatKb(finalBytes[worst.index].length)} at ${describeBudget(worst.result)}: ${listNames(missed)}`,
+        );
+      }
+
+      const summary: string[] = [];
+      if (budgetLine) summary.push(budgetLine);
+      if (outTotal) {
+        summary.push(
+          `TinyPNG: ${formatKb(inTotal)} → ${formatKb(outTotal)} (saved ${Math.round((1 - outTotal / inTotal) * 100)}%)`,
+        );
+      }
+      setCompressSummary(summary.join(' · '));
+      if (!key) toast.info('No TinyPNG key set — exporting uncompressed PNGs.');
+      setProgress({
+        pct: 100,
+        text: failed
+          ? `Exported ${files.length} PNG${files.length > 1 ? 's' : ''} with ${failed} compression failure${failed > 1 ? 's' : ''}.`
+          : `Exported ${files.length} PNG${files.length > 1 ? 's' : ''}.`,
+      });
+
+      const blob = buildZip(files);
+      await saveTo(dest, blob, zipName);
+    } catch (e) {
+      toast.error(`Export failed: ${errorMessage(e)}`);
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  // ---- Shared panes ------------------------------------------------------
+
+  const bgChoice: 'transparent' | 'white' | 'custom' =
+    outputBg === TRANSPARENT ? 'transparent' : outputBg.toLowerCase() === WHITE ? 'white' : 'custom';
+
+  function chooseBackground(next: string) {
+    if (next === 'transparent') setOutputBg(TRANSPARENT);
+    else if (next === 'white') setOutputBg(WHITE);
+    else setOutputBg(bgChoice === 'custom' ? outputBg : DEFAULT_CUSTOM_BG);
+  }
+
+  const inputCard = (
+    <Card>
+      <HintCardHeader title="Images" hint="Files, a clipboard paste, or a CSV of image URLs." />
+      <CardContent>
+        <ImageDropzone onAdd={handleAdd} onCsv={handleCsv} onProject={(file) => void handleProject(file)} itemCount={items.length} disabled={busy} />
+        {csvInfo && (
+          <div className="mt-4 space-y-4 border-t pt-4">
+            <div className="text-sm font-medium">CSV columns — {csvInfo.fileName}</div>
+            <Field>
+              <FieldLabel htmlFor="csv-name-col">
+                <Hint hint="Names the previews and exported files. Safe to change any time — finished rows are renamed in place and their cutouts are kept.">
+                  Name column
+                </Hint>
+              </FieldLabel>
+              <Select
+                value={csvInfo.nameColumn || NONE}
+                onValueChange={(value) =>
+                  updateCsvMapping({ nameColumn: value === NONE ? '' : String(value ?? '') })
+                }
+                disabled={busy}
+              >
+                <SelectTrigger id="csv-name-col" className="w-full">
+                  <SelectValue>
+                    {(value) => (value && value !== NONE ? String(value) : '(URL filename)')}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NONE}>(URL filename)</SelectItem>
+                  {csvInfo.headers.map((header) => (
+                    <SelectItem key={header} value={header}>
+                      {header}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </Field>
+            <Field>
+              <FieldLabel>Image URL columns</FieldLabel>
+              {csvInfo.headers.map((header) => (
+                <Field key={header} orientation="horizontal">
+                  <Checkbox
+                    id={`csv-img-${header}`}
+                    checked={csvInfo.imageColumns.includes(header)}
+                    disabled={busy}
+                    onCheckedChange={(checked) =>
+                      updateCsvMapping({
+                        imageColumns:
+                          checked === true
+                            ? [...csvInfo.imageColumns, header]
+                            : csvInfo.imageColumns.filter((column) => column !== header),
+                      })
+                    }
+                  />
+                  <FieldLabel htmlFor={`csv-img-${header}`} className="font-normal">
+                    {header}
+                  </FieldLabel>
+                </Field>
+              ))}
+            </Field>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+
+  // The queue used to be a separate card of rows here; the results grid IS the queue now —
+  // originals appear as tiles the moment they land and are replaced by their cutouts in place,
+  // with the row's status line and retry/remove controls folded into each tile.
+
+  // The prompt always resolves to something (blank falls back to the default), so only the
+  // credentials gate AI editing.
+  const aiReady =
+    azureEndpoint.trim().length > 0 && azureKey.trim().length > 0 ||
+    (typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('mock'));
+  const aiCard = (
+    <Card>
+      <HintCardHeader
+        title="AI edit"
+        hint="Send an image to Azure GPT-Image from its dialog; the result replaces the image and its background is removed again."
+      />
+      <CardContent>
+        <FieldGroup className="gap-4">
+          <Field>
+            <FieldLabel htmlFor="bg-ai-prompt">
+              <Hint hint="Used for every AI edit, including the AI-fix flagged batch. Ships with a studio-packshot recreation prompt; clearing the box restores it.">
+                Default prompt
+              </Hint>
+            </FieldLabel>
+            <Textarea
+              id="bg-ai-prompt"
+              value={aiPrompt}
+              onChange={(e) => setAiPrompt(e.target.value)}
+              placeholder="e.g. Recreate this product photo on a clean white studio background, keeping the product exactly as it is."
+              rows={3}
+              disabled={busy}
+            />
+          </Field>
+          <Field orientation="horizontal">
+            <Checkbox
+              id="bg-ai-focus-crop"
+              checked={aiFocusCrop}
+              disabled={busy}
+              onCheckedChange={(checked) => setAiFocusCrop(checked === true)}
+            />
+            <FieldContent>
+              <FieldLabel htmlFor="bg-ai-focus-crop" className="font-normal">
+                <Hint hint="Crops the reference to the main product before sending it to the model, so bowls, props and scattered pieces can't be copied back into the result. Falls back to the full image when there's nothing to crop away.">
+                  Focus on main subject
+                </Hint>
+              </FieldLabel>
+            </FieldContent>
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="bg-azure-endpoint">Azure endpoint</FieldLabel>
+            <Input
+              id="bg-azure-endpoint"
+              value={azureEndpoint}
+              onChange={(e) => setAzureEndpoint(e.target.value)}
+              placeholder="https://<resource>.openai.azure.com"
+              disabled={busy}
+            />
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="bg-azure-key">
+              <Hint hint="Shared with the Compositor.">Azure API key</Hint>
+            </FieldLabel>
+            <Input
+              id="bg-azure-key"
+              type="password"
+              value={azureKey}
+              onChange={(e) => setAzureKey(e.target.value)}
+              placeholder="Azure API key"
+              disabled={busy}
+            />
+          </Field>
+        </FieldGroup>
+      </CardContent>
+    </Card>
+  );
+
+  const keyCard = (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-sm">Compression</CardTitle>
+      </CardHeader>
+      <CardContent>
+        {/* CardContent sets no gap and Field carries no margin, so the fields need a group to
+            space them — same wrapper the Model card uses. */}
+        <FieldGroup className="gap-4">
+          <Field orientation="horizontal">
+            <Checkbox
+              id="bg-number-files"
+              checked={numberFiles}
+              disabled={busy}
+              onCheckedChange={(checked) => setNumberFiles(checked === true)}
+            />
+            <FieldContent>
+              <FieldLabel htmlFor="bg-number-files" className="font-normal">
+                Number exported files
+              </FieldLabel>
+              <FieldDescription>
+                {numberFiles
+                  ? 'Files are named 01-product-name.png.'
+                  : 'Files use the name alone; repeats get -2, -3 so nothing is overwritten.'}
+              </FieldDescription>
+            </FieldContent>
+          </Field>
+
+          <Field orientation="horizontal">
+            {/* Field only nudges [role=checkbox]/[role=radio] into line with the label; a switch
+                needs the offset spelled out, as in components/bg-remover/safe-area-controls.tsx. */}
+            <Switch
+              id="bg-budget-on"
+              className="mt-0.5"
+              checked={budgetOn}
+              disabled={busy || !png8Ready}
+              onCheckedChange={(checked) => setBudgetOn(checked)}
+            />
+            <FieldContent>
+              <FieldLabel htmlFor="bg-budget-on" className="font-normal">
+                <Hint hint="PNG is lossless, so the same tile can export anywhere from 60 KB to 300 KB. On, every file is held under a ceiling.">
+                  Limit file size
+                </Hint>
+              </FieldLabel>
+              {!png8Ready && (
+                <FieldDescription>
+                  Needs CompressionStream, which this browser does not provide — exports stay
+                  uncapped.
+                </FieldDescription>
+              )}
+            </FieldContent>
+          </Field>
+
+          {budgetActive && (
+            <>
+              <Field>
+                <FieldLabel htmlFor="bg-budget-kb">
+                  <Hint hint="Colours go first — full colour, then a 256 · 128 · 64 · 32 palette — and the export stops at the first step that fits.">
+                    Max KB per file
+                  </Hint>
+                </FieldLabel>
+                <Input
+                  id="bg-budget-kb"
+                  type="number"
+                  inputMode="numeric"
+                  min={BUDGET_KB_MIN}
+                  step={BUDGET_KB_STEP}
+                  value={budgetKb}
+                  disabled={busy}
+                  onChange={(e) => {
+                    const next = Number(e.target.value);
+                    // A cleared or half-typed field must never be persisted as NaN.
+                    if (Number.isFinite(next) && next > 0) setBudgetKb(next);
+                  }}
+                  onBlur={() => setBudgetKb(budgetKbSafe)}
+                />
+              </Field>
+
+              <Field orientation="horizontal">
+                <Switch
+                  id="bg-budget-shrink"
+                  className="mt-0.5"
+                  checked={budgetShrink}
+                  disabled={busy}
+                  onCheckedChange={(checked) => setBudgetShrink(checked)}
+                />
+                <FieldContent>
+                  <FieldLabel htmlFor="bg-budget-shrink" className="font-normal">
+                    <Hint hint="Last resort, only when no palette fits. Off, an unfittable file is exported over budget instead — either way the export report names it.">
+                      Shrink dimensions if needed
+                    </Hint>
+                  </FieldLabel>
+                </FieldContent>
+              </Field>
+            </>
+          )}
+
+          <Field>
+            <FieldLabel htmlFor="tiny-key">
+              <Hint hint="Shared with the Compositor. Exports go through TinyPNG when it is set.">
+                TinyPNG API key
+              </Hint>
+            </FieldLabel>
+            <Input
+              id="tiny-key"
+              type="password"
+              value={tinyKey}
+              onChange={(e) => setTinyKey(e.target.value)}
+              placeholder="TinyPNG key (optional)"
+            />
+          </Field>
+        </FieldGroup>
+      </CardContent>
+    </Card>
+  );
+
+  const runFooter = (
+    <Card className="shrink-0 !py-3">
+      <CardContent className="flex gap-2">
+        <Button className="flex-1" disabled={busy || !pending.length} onClick={handleRun}>
+          {running ? <Spinner data-icon="inline-start" /> : <WandSparklesIcon data-icon="inline-start" />}
+          {pending.length
+            ? `${tab === 'tile' ? 'Run batch' : 'Remove backgrounds'} (${pending.length})`
+            : items.length
+              ? 'All images cut out'
+              : 'Nothing queued'}
+        </Button>
+        {running && (
+          <Button variant="outline" onClick={handleCancel}>
+            <CircleStopIcon data-icon="inline-start" />
+            Cancel
+          </Button>
+        )}
+      </CardContent>
+    </Card>
+  );
+
+  // progress.text is never cleared once a run or an export has finished, so the compression
+  // summary has to share the line with it rather than sit behind it in a fallback chain.
+  const statusLine =
+    (download && describeDownload(download)) ||
+    [progress?.text, compressSummary].filter(Boolean).join(' · ') ||
+    (tinyKey.trim()
+      ? 'Exports are compressed with TinyPNG.'
+      : 'Everything runs locally — nothing leaves this browser.');
+
+  const exportFooter = (
+    <CardFooter className="sticky bottom-0 gap-3 border-t bg-card !py-3">
+      <div className="min-w-0 flex-1 space-y-1.5">
+        {progress && <Progress value={progress.pct} />}
+        {download?.ratio != null && <Progress value={download.ratio * 100} />}
+        <p className="truncate text-xs text-muted-foreground">
+          {statusLine}
+          {stage && stage !== 'done' ? ` · ${stage}` : ''}
+        </p>
+      </div>
+      <Button
+        variant="outline"
+        disabled={busy || !cutouts.length}
+        onClick={() => void handleSaveProject()}
+        title="Everything needed to reopen this batch later — cutouts, bounds and safe-area settings — without re-running the models"
+      >
+        <SaveIcon data-icon="inline-start" />
+        Save project
+      </Button>
+      <Button disabled={busy || !cutouts.length} onClick={handleExport}>
+        {exporting ? <Spinner data-icon="inline-start" /> : <DownloadIcon data-icon="inline-start" />}
+        Export ZIP
+      </Button>
+    </CardFooter>
+  );
+
+  const emptyState = (
+    <Empty className="h-full min-h-60">
+      <EmptyHeader>
+        <EmptyMedia variant="icon">
+          <ImagesIcon />
+        </EmptyMedia>
+        <EmptyTitle>Nothing queued yet</EmptyTitle>
+        <EmptyDescription>
+          Drop or browse image files, paste an image straight from the clipboard, or drop a CSV
+          and every image URL in it becomes its own queue item.
+        </EmptyDescription>
+      </EmptyHeader>
+    </Empty>
+  );
+
+  const setupBanner = setupError && (
+    <div className="mb-3 flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/10 p-2.5 text-xs text-destructive">
+      <TriangleAlertIcon className="mt-0.5 size-4 shrink-0" />
+      <div className="min-w-0">
+        <p className="font-medium">{SETUP_HINT}</p>
+        <p className="mt-1 break-words opacity-80">{setupError}</p>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="flex min-h-dvh flex-col">
+      <ProductHeader title="BG Remover" description="Browser-side background removal">
+        <Badge variant={modelReady ? 'default' : 'outline'} className="hidden md:inline-flex">
+          {spec.label}
+          {modelReady
+            ? ` · ready${backendLabel ? ` · ${backendLabel}` : ''}`
+            : spec.approxSizeMb
+              ? ` · ${spec.approxSizeMb} MB`
+              : ''}
+        </Badge>
+      </ProductHeader>
+
+      <Tabs
+        value={tab}
+        onValueChange={(value) => setTab(value as BgTab)}
+        className="flex flex-1 flex-col gap-0"
+      >
+        <div className="flex h-11 shrink-0 items-center border-b px-5">
+          <TabsList>
+            <TabsTrigger value="remove">Remove</TabsTrigger>
+            <TabsTrigger value="tile">Tile fit</TabsTrigger>
+          </TabsList>
+        </div>
+
+        {/* TAB 1 — background removal only; output is transparent (or flattened) PNGs. */}
+        <TabsContent value="remove">
+          <WorkGrid>
+            <ControlColumn hint="Input & model" footer={runFooter}>
+              {inputCard}
+              <Card>
+                <HintCardHeader title="Model" hint="Weights download once, then stay cached." />
+                <CardContent>
+                  <FieldGroup className="gap-4">
+                    <Field>
+                      <FieldLabel htmlFor="bg-model" className="sr-only">Model</FieldLabel>
+                      <Select
+                        value={modelId}
+                        onValueChange={(value) => setModelId(value as BgModelId)}
+                        disabled={busy}
+                      >
+                        <SelectTrigger id="bg-model" className="w-full">
+                          <SelectValue>
+                            {(value) => BG_MODELS[value as BgModelId]?.label ?? 'Choose a model'}
+                          </SelectValue>
+                        </SelectTrigger>
+                        <SelectContent>
+                          {BG_MODEL_ORDER.map((id) => {
+                            const option = BG_MODELS[id];
+                            const offline = option.server === true && serverUp !== true;
+                            return (
+                              <SelectItem key={id} value={id} disabled={offline}>
+                                <span className="flex min-w-0 flex-col gap-0.5 py-0.5">
+                                  <span>
+                                    {option.label}
+                                    {option.approxSizeMb ? ` · ${option.approxSizeMb} MB` : ''}
+                                  </span>
+                                  <span className="text-xs text-muted-foreground">
+                                    {offline
+                                      ? 'Local sidecar is not running'
+                                      : option.description}
+                                  </span>
+                                </span>
+                              </SelectItem>
+                            );
+                          })}
+                        </SelectContent>
+                      </Select>
+                      {serverBlocked && (
+                        <FieldDescription>
+                          {`${BG_MODELS[knownModel].label} needs its local sidecar — using ${spec.label} until it answers.`}
+                        </FieldDescription>
+                      )}
+                    </Field>
+
+                    <Field orientation="horizontal">
+                      <Checkbox
+                        id="bg-refine"
+                        checked={refine}
+                        disabled={busy}
+                        onCheckedChange={(checked) => setRefine(checked === true)}
+                      />
+                      <FieldContent>
+                        <FieldLabel htmlFor="bg-refine" className="font-normal">
+                          <Hint hint="Slower, but much better on hair, fur and soft edges.">
+                            Refine edges
+                          </Hint>
+                        </FieldLabel>
+                      </FieldContent>
+                    </Field>
+
+                    <Field orientation="horizontal">
+                      <Checkbox
+                        id="bg-high-detail"
+                        checked={highDetail}
+                        disabled={busy}
+                        onCheckedChange={(checked) => setHighDetail(checked === true)}
+                      />
+                      <FieldContent>
+                        <FieldLabel htmlFor="bg-high-detail" className="font-normal">
+                          <Hint hint="Re-runs the model on a tight crop of the subject for sharper edges — about twice as slow per image.">
+                            High detail (two passes)
+                          </Hint>
+                        </FieldLabel>
+                      </FieldContent>
+                    </Field>
+
+                    <Field orientation="horizontal">
+                      <Checkbox
+                        id="bg-product-only"
+                        checked={productOnly}
+                        disabled={busy}
+                        onCheckedChange={(checked) => setProductOnly(checked === true)}
+                      />
+                      <FieldContent>
+                        <FieldLabel htmlFor="bg-product-only" className="font-normal">
+                          <Hint hint="Drops flat colour strips and badges the model kept, and re-measures the subject without them. Only affects graphics detached from the product.">
+                            Product only
+                          </Hint>
+                        </FieldLabel>
+                      </FieldContent>
+                    </Field>
+
+                    <Field>
+                      <FieldLabel>
+                        <Hint hint="Applied on export and in the previews; the cutout itself keeps its alpha.">
+                          Output background
+                        </Hint>
+                      </FieldLabel>
+                      <div className="flex items-center gap-2">
+                        <ToggleGroup
+                          value={[bgChoice]}
+                          onValueChange={(value) => value[0] && chooseBackground(value[0])}
+                          variant="outline"
+                          size="sm"
+                          disabled={busy}
+                        >
+                          <ToggleGroupItem value="transparent">Transparent</ToggleGroupItem>
+                          <ToggleGroupItem value="white">White</ToggleGroupItem>
+                          <ToggleGroupItem value="custom">Custom</ToggleGroupItem>
+                        </ToggleGroup>
+                        {bgChoice === 'custom' && (
+                          <Input
+                            type="color"
+                            aria-label="Custom output background"
+                            className="h-7 w-12 p-1"
+                            value={outputBg}
+                            onChange={(e) => setOutputBg(e.target.value)}
+                          />
+                        )}
+                      </div>
+                    </Field>
+
+                    {!spec.server && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="w-fit"
+                        disabled={busy || modelReady}
+                        onClick={() => void handleWarm()}
+                      >
+                        {warming ? (
+                          <Spinner data-icon="inline-start" />
+                        ) : (
+                          <CloudDownloadIcon data-icon="inline-start" />
+                        )}
+                        {modelReady
+                          ? 'Model loaded'
+                          : `Warm up${spec.approxSizeMb ? ` · ${spec.approxSizeMb} MB download` : ''}`}
+                      </Button>
+                    )}
+                  </FieldGroup>
+                </CardContent>
+              </Card>
+              {keyCard}
+              {aiCard}
+            </ControlColumn>
+
+            <ResultColumn
+              hint={
+                items.length
+                  ? `${cutouts.length}/${items.length} cut out${flaggedCount ? ` · ${flaggedCount} flagged` : ''}`
+                  : 'Cutouts'
+              }
+              footer={exportFooter}
+              scrollRef={removeScrollRef}
+            >
+              {setupBanner}
+              {items.length === 0 ? (
+                emptyState
+              ) : (
+                <>
+                  {flaggedCount > 0 && (
+                    <div className="mb-3 flex items-center justify-between gap-2">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={busy || !aiReady || !flaggedItems.length}
+                        title={
+                          aiReady
+                            ? `Regenerate every flagged image with the AI edit prompt, ${AI_EDIT_CONCURRENCY} at a time, then re-remove their backgrounds`
+                            : 'Enter the Azure endpoint and API key in the AI edit card first'
+                        }
+                        onClick={() => void handleAiEditFlagged()}
+                      >
+                        {aiFixing ? (
+                          <Spinner data-icon="inline-start" />
+                        ) : (
+                          <WandSparklesIcon data-icon="inline-start" />
+                        )}
+                        AI-fix flagged ({flaggedItems.length})
+                      </Button>
+                      <ToggleGroup
+                        size="sm"
+                        variant="outline"
+                        value={[qualitySort ? 'quality' : 'queue']}
+                        onValueChange={(next) => setQualitySort(next[0] === 'quality')}
+                      >
+                        <ToggleGroupItem value="queue" aria-label="Queue order">
+                          Queue order
+                        </ToggleGroupItem>
+                        <ToggleGroupItem value="quality" aria-label="Flagged first">
+                          <CircleAlertIcon data-icon="inline-start" />
+                          Flagged
+                        </ToggleGroupItem>
+                      </ToggleGroup>
+                    </div>
+                  )}
+                  <VirtualGrid
+                    items={tab === 'remove' ? displayItems : EMPTY_ITEMS}
+                    scrollRef={removeScrollRef}
+                    minCellWidth={GRID_MIN_CELL}
+                    gap={GRID_GAP}
+                    // Square preview box plus the filename line beneath it.
+                    cellHeight={(w) => w + GRID_LABEL_HEIGHT}
+                    keyOf={(item) => item.id}
+                    renderItem={(item, index) => (
+                      <CutoutCell
+                        item={item}
+                        label={item.name || `Image ${index + 1}`}
+                        selected={item.id === highlightId}
+                        background={outputBg}
+                        running={busy}
+                        onSelect={selectById}
+                        onCompare={compareById}
+                        onRemove={removeById}
+                      />
+                    )}
+                  />
+                </>
+              )}
+            </ResultColumn>
+          </WorkGrid>
+        </TabsContent>
+
+        {/* TAB 2 — the same queue composited onto tiles through the safe-area module. */}
+        <TabsContent value="tile">
+          <WorkGrid>
+            <ControlColumn hint="Input & safe area" footer={runFooter}>
+              {inputCard}
+              <Card>
+                <HintCardHeader title="Safe area" hint="Tile size, margins and where the subject sits." />
+                <CardContent>
+                  <SafeAreaControls
+                    config={safeArea}
+                    onChange={setSafeArea}
+                    onReset={() => setSafeArea(structuredClone(DEFAULT_SAFE_AREA))}
+                    disabled={busy}
+                  />
+                </CardContent>
+              </Card>
+              {keyCard}
+              {aiCard}
+            </ControlColumn>
+
+            <ResultColumn
+              scrollRef={tileScrollRef}
+              hint={
+                cutouts.length
+                  ? `${cutouts.length} tile${cutouts.length > 1 ? 's' : ''} · ${safeArea.tile.width}×${safeArea.tile.height}`
+                  : 'Tiles'
+              }
+              footer={exportFooter}
+            >
+              {setupBanner}
+              {cutouts.length === 0 ? (
+                items.length === 0 ? (
+                  emptyState
+                ) : (
+                  <Empty className="h-full min-h-60">
+                    <EmptyHeader>
+                      <EmptyMedia variant="icon">
+                        <WandSparklesIcon />
+                      </EmptyMedia>
+                      <EmptyTitle>No cutouts yet</EmptyTitle>
+                      <EmptyDescription>
+                        Run the batch to remove backgrounds — tiles are composited from the
+                        cutouts, so every image needs one first.
+                      </EmptyDescription>
+                    </EmptyHeader>
+                  </Empty>
+                )
+              ) : (
+                <div className="space-y-4">
+                  <div className="rounded-xl bg-muted/30 p-4">
+                    <TilePreview
+                      source={selectedPreview}
+                      bounds={selectedPreviewBounds}
+                      config={safeArea}
+                      showOverlay
+                      maxSize={340}
+                    />
+                    <p className="mt-1 truncate text-center text-xs text-muted-foreground">
+                      {selected?.name || 'No selection'}
+                    </p>
+                  </div>
+                  <Separator />
+                  <VirtualGrid
+                    items={tab === 'tile' ? cutouts : EMPTY_CUTOUTS}
+                    scrollRef={tileScrollRef}
+                    minCellWidth={GRID_MIN_CELL}
+                    gap={GRID_GAP}
+                    // TilePreview caps itself at 180px tall; the rest is caption + filename.
+                    cellHeight={() => TILE_CELL_HEIGHT}
+                    keyOf={(item) => item.id}
+                    renderItem={(item, index) => (
+                      <TileCell
+                        item={item}
+                        label={item.name || `Image ${index + 1}`}
+                        selected={item.id === highlightId}
+                        config={safeArea}
+                        running={busy}
+                        onSelect={selectById}
+                        onRemove={removeById}
+                      />
+                    )}
+                  />
+                </div>
+              )}
+            </ResultColumn>
+          </WorkGrid>
+        </TabsContent>
+      </Tabs>
+
+      {/* One dialog for the whole product: queue rows and result images open the same view. */}
+      <CompareDialog
+        item={compareItem}
+        index={compareIndex < 0 ? 0 : compareIndex}
+        background={tab === 'tile' ? TRANSPARENT : outputBg}
+        numbered={numberFiles}
+        onClose={() => setCompareId(null)}
+        models={redoModels}
+        defaultModel={modelId}
+        defaultRefine={refine}
+        onRedo={(item, options) =>
+          handleRetry(item, { model: options.model as BgModelId, refine: options.refine })
+        }
+        aiEdit={{
+          ready: aiReady && !busy,
+          hint: aiReady
+            ? 'Send to Azure GPT-Image with the default prompt; the result replaces this image'
+            : 'Set the default prompt (and Azure endpoint + key) in the AI edit card first',
+          onEdit: (item) => void handleAiEdit(item),
+        }}
+        busy={busy}
+      />
+    </div>
+  );
+}
+
+// ---- Layout scaffolding ---------------------------------------------------
+
+function WorkGrid({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      className="grid items-start gap-5 p-5 pb-6 lg:grid-cols-[minmax(320px,400px)_minmax(0,1fr)] lg:items-stretch"
+      style={{ '--pane-h': PANE_HEIGHT } as React.CSSProperties}
+    >
+      {children}
+    </div>
+  );
+}
+
+interface ColumnProps {
+  hint: string;
+  children: React.ReactNode;
+  footer: React.ReactNode;
+  scrollRef?: React.RefObject<HTMLDivElement | null>;
+}
+
+function ControlColumn({ hint, children, footer }: ColumnProps) {
+  return (
+    <section aria-label="Controls" className="min-w-0 space-y-4 lg:flex lg:h-(--pane-h) lg:flex-col">
+      <PaneHeading title="Setup" hint={hint} />
+      {/* p-1 keeps focus rings from being clipped by the scroll container. */}
+      <div className="space-y-4 lg:min-h-0 lg:flex-1 lg:overflow-y-auto lg:p-1">{children}</div>
+      {footer}
+    </section>
+  );
+}
+
+function ResultColumn({ hint, children, footer, scrollRef }: ColumnProps) {
+  return (
+    <section aria-label="Results" className="min-w-0 space-y-4 lg:flex lg:h-(--pane-h) lg:flex-col">
+      <PaneHeading title="Results" hint={hint} />
+      <Card className="lg:flex lg:min-h-0 lg:flex-1 lg:flex-col">
+        {/* The element the virtual grids measure and listen to. It must be a bounded scroll
+            container at EVERY width, not just at lg: a grid whose container can grow without
+            limit reports a viewport the size of its content, so windowing degrades to rendering
+            every cell — which with a few thousand items is exactly the hang this avoids. */}
+        <CardContent
+          ref={scrollRef}
+          className="max-h-[70dvh] min-h-0 overflow-y-auto lg:max-h-none lg:flex-1"
+        >
+          {children}
+        </CardContent>
+        {footer}
+      </Card>
+    </section>
+  );
+}
+
+function PaneHeading({ title, hint }: { title: string; hint: string }) {
+  return (
+    <div className="flex items-baseline gap-2 px-1">
+      <h2 className="text-sm font-semibold tracking-wide uppercase">{title}</h2>
+      <span className="ml-auto truncate text-xs text-muted-foreground">{hint}</span>
+    </div>
+  );
+}
+
+// Both result grids are memoised per cell. A batch patches state once per finished image, and
+// re-rendering every cell each time cost more than the inference did once a queue got long.
+// selected/label/background are primitives and onSelect is stable, so only the changed cell
+// re-renders.
+const CutoutCell = React.memo(function CutoutCell({
+  item,
+  label,
+  selected,
+  background,
+  running,
+  onSelect,
+  onCompare,
+  onRemove,
+}: {
+  item: BgItem;
+  label: string;
+  selected: boolean;
+  background: string;
+  running: boolean;
+  onSelect: (id: number) => void;
+  /** Clicking a finished result opens the same before/after view as a queue row. */
+  onCompare: (id: number) => void;
+  onRemove: (id: number) => void;
+}) {
+  const working =
+    item.status === 'removing' || item.status === 'loading-model' || item.status === 'editing';
+  const quality = item.status === 'done' ? assessQuality(item) : null;
+  return (
+    <ResultCell
+      label={label}
+      status={statusLine(item)}
+      selected={selected}
+      onSelect={() => {
+        onSelect(item.id);
+        if (item.cutout) onCompare(item.id);
+      }}
+      onRemove={() => onRemove(item.id)}
+      removeDisabled={running}
+    >
+      <div
+        className="relative grid aspect-square place-items-center overflow-hidden rounded-lg border p-2"
+        style={backdropStyle(background)}
+      >
+        {item.cutout ? (
+          <CutoutImage itemId={item.id} cutout={item.cutout} max={240} className="max-h-full max-w-full" />
+        ) : (
+          // The original stands in until its cutout replaces it — the tile is the queue row now,
+          // so an image is visible from the moment it is added, not only once it is done.
+          <SourceImage item={item} className="max-h-full max-w-full object-contain" />
+        )}
+        {working && (
+          <div className="absolute inset-0 grid place-items-center bg-background/70">
+            <Spinner className="size-5 text-primary" />
+          </div>
+        )}
+        {item.status === 'error' && (
+          <TriangleAlertIcon className="absolute bottom-2 left-2 size-4 text-destructive" />
+        )}
+        {quality && quality.level !== 'ok' && (
+          <Hint
+            hint={quality.reasons.join(' · ')}
+            className="absolute bottom-2 left-2"
+          >
+            <CircleAlertIcon
+              className={cn('size-4', quality.level === 'bad' ? 'text-destructive' : 'text-amber-500')}
+            />
+          </Hint>
+        )}
+      </div>
+    </ResultCell>
+  );
+});
+
+/**
+ * A grid tile fed by the preview cache. Split out of TileCell so the hook lives in a component
+ * that only exists while the cell is on screen — with virtualisation that is a few dozen
+ * decodes, not one per queued image.
+ */
+function TileCellPreview({
+  cutout,
+  itemId,
+  config,
+}: {
+  cutout: BgCutout;
+  itemId: number;
+  config: SafeAreaConfig;
+}) {
+  const preview = usePreview({ key: itemId, blob: cutout.blob, edge: TILE_CELL_EDGE });
+  const bounds =
+    cutout.bounds && preview ? scaleBounds(cutout.bounds, previewScale(cutout, preview)) : null;
+  return (
+    <TilePreview source={preview} bounds={bounds} config={config} showOverlay={false} maxSize={180} />
+  );
+}
+
+const TileCell = React.memo(function TileCell({
+  item,
+  label,
+  selected,
+  config,
+  running,
+  onSelect,
+  onRemove,
+}: {
+  // Only ever rendered for items that already have a cutout, so no null-guarding here.
+  item: CutoutItem;
+  label: string;
+  selected: boolean;
+  config: SafeAreaConfig;
+  running: boolean;
+  onSelect: (id: number) => void;
+  onRemove: (id: number) => void;
+}) {
+  return (
+    <ResultCell
+      label={label}
+      selected={selected}
+      onSelect={() => onSelect(item.id)}
+      onRemove={() => onRemove(item.id)}
+      removeDisabled={running}
+    >
+      {/* TilePreview sizes and frames itself — no wrapper box here, or the tile ends up
+          double-bordered. */}
+      <TileCellPreview cutout={item.cutout} itemId={item.id} config={config} />
+    </ResultCell>
+  );
+});

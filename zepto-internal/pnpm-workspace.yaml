@@ -1,0 +1,10 @@
+packages: []
+
+allowBuilds:
+  sharp: true
+  unrs-resolver: true
+  msw: false
+  # The bg-removal engine runs entirely in the browser (onnxruntime-web), so the
+  # native Node binding never loads and its build step is dead weight.
+  onnxruntime-node: false
+  protobufjs: false

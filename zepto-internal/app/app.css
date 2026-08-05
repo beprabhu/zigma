@@ -1,0 +1,5 @@
+/* Single CSS entry — layout.tsx imports ONLY this file.
+   Order matters: globals.css is the tweakcn paste target, base.css is the
+   app plumbing that must win over any pasted theme. */
+@import "./globals.css";
+@import "./base.css";

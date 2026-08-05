@@ -1,0 +1,4 @@
+Product Title,Image URL 1,Image URL 2,Discount
+"Orange Bottle + Blue Box Combo",http://localhost:3000/samples/bottle.png,http://localhost:3000/samples/box.png,20% OFF
+"Green Jar & Bottle Pack",http://localhost:3000/samples/jar.png,http://localhost:3000/samples/bottle.png,FLAT ₹50 OFF
+"Blue Box Solo",http://localhost:3000/samples/box.png,,
