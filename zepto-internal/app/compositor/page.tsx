@@ -4,10 +4,6 @@ import * as React from 'react';
 import { toast } from 'sonner';
 import { ChevronDownIcon, DownloadIcon, ImageIcon } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import {
-  Card, CardContent, CardFooter, CardHeader, CardTitle,
-} from '@/components/ui/card';
-import { HintCardHeader } from '@/components/hint-card-header';
 import { Hint } from '@/components/hint';
 import { Checkbox } from '@/components/ui/checkbox';
 import {
@@ -28,18 +24,19 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
 
 import { TemplateEditor } from '@/components/template-editor';
-import { ProductHeader } from '@/components/product-header';
 import { CsvDropzone } from '@/components/csv-dropzone';
 import { TileGrid, TileDialog } from '@/components/tile-grid';
+import { Canvas, LeftPanel, PanelSection, RightPanel, StudioShell } from '@/components/pane-layout';
+import { useProcessing } from '@/components/process-panel';
 
 import { DEFAULT_TEMPLATE, TileTemplate, tileToPngBlob } from '@/lib/tile';
 import { parseCSV, detectImageColumns, detectTitleColumn, detectOfferColumn, CsvRecord } from '@/lib/csv';
 import { buildZip, ZipFileEntry } from '@/lib/zip';
-import { loadImageFromUrl, callAzure, mockComposite } from '@/lib/pipeline';
+import { azureImageUrl, loadImageFromUrl, callAzure, mockComposite } from '@/lib/pipeline';
 import {
   BG_MODELS, BG_MODEL_ORDER, DEFAULT_MODEL_ID, probeServerModel, removeBackground, type BgModelId,
 } from '@/lib/bg/engine';
-import { extractTinifyKey, mapWithLimit, pickSave, saveTo } from '@/lib/bg/batch';
+import { mapWithLimit, pickSave, saveTo } from '@/lib/bg/batch';
 import { describeBudget, fitToBudget, type BudgetResult } from '@/lib/bg/budget';
 import { isPng8Supported } from '@/lib/bg/png8';
 import { TILE_PRESETS } from '@/lib/bg/safe-area';
@@ -104,7 +101,6 @@ export default function Compositor() {
   const [endpoint, setEndpoint] = usePersistedState('skuc_azureEndpoint', DEFAULT_ENDPOINT);
   const [azureKey, setAzureKey] = usePersistedState('skuc_azureKey', '');
   const [parallel, setParallel] = usePersistedState('skuc_azureParallel', 3);
-  const [tinyKey, setTinyKey] = usePersistedState('skuc_tinyKey', '');
   // The CDN ceiling is one rule for the whole suite, so these keys are the BG remover's own.
   const [budgetOn, setBudgetOn] = usePersistedState('skuc_bgBudgetOn', false);
   const [budgetKb, setBudgetKb] = usePersistedState('skuc_bgBudgetKb', 150);
@@ -152,7 +148,6 @@ export default function Compositor() {
   // The dialog holds an id, not an item object: rows are replaced on every status patch, and
   // resolving the id at render time is what lets the open dialog update live mid-regenerate.
   const [openId, setOpenId] = React.useState<number | null>(null);
-  const [exportOpen, setExportOpen] = React.useState(false);
   const openItem = items.find((it) => it.id === openId) ?? null;
 
   const canvases = React.useRef(new Map<number, HTMLCanvasElement>());
@@ -161,7 +156,11 @@ export default function Compositor() {
     else canvases.current.delete(id);
   }, []);
 
+  const proc = useProcessing({ prefix: 'skuc_co', busy: running });
+
   const mock = typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('mock');
+  // The proxy keeps only this field's origin; showing the result keeps that from being silent.
+  const resolvedUrl = azureImageUrl(endpoint, 'edits');
 
   // isPng8Supported() reads a browser global, so it must not decide the server-rendered markup.
   const png8Ready = React.useSyncExternalStore(
@@ -312,11 +311,8 @@ export default function Compositor() {
     setRunning(false);
   }
 
-  // ---- Export: compress (when a TinyPNG key is set) + download ZIP, one action ----
+  // ---- Export: budget → shared local compress → ZIP, one action ----
   async function handleExport() {
-    // Both products read the same skuc_tinyKey value, so the extraction rule is shared rather
-    // than duplicated — the two copies must not drift.
-    const key = extractTinifyKey(tinyKey);
     const done = items.filter((it) => it.status === 'done' && canvases.current.has(it.id));
     if (!done.length) return;
     // Save dialog first, while the click still counts as user activation — TinyPNG passes can
@@ -359,23 +355,14 @@ export default function Compositor() {
         return data;
       });
 
-      // TinyPNG rate-limits, so this fan-out stays narrower than the encode one. Already
-      // compressed tiles are skipped, and a failure keeps the uncompressed PNG.
+      // The processing space's shared compress step (pngquant + oxipng, local). A failure
+      // keeps the uncompressed PNG for that tile rather than sinking the export.
       let sent = 0;
       const finalBytes = await mapWithLimit(raw, COMPRESS_CONCURRENCY, async (data, n) => {
         const item = done[n];
-        if (!key || (!budget && item.compressed)) return data;
+        if (!proc.compressOn || (!budget && item.compressed)) return data;
         try {
-          const res = await fetch('/api/compress', {
-            method: 'POST',
-            headers: { 'x-tinify-key': key, 'Content-Type': 'application/octet-stream' },
-            body: data as unknown as BodyInit,
-          });
-          if (!res.ok) {
-            const err = await res.json().catch(() => ({}));
-            throw new Error(err.error || `Compression failed (${res.status})`);
-          }
-          const out = new Uint8Array(await res.arrayBuffer());
+          const out = await proc.compressBytes(data);
           patchItem(item.id, { compressed: { data: out, inputSize: data.length } });
           inTotal += data.length;
           outTotal += out.length;
@@ -387,7 +374,7 @@ export default function Compositor() {
           return data;
         } finally {
           sent++;
-          setProgress({ pct: 50 + (sent / done.length) * 50, text: `Compressing tile ${sent} of ${done.length} with TinyPNG…` });
+          setProgress({ pct: 50 + (sent / done.length) * 50, text: `Compressing tile ${sent} of ${done.length}…` });
         }
       });
 
@@ -438,7 +425,7 @@ export default function Compositor() {
       }
 
       if (outTotal) {
-        setCompressSummary(`TinyPNG: ${(inTotal / 1024).toFixed(1)} KB → ${(outTotal / 1024).toFixed(1)} KB (saved ${Math.round((1 - outTotal / inTotal) * 100)}%)`);
+        setCompressSummary(`Compressed: ${(inTotal / 1024).toFixed(1)} KB → ${(outTotal / 1024).toFixed(1)} KB (saved ${Math.round((1 - outTotal / inTotal) * 100)}%)`);
       }
       // The budget verdict rides on the final line — the footer shows progress text first, so
       // a separate summary would be invisible behind it.
@@ -450,7 +437,6 @@ export default function Compositor() {
             : `Exported ${files.length} tile${files.length > 1 ? 's' : ''}.`) +
           (budgetSummary ? ` · ${budgetSummary}` : ''),
       });
-      if (!key) toast.info('No TinyPNG key set — exporting uncompressed PNGs.');
 
       const zip = buildZip(files);
       await saveTo(dest, zip, 'sku-tiles.zip');
@@ -474,28 +460,19 @@ export default function Compositor() {
 
   return (
     <div className="flex min-h-dvh flex-col">
-      <ProductHeader title="Compositor" description="CSV in, branded tiles out" />
 
-      {/* --pane-h feeds the pane height calc: panes fill the viewport minus the
-          chrome above and around this grid, so footers sit flush at the bottom.
-          3rem = ProductHeader (h-12), 1px = its border-b, 2.75rem = this grid's
-          own vertical padding (p-5 top 1.25rem + pb-6 bottom 1.5rem).
-          The sidebar adds no vertical chrome, so nothing else subtracts.
-          A layout wrapper is used rather than <main>: SidebarInset already
-          renders the page's <main> landmark. */}
-      <div
-        className="grid flex-1 items-start gap-5 p-5 pb-6 lg:grid-cols-2 xl:grid-cols-[minmax(300px,400px)_minmax(290px,380px)_minmax(300px,520px)] xl:items-stretch xl:justify-center"
-        style={{ '--pane-h': 'calc(100dvh - 3rem - 1px - 2.75rem)' } as React.CSSProperties}
-      >
-        {/* PANE 1 — Design: template editor + live preview */}
-        <section
-          aria-label="Design"
-          className="min-w-0 space-y-4 xl:flex xl:h-(--pane-h) xl:flex-col"
+      <StudioShell>
+        <LeftPanel
+          title="Design & Generate"
+          hint="Template · data · prompt · keys"
+          footer={
+            <Button className="w-full" disabled={!canGenerate || running} onClick={handleGenerateAll}>
+              {running && <Spinner data-icon="inline-start" />}
+              Generate &amp; Populate
+            </Button>
+          }
         >
-          <PaneHeading step="01" title="Design" hint="Tile template & preview" />
-          <Card className="xl:flex xl:min-h-0 xl:flex-1 xl:flex-col">
-            <HintCardHeader title="Template" hint="Click a layer in the preview to edit it." />
-            <CardContent className="space-y-4 xl:min-h-0 xl:flex-1 xl:overflow-y-auto">
+          <PanelSection title="Template" hint="Click a layer in the preview to edit it." className="space-y-4">
               <TemplateEditor
                 template={template}
                 onChange={handleTemplateChange}
@@ -531,32 +508,13 @@ export default function Compositor() {
                   </Field>
                 </FieldGroup>
               </TemplateEditor>
-            </CardContent>
-          </Card>
-        </section>
-
-        {/* PANE 2 — Generate: data in, prompt, keys, run */}
-        <section
-          aria-label="Generate"
-          className="min-w-0 space-y-4 xl:flex xl:h-(--pane-h) xl:flex-col"
-        >
-          <PaneHeading step="02" title="Generate" hint="Data, prompt & keys" />
-          <div className="space-y-4 xl:min-h-0 xl:flex-1 xl:overflow-y-auto xl:p-1">
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-sm">CSV file</CardTitle>
-            </CardHeader>
-            <CardContent>
+            </PanelSection>
+          <PanelSection title="CSV file">
               <CsvDropzone fileName={fileName} rowCount={records.length} onFile={handleFile} />
-            </CardContent>
-          </Card>
+            </PanelSection>
 
           {headers.length > 0 && (
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-sm">Settings</CardTitle>
-              </CardHeader>
-              <CardContent>
+            <PanelSection title="Settings">
                 <Tabs defaultValue="auto">
                   <TabsList>
                     <TabsTrigger value="auto">Auto</TabsTrigger>
@@ -622,13 +580,11 @@ export default function Compositor() {
                     </FieldGroup>
                   </TabsContent>
                 </Tabs>
-              </CardContent>
-            </Card>
+              </PanelSection>
           )}
 
           {/* Prompt is tuned rarely — collapsed by default. */}
-          <Card>
-            <CardContent>
+          <PanelSection>
               <Collapsible open={promptOpen} onOpenChange={setPromptOpen}>
                 <CollapsibleTrigger className="group flex w-full items-center justify-between text-left">
                   <span className="text-sm font-medium">Prompt</span>
@@ -646,14 +602,9 @@ export default function Compositor() {
                   />
                 </CollapsibleContent>
               </Collapsible>
-            </CardContent>
-          </Card>
+            </PanelSection>
 
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-sm">Background</CardTitle>
-            </CardHeader>
-            <CardContent>
+          <PanelSection title="Background">
               <FieldGroup className="gap-4">
                 <Field orientation="horizontal">
                   <Checkbox
@@ -698,18 +649,20 @@ export default function Compositor() {
                   </FieldDescription>
                 </Field>
               </FieldGroup>
-            </CardContent>
-          </Card>
+            </PanelSection>
 
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-sm">Keys</CardTitle>
-            </CardHeader>
-            <CardContent>
+          <PanelSection title="Keys">
               <FieldGroup className="gap-4">
                 <Field>
-                  <FieldLabel htmlFor="azure-endpoint">Azure endpoint</FieldLabel>
+                  <FieldLabel htmlFor="azure-endpoint">Azure resource</FieldLabel>
                   <Input id="azure-endpoint" value={endpoint} onChange={(e) => setEndpoint(e.target.value)} placeholder={DEFAULT_ENDPOINT} />
+                  <FieldDescription>
+                    {resolvedUrl ? (
+                      <>Calls <code className="break-all">{resolvedUrl}</code> — only the resource host is taken from this field.</>
+                    ) : (
+                      'Paste the resource URL, or any image URL from the Azure portal.'
+                    )}
+                  </FieldDescription>
                 </Field>
                 <Field>
                   <FieldLabel htmlFor="azure-key">Azure API key</FieldLabel>
@@ -730,46 +683,66 @@ export default function Compositor() {
                   />
                 </Field>
               </FieldGroup>
-            </CardContent>
-          </Card>
+            </PanelSection>
 
-          </div>
+        </LeftPanel>
 
-          {/* Anchored run bar — mirrors pane 3's card footer. !py-3 overrides the
-              card's own vertical padding so the bar stays slim. */}
-          <Card className="shrink-0 !py-3">
-            <CardContent>
-              <Button className="w-full" disabled={!canGenerate || running} onClick={handleGenerateAll}>
-                {running && <Spinner data-icon="inline-start" />}
-                Generate &amp; Populate
+        <Canvas>
+
+            {items.length === 0 ? (
+              <Empty className="h-full min-h-40">
+                <EmptyHeader>
+                  <EmptyMedia variant="icon">
+                    <ImageIcon />
+                  </EmptyMedia>
+                  <EmptyTitle>No tiles yet</EmptyTitle>
+                  <EmptyDescription>
+                    Upload a CSV and select Generate &amp; Populate to fill this pane.
+                  </EmptyDescription>
+                </EmptyHeader>
+              </Empty>
+            ) : (
+              <TileGrid
+                items={items}
+                template={template}
+                fallbackTitle={tplTitle}
+                fallbackOffer={tplOffer}
+                offerToggle={offerVisible}
+                hasOfferCol={!!offerCol}
+                running={running}
+                registerCanvas={registerCanvas}
+                onOpen={(item) => setOpenId(item.id)}
+                onRemove={(item) => {
+                  setItems((prev) => prev.filter((it) => it.id !== item.id));
+                  setOpenId((prev) => (prev === item.id ? null : prev));
+                }}
+              />
+            )}
+        </Canvas>
+
+        <RightPanel
+          title="Export"
+          hint={items.length ? `${doneCount}/${items.length} tiles ready` : 'Generated tiles'}
+          footer={
+            <div className="space-y-2">
+              {/* No children: the Progress root renders its own track+indicator;
+                  passing another track duplicates the bar. */}
+              {progress && <Progress value={progress.pct} />}
+              <p className="text-xs break-words text-muted-foreground">
+                {progress?.text
+                  || compressSummary
+                  || (proc.compressOn ? 'Tiles are compressed locally on export.' : 'Turn on Compress PNGs to shrink the ZIP.')}
+              </p>
+              <Button className="w-full" disabled={running || !doneCount} onClick={handleExport}>
+                {running ? <Spinner data-icon="inline-start" /> : <DownloadIcon data-icon="inline-start" />}
+                Export ZIP
               </Button>
-            </CardContent>
-          </Card>
-        </section>
-
-        {/* PANE 3 — Export: generated tiles */}
-        <section
-          aria-label="Export"
-          className="min-w-0 space-y-4 lg:col-span-2 xl:col-span-1 xl:flex xl:h-(--pane-h) xl:flex-col"
+            </div>
+          }
         >
-          <PaneHeading step="03" title="Export" hint={items.length ? `${doneCount}/${items.length} tiles ready` : 'Generated tiles'} />
-
-          {/* Export-time knobs live with the export, not in the Generate pane: tile size,
-              the CDN file-size ceiling and compression all decide what lands in the ZIP. */}
-          <Card className="shrink-0 !py-3">
-            <CardContent>
-              <Collapsible open={exportOpen} onOpenChange={setExportOpen}>
-                <CollapsibleTrigger className="group flex w-full items-center justify-between text-left">
-                  <span className="text-sm font-medium">Export settings</span>
-                  <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                    {template.frame.width}×{template.frame.height}
-                    {budgetActive ? ` · ≤${budgetKbSafe} KB` : ''}
-                    {tinyKey.trim() ? ' · TinyPNG' : ''}
-                    <ChevronDownIcon className="size-4 transition-transform group-aria-expanded:rotate-180" />
-                  </span>
-                </CollapsibleTrigger>
-                <CollapsibleContent>
-                  <FieldGroup className="mt-4 gap-4">
+          {proc.panel}
+          <PanelSection>
+          <FieldGroup className="gap-4">
                     <Field>
                       <FieldLabel>
                         <Hint hint="Sets the template frame — fine-tune width, height and corners in the Design pane. Layers keep their positions, so check the preview after a big jump.">Tile size</Hint>
@@ -868,76 +841,10 @@ export default function Compositor() {
                       </FieldContent>
                     </Field>
 
-                    <Field>
-                      <FieldLabel htmlFor="tiny-key">
-                        <Hint hint="Shared with the BG Remover. Runs after the size budget, so it only takes files further under the ceiling.">TinyPNG API key</Hint>
-                      </FieldLabel>
-                      <Input
-                        id="tiny-key"
-                        type="password"
-                        value={tinyKey}
-                        onChange={(e) => setTinyKey(e.target.value)}
-                        placeholder="TinyPNG key (optional)"
-                      />
-                    </Field>
                   </FieldGroup>
-                </CollapsibleContent>
-              </Collapsible>
-            </CardContent>
-          </Card>
-
-          <Card className="xl:flex xl:min-h-0 xl:flex-1 xl:flex-col">
-          <CardContent className="xl:min-h-0 xl:flex-1 xl:overflow-y-auto">
-            {items.length === 0 ? (
-              <Empty className="h-full min-h-40">
-                <EmptyHeader>
-                  <EmptyMedia variant="icon">
-                    <ImageIcon />
-                  </EmptyMedia>
-                  <EmptyTitle>No tiles yet</EmptyTitle>
-                  <EmptyDescription>
-                    Upload a CSV and select Generate &amp; Populate to fill this pane.
-                  </EmptyDescription>
-                </EmptyHeader>
-              </Empty>
-            ) : (
-              <TileGrid
-                items={items}
-                template={template}
-                fallbackTitle={tplTitle}
-                fallbackOffer={tplOffer}
-                offerToggle={offerVisible}
-                hasOfferCol={!!offerCol}
-                running={running}
-                registerCanvas={registerCanvas}
-                onOpen={(item) => setOpenId(item.id)}
-                onRemove={(item) => {
-                  setItems((prev) => prev.filter((it) => it.id !== item.id));
-                  setOpenId((prev) => (prev === item.id ? null : prev));
-                }}
-              />
-            )}
-          </CardContent>
-          {/* Sticky action bar: run progress + single export step (compress + zip). */}
-          <CardFooter className="sticky bottom-0 gap-3 border-t bg-card !py-3">
-            <div className="min-w-0 flex-1 space-y-1.5">
-              {/* No children: the Progress root renders its own track+indicator;
-                  passing another track duplicates the bar. */}
-              {progress && <Progress value={progress.pct} />}
-              <p className="truncate text-xs text-muted-foreground">
-                {progress?.text
-                  || compressSummary
-                  || (tinyKey.trim() ? 'Tiles are compressed with TinyPNG on export.' : 'Add a TinyPNG key to compress on export.')}
-              </p>
-            </div>
-            <Button disabled={running || !doneCount} onClick={handleExport}>
-              {running ? <Spinner data-icon="inline-start" /> : <DownloadIcon data-icon="inline-start" />}
-              Export ZIP
-            </Button>
-          </CardFooter>
-          </Card>
-        </section>
-      </div>
+          </PanelSection>
+        </RightPanel>
+      </StudioShell>
 
       <TileDialog
         item={openItem}
@@ -954,14 +861,4 @@ export default function Compositor() {
   );
 }
 
-// Pane heading: step number + role. The numbering is real information here —
-// the three panes are the actual pipeline order (design → generate → export).
-function PaneHeading({ step, title, hint }: { step: string; title: string; hint: string }) {
-  return (
-    <div className="flex items-baseline gap-2 px-1">
-      <span className="font-mono text-xs text-primary">{step}</span>
-      <h2 className="text-sm font-semibold tracking-wide uppercase">{title}</h2>
-      <span className="ml-auto text-xs text-muted-foreground">{hint}</span>
-    </div>
-  );
-}
+

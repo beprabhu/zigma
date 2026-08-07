@@ -9,7 +9,6 @@ import { cn } from '@/lib/utils';
 import {
   planTile,
   renderTile,
-  scaleRect,
   TRANSPARENT,
   type Rect,
   type SafeAreaConfig,
@@ -33,11 +32,26 @@ export interface TilePreviewProps {
   showOverlay?: boolean;
   /** Longest edge of the rendered preview in CSS px. Default 320. */
   maxSize?: number;
+  /**
+   * previewWidth / fullWidth when `source` is a downscaled preview of the real cutout, so the
+   * upscale guard and the caption's subject % speak in full-resolution terms. Default 1.
+   */
+  sourceScale?: number;
+  /** The "600 × 768 · subject N%" line under the tile. On for panels, off for grid cells. */
+  showCaption?: boolean;
   className?: string;
 }
 
-function rectStyle(rect: Rect): React.CSSProperties {
-  return { left: rect.x, top: rect.y, width: rect.width, height: rect.height };
+// Percentages of the tile, not preview pixels: the frame below is allowed to shrink to fit its
+// container, so an overlay measured in px would drift off the artwork at any size but the
+// nominal one.
+function rectStyle(rect: Rect, tileW: number, tileH: number): React.CSSProperties {
+  return {
+    left: `${(rect.x / tileW) * 100}%`,
+    top: `${(rect.y / tileH) * 100}%`,
+    width: `${(rect.width / tileW) * 100}%`,
+    height: `${(rect.height / tileH) * 100}%`,
+  };
 }
 
 export function TilePreview({
@@ -46,41 +60,50 @@ export function TilePreview({
   config,
   showOverlay = true,
   maxSize = DEFAULT_MAX_SIZE,
+  sourceScale = 1,
+  showCaption = true,
   className,
 }: TilePreviewProps): React.JSX.Element {
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
 
   // planTile is canvas-free and allocation-light; safe to run on every config tick.
-  const layout = React.useMemo(() => planTile(config, bounds), [config, bounds]);
+  const layout = React.useMemo(
+    () => planTile(config, bounds, sourceScale),
+    [config, bounds, sourceScale],
+  );
 
   const tileW = Math.max(1, Math.round(config.tile.width));
   const tileH = Math.max(1, Math.round(config.tile.height));
   const box = Number.isFinite(maxSize) && maxSize > 0 ? maxSize : DEFAULT_MAX_SIZE;
-  const factor = box / Math.max(tileW, tileH);
-  const viewW = tileW * factor;
-  const viewH = tileH * factor;
+  // Nominal size only — the frame carries max-width/max-height so a container narrower than this
+  // (a grid cell at GRID_MIN_CELL, say) shrinks the tile instead of cropping it. aspect-ratio is
+  // what keeps the two axes locked while that happens.
+  const viewW = (tileW / Math.max(tileW, tileH)) * box;
 
   // A preview never needs more pixels than it displays. Rendering at full tile resolution
   // would put a 2048x2048 backing store behind every cell of a batch grid (~16 MB each, and
   // re-rendered on every safe-area tick). Exports call renderTile with the real config, so
   // this only ever shrinks what is on screen.
-  const renderConfig = React.useMemo(() => {
+  const { renderConfig, renderScale } = React.useMemo(() => {
     const dpr = typeof window === 'undefined' ? 1 : Math.min(window.devicePixelRatio || 1, 2);
     const scale = Math.min(1, (box * dpr) / Math.max(tileW, tileH));
-    if (scale >= 1) return config;
+    if (scale >= 1) return { renderConfig: config, renderScale: 1 };
     return {
-      ...config,
-      tile: { width: config.tile.width * scale, height: config.tile.height * scale },
-      // Percent margins are relative and survive scaling untouched; pixel ones must follow.
-      margins:
-        config.marginUnit === 'px'
-          ? {
-              top: config.margins.top * scale,
-              right: config.margins.right * scale,
-              bottom: config.margins.bottom * scale,
-              left: config.margins.left * scale,
-            }
-          : config.margins,
+      renderScale: scale,
+      renderConfig: {
+        ...config,
+        tile: { width: config.tile.width * scale, height: config.tile.height * scale },
+        // Percent margins are relative and survive scaling untouched; pixel ones must follow.
+        margins:
+          config.marginUnit === 'px'
+            ? {
+                top: config.margins.top * scale,
+                right: config.margins.right * scale,
+                bottom: config.margins.bottom * scale,
+                left: config.margins.left * scale,
+              }
+            : config.margins,
+      },
     };
   }, [config, box, tileW, tileH]);
 
@@ -91,7 +114,10 @@ export function TilePreview({
     if (!canvas) return;
     // The canvas instance is reused across renders — renderTile resizes and clears it in place.
     if (source) {
-      renderTile(source, renderConfig, { bounds, canvas });
+      // The guard ratio composes BOTH downscales: the source is a preview of the full cutout
+      // (sourceScale) and the tile itself renders shrunken to screen size (renderScale). One
+      // real pixel therefore equals sourceScale / renderScale source-bitmap pixels here.
+      renderTile(source, renderConfig, { bounds, canvas, sourceScale: sourceScale / renderScale });
       return;
     }
     const w = Math.max(1, Math.round(renderConfig.tile.width));
@@ -105,21 +131,35 @@ export function TilePreview({
       ctx.fillStyle = config.background;
       ctx.fillRect(0, 0, w, h);
     }
-  }, [source, bounds, config, renderConfig]);
+  }, [source, bounds, config, renderConfig, renderScale, sourceScale]);
 
-  const safeView = scaleRect(layout.safe, factor);
   const subject = layout.subject;
-  const subjectView = subject ? scaleRect(subject, factor) : null;
   // null means "no subject at all". A subject scaled to nothing (fill 0, or margins that ate the
   // safe area) still exists and must not be reported as missing.
-  const scalePct = subject ? Math.round(subject.scale * 100) : null;
+  // Reported in full-resolution terms: preview-space scale × sourceScale is what the export
+  // will actually do to the image's real pixels.
+  const scalePct = subject ? Math.round(subject.scale * sourceScale * 100) : null;
 
   return (
-    <div className={cn('flex w-full flex-col items-center', className)}>
+    // h-full lets the frame's max-height resolve against a height-constrained parent (the
+    // square grid cell); in an auto-height parent like the properties panel it is inert.
+    // min-w-0/min-h-0: as a grid (or flex) item this defaults to min-*:auto, which refuses to
+    // shrink below the frame's nominal size — w-full/h-full would then never bind and the frame
+    // would overflow a smaller cell and be cropped by its overflow-hidden.
+    <div
+      className={cn(
+        'flex h-full min-h-0 w-full min-w-0 flex-col items-center justify-center',
+        className,
+      )}
+    >
       {/* No corner rounding: the tile's own edge pixels are part of the artwork. */}
       <div
-        className="relative overflow-hidden ring-1 ring-border"
-        style={{ width: viewW, height: viewH, background: CHECKERBOARD }}
+        className="relative max-h-full max-w-full overflow-hidden ring-1 ring-border"
+        style={{
+          width: viewW,
+          aspectRatio: `${tileW} / ${tileH}`,
+          background: CHECKERBOARD,
+        }}
       >
         <canvas
           ref={canvasRef}
@@ -131,21 +171,23 @@ export function TilePreview({
           <div className="pointer-events-none absolute inset-0" aria-hidden="true">
             <div
               className="absolute border border-dashed border-primary/70"
-              style={rectStyle(safeView)}
+              style={rectStyle(layout.safe, tileW, tileH)}
             />
-            {subjectView && subjectView.width >= 1 && subjectView.height >= 1 && (
+            {subject && subject.width > 0 && subject.height > 0 && (
               <div
                 className="absolute border border-foreground/25"
-                style={rectStyle(subjectView)}
+                style={rectStyle(subject, tileW, tileH)}
               />
             )}
           </div>
         )}
       </div>
-      <div className="mt-2 text-center text-[11px] text-muted-foreground tabular-nums">
-        {tileW} × {tileH}
-        {scalePct === null ? ' · no subject' : ` · subject ${scalePct}%`}
-      </div>
+      {showCaption && (
+        <div className="mt-2 text-center text-[11px] text-muted-foreground tabular-nums">
+          {tileW} × {tileH}
+          {scalePct === null ? ' · no subject' : ` · subject ${scalePct}%`}
+        </div>
+      )}
     </div>
   );
 }

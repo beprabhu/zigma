@@ -60,8 +60,26 @@ const failures = new Map<string, number>();
 const listeners = new Map<string, Set<() => void>>();
 let cachedBytes = 0;
 
-function entryKey(key: number, edge: number): string {
-  return `${key}@${edge}`;
+// The BLOB is part of the cache identity, not just the item id. An item's cutout can be
+// REPLACED under the same id (redo, AI edit, project restore) — and with an id-only key, a
+// stale decode of the old blob could be re-created during the replacement window and then
+// served for the new cutout indefinitely: wrong pixels AND a wrong previewScale, which is what
+// drew "zoomed crop" tiles after an AI-fix pass. Tokens are handed out per Blob instance via a
+// WeakMap, so a new blob can never collide with the old one's entries.
+const blobTokens = new WeakMap<Blob, number>();
+let nextBlobToken = 1;
+
+function tokenOf(blob: Blob): number {
+  let token = blobTokens.get(blob);
+  if (token === undefined) {
+    token = nextBlobToken++;
+    blobTokens.set(blob, token);
+  }
+  return token;
+}
+
+function entryKey(key: number, blob: Blob, edge: number): string {
+  return `${key}@${tokenOf(blob)}@${edge}`;
 }
 
 function belongsTo(cacheKey: string, key: number): boolean {
@@ -171,7 +189,7 @@ function recentlyFailed(cacheKey: string): boolean {
  * decode instead of racing N of them.
  */
 function requestDecode(key: number, blob: Blob, edge: number): void {
-  const cacheKey = entryKey(key, edge);
+  const cacheKey = entryKey(key, blob, edge);
   if (cache.has(cacheKey) || inFlight.has(cacheKey) || recentlyFailed(cacheKey)) return;
 
   const task: DecodeTask = { cancelled: false, started: false };
@@ -256,7 +274,7 @@ export function usePreview(request: PreviewRequest | null): ImageBitmap | null {
   const key = request?.key ?? null;
   const blob = request?.blob ?? null;
   const edge = request?.edge ?? 0;
-  const cacheKey = key === null ? null : entryKey(key, edge);
+  const cacheKey = key === null || blob === null ? null : entryKey(key, blob, edge);
 
   const subscribe = React.useCallback(
     (onStoreChange: () => void) =>

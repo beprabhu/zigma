@@ -1,6 +1,12 @@
 import type { NextConfig } from "next"
 
 const nextConfig: NextConfig = {
+  // Turbopack infers the workspace root from lockfile locations, so a stray
+  // lockfile anywhere up the directory tree silently re-roots the build. Pin
+  // the root to this project so inference never gets a vote.
+  turbopack: {
+    root: __dirname,
+  },
   // The background-removal engine runs ONNX models through onnxruntime-web's
   // multithreaded WASM backend, which needs SharedArrayBuffer. SharedArrayBuffer
   // is only exposed to cross-origin-isolated documents, which requires this exact

@@ -6,7 +6,6 @@ import { Lexend } from "next/font/google"
 import "./app.css"
 import { AppSidebar } from "@/components/app-sidebar"
 import { ThemeProvider } from "@/components/theme-provider"
-import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar"
 import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
 
@@ -37,16 +36,14 @@ export default function RootLayout({
           cross-origin script — it only produced a console error on every load. */}
       <body>
         <ThemeProvider>
-          {/* SidebarMenuButton's collapsed-mode tooltips need a Tooltip provider
-              above the sidebar. */}
           <TooltipProvider>
-            <SidebarProvider>
+            {/* Figma-style fixed rail + content. min-w-0 on <main>: as a flex child it
+                defaults to min-width:auto, so a wide product page would push the document
+                wider than the viewport instead of shrinking to fit. */}
+            <div className="flex min-h-dvh w-full">
               <AppSidebar />
-              {/* min-w-0: as a flex child the inset defaults to min-width:auto, so a
-                  wide product page (the compositor's three panes) would push the
-                  document wider than the viewport instead of shrinking to fit. */}
-              <SidebarInset className="min-w-0">{children}</SidebarInset>
-            </SidebarProvider>
+              <main className="min-w-0 flex-1">{children}</main>
+            </div>
           </TooltipProvider>
           <Toaster />
         </ThemeProvider>

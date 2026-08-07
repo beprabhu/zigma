@@ -203,13 +203,20 @@ export function fitToSafeArea(
   subject: { w: number; h: number },
   safe: Rect,
   cfg: SafeAreaConfig,
+  /**
+   * How many SOURCE pixels one full-resolution pixel maps to — 1 for a full-res source, and
+   * previewWidth / fullWidth (< 1) when fitting a downscaled preview. The no-upscale guard is
+   * a statement about REAL pixels, so a preview must be allowed to scale up to 1/sourceScale
+   * before the guard bites, or thumbnails cap early and disagree with the export.
+   */
+  sourceScale = 1,
 ): SubjectPlacement {
   const fill = clamp(cfg.fill, 0, 1);
   const sw = Math.max(0, subject.w);
   const sh = Math.max(0, subject.h);
   const fits = sw > 0 && sh > 0 && safe.width > 0 && safe.height > 0;
   let scale = fits ? Math.min(safe.width / sw, safe.height / sh) * fill : 0;
-  if (!cfg.allowUpscale) scale = Math.min(scale, 1);
+  if (!cfg.allowUpscale) scale = Math.min(scale, sourceScale > 0 ? 1 / sourceScale : 1);
   if (!Number.isFinite(scale) || scale < 0) scale = 0;
   const width = sw * scale;
   const height = sh * scale;
@@ -231,7 +238,11 @@ export interface TileLayout {
 
 // Everything an overlay needs, in tile pixels: the frame, the safe rect and where the subject
 // lands. Cheap and canvas-free, so it can drive React state on every config change.
-export function planTile(cfg: SafeAreaConfig, bounds: SubjectBounds | null): TileLayout {
+export function planTile(
+  cfg: SafeAreaConfig,
+  bounds: SubjectBounds | null,
+  sourceScale = 1,
+): TileLayout {
   const tile: Rect = {
     x: 0,
     y: 0,
@@ -239,7 +250,7 @@ export function planTile(cfg: SafeAreaConfig, bounds: SubjectBounds | null): Til
     height: Math.max(0, cfg.tile.height),
   };
   const safe = resolveSafeArea(cfg);
-  return { tile, safe, subject: bounds ? fitToSafeArea(bounds, safe, cfg) : null };
+  return { tile, safe, subject: bounds ? fitToSafeArea(bounds, safe, cfg, sourceScale) : null };
 }
 
 // Tile pixels -> preview pixels; factor is previewWidth / cfg.tile.width.
@@ -268,6 +279,14 @@ export interface RenderTileOptions {
   bounds?: SubjectBounds | null;
   // Reused across preview ticks so a slider drag does not allocate a canvas per frame.
   canvas?: HTMLCanvasElement;
+  /**
+   * Handed straight to fitToSafeArea's sourceScale (see there). Exports render full-res
+   * sources at full-res configs and leave this at 1; TilePreview renders a downscaled source
+   * onto a downscaled tile and passes previewScale / tileShrink so the no-upscale guard still
+   * measures REAL pixels. Without it, thumbnails cap subjects at preview resolution and draw
+   * them at sizes the export would never produce.
+   */
+  sourceScale?: number;
 }
 
 export function renderTile(
@@ -292,7 +311,7 @@ export function renderTile(
   const bounds = opts.bounds !== undefined ? opts.bounds : measureSubject(source);
   if (!bounds || bounds.w <= 0 || bounds.h <= 0) return canvas;
 
-  const dest = fitToSafeArea(bounds, resolveSafeArea(cfg), cfg);
+  const dest = fitToSafeArea(bounds, resolveSafeArea(cfg), cfg, opts.sourceScale ?? 1);
   // drawImage raises IndexSizeError on a zero-width source rect and no-ops on a zero-width
   // destination, so bail before either can happen (fill = 0, or margins that ate the tile).
   if (dest.width <= 0 || dest.height <= 0) return canvas;

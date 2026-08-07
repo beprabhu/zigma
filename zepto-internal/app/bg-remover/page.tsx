@@ -15,11 +15,7 @@ import {
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import {
-  Card, CardContent, CardFooter, CardHeader, CardTitle,
-} from '@/components/ui/card';
 import { Hint } from '@/components/hint';
-import { HintCardHeader } from '@/components/hint-card-header';
 import { Checkbox } from '@/components/ui/checkbox';
 import {
   Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle,
@@ -32,15 +28,14 @@ import { Progress } from '@/components/ui/progress';
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
-import { Separator } from '@/components/ui/separator';
 import { Spinner } from '@/components/ui/spinner';
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 
-import { ProductHeader } from '@/components/product-header';
 import { ResultCell } from '@/components/result-cell';
+import { Canvas, LeftPanel, PanelSection, RightPanel, StudioShell } from '@/components/pane-layout';
+import { useProcessing } from '@/components/process-panel';
 import {
   CompareDialog, CutoutImage, SourceImage, backdropStyle, statusLine,
 } from '@/components/bg-remover/bg-queue-list';
@@ -60,10 +55,10 @@ import {
 } from '@/lib/bg/safe-area';
 import {
   SETUP_HINT, canRetry, canvasToPngBlob, canvasToPngBytes, createItems, describeDownload, draftsFromCsv, errorMessage,
-  exportFileNames, extractTinifyKey, flattenOnBackground, formatKb, isAbortError,
+  exportFileNames, flattenOnBackground, formatKb, isAbortError,
   decodeCutout, loadImageFromFile, looksLikeMissingWeights, mapWithLimit, needsCutout,
   nextItemId, pickSave, previewScale, releaseCanvas, releaseItem, releaseOriginal, saveTo, withCutout,
-  type BgCutout, type BgItem, type BgItemDraft, type BgItemStatus, type CutoutItem,
+  type BgItem, type BgItemDraft, type BgItemStatus,
 } from '@/lib/bg/batch';
 import { describeBudget, fitToBudget, type BudgetResult } from '@/lib/bg/budget';
 import { isPng8Supported } from '@/lib/bg/png8';
@@ -78,13 +73,6 @@ import { STORE_TYPE } from '@/lib/bg/constants';
 import { callAzure, loadImageFromUrl, mockComposite } from '@/lib/pipeline';
 import { buildZip, type ZipFileEntry } from '@/lib/zip';
 import { cn } from '@/lib/utils';
-
-type BgTab = 'remove' | 'tile';
-
-// Pane height = viewport minus ProductHeader (h-12 + border), the tab bar (h-11 + border) and
-// the work grid's own vertical padding (p-5 top 1.25rem + pb-6 bottom 1.5rem). Same trick as
-// app/compositor/page.tsx — if any of those change, this arithmetic changes with them.
-const PANE_HEIGHT = 'calc(100dvh - 3rem - 1px - 2.75rem - 1px - 2.75rem)';
 
 const WHITE = '#ffffff';
 const DEFAULT_CUSTOM_BG = '#f4f4f5';
@@ -106,23 +94,18 @@ const BUDGET_KB_STEP = 50;
 const BUDGET_TOAST_NAMES = 3;
 // Decode edges for the two tile previews. Both go through the shared preview cache.
 const TILE_PREVIEW_EDGE = 512;
-const TILE_CELL_EDGE = 256;
 // Result-grid geometry. Rows must be uniform for windowing, so these are fixed rather than
 // breakpoint-driven; the column count is measured from the pane width instead.
 const GRID_MIN_CELL = 150;
 const GRID_GAP = 14;
 // Two text lines now: the name and the status line the old queue rows carried.
 const GRID_LABEL_HEIGHT = 40;
-const TILE_CELL_HEIGHT = 236;
 /** Settings a single redo may override without touching the global ones. */
 interface RunOverrides {
   model?: BgModelId;
   refine?: boolean;
 }
 
-// Stable identities so the inactive tab's grid does not remount its (empty) contents.
-const EMPTY_ITEMS: BgItem[] = [];
-const EMPTY_CUTOUTS: CutoutItem[] = [];
 
 // Ships as the AI-edit prompt so the flow works out of the box. The reference image carries the
 // product's identity, so one generic prompt covers every SKU; fidelity comes first and loudest
@@ -245,7 +228,8 @@ function usePersistedState<T>(key: string, initial: T): [T, (v: T | ((p: T) => T
 }
 
 export default function BgRemover() {
-  const [tab, setTab] = React.useState<BgTab>('remove');
+  // Tile fit is a processing switch on the right pane now, not a mode of its own.
+  const [tileFitOn, setTileFitOn] = usePersistedState('skuc_bgTileFit', false);
 
   // ---- Settings (persisted) ----
   const [storedModel, setModelId] = usePersistedState<BgModelId>('skuc_bgModel', DEFAULT_MODEL_ID);
@@ -258,8 +242,6 @@ export default function BgRemover() {
   const [productOnly, setProductOnly] = usePersistedState('skuc_bgProductOnly', false);
   const [outputBg, setOutputBg] = usePersistedState('skuc_bgOutput', TRANSPARENT);
   const [safeArea, setSafeArea] = usePersistedState<SafeAreaConfig>('skuc_bgSafeArea', DEFAULT_SAFE_AREA);
-  // Shared with the compositor — the TinyPNG key is entered once for the whole suite.
-  const [tinyKey, setTinyKey] = usePersistedState('skuc_tinyKey', '');
   // Azure credentials are the compositor's own keys, read from the same storage so the two
   // products never hold different values; only the default prompt is this product's.
   const [azureEndpoint, setAzureEndpoint] = usePersistedState('skuc_azureEndpoint', '');
@@ -335,7 +317,6 @@ export default function BgRemover() {
 
   // Each tab has its own results pane element; the grids window against whichever is mounted.
   const removeScrollRef = React.useRef<HTMLDivElement>(null);
-  const tileScrollRef = React.useRef<HTMLDivElement>(null);
 
   const abortRef = React.useRef<AbortController | null>(null);
   // The run loop reads the queue across awaits, so it needs the committed value, not a closure.
@@ -425,6 +406,8 @@ export default function BgRemover() {
 
   // Stable so the memoised result cells are not invalidated on every render.
   const selectById = React.useCallback((id: number) => setSelectedId(id), []);
+  const proc = useProcessing({ prefix: 'skuc_bg', busy });
+
   const removeById = React.useCallback((id: number) => {
     const item = itemsRef.current.find((it) => it.id === id);
     if (!item) return;
@@ -588,7 +571,7 @@ export default function BgRemover() {
       });
       setSafeArea(restored.safeArea);
       setOutputBg(restored.outputBg);
-      setTab('tile');
+      setTileFitOn(true);
       const count = restored.items.length;
       toast.success(
         `${file.name}: restored ${count} cutout${count === 1 ? '' : 's'} — safe-area settings applied, ready for tile fit.`,
@@ -807,7 +790,7 @@ export default function BgRemover() {
   }
 
   function handleRun() {
-    void runBatch(pending, tab === 'tile' ? 'Preparing' : 'Removing');
+    void runBatch(pending, 'Removing');
   }
 
   function aiEditGuards(): { prompt: string; mock: boolean } | null {
@@ -975,8 +958,7 @@ export default function BgRemover() {
   async function handleExport() {
     const ready = withCutout(itemsRef.current);
     if (!ready.length || busy) return;
-    const key = extractTinifyKey(tinyKey);
-    const tiles = tab === 'tile';
+    const tiles = tileFitOn;
     // The save dialog opens now, while the click still counts as user activation — after
     // minutes of encoding Chrome would refuse it. Cancelling the dialog cancels the export.
     const zipName = tiles ? 'safe-area-tiles.zip' : 'bg-cutouts.zip';
@@ -1020,9 +1002,9 @@ export default function BgRemover() {
           const data = budgeted ? budgeted.bytes : await canvasToPngBytes(canvas);
           releaseCanvas(canvas);
           encoded++;
-          // The compress half only exists when a TinyPNG key is set; without one the encode
+          // The compress half only exists when the compress switch is on; without it the encode
           // stage owns the whole bar, or it would stall at 50% until the run ended.
-          const span = key ? 50 : 100;
+          const span = proc.compressOn ? 50 : 100;
           setProgress({
             pct: (encoded / ready.length) * span,
             text: `Encoding ${encoded} of ${ready.length}…`,
@@ -1033,22 +1015,13 @@ export default function BgRemover() {
         }
       });
 
-      // TinyPNG is a rate-limited third-party API, so this stays deliberately narrower than the
-      // encode fan-out. A failure here keeps the uncompressed PNG rather than dropping an image.
+      // The processing space's shared compress step (pngquant + oxipng, local). A failure
+      // keeps the uncompressed PNG rather than dropping an image.
       let compressed = 0;
-      const finalBytes = key
+      const finalBytes = proc.compressOn
         ? await mapWithLimit(pngs, COMPRESS_CONCURRENCY, async (data, n) => {
             try {
-              const res = await fetch('/api/compress', {
-                method: 'POST',
-                headers: { 'x-tinify-key': key, 'Content-Type': 'application/octet-stream' },
-                body: data as unknown as BodyInit,
-              });
-              if (!res.ok) {
-                const detail = (await res.json().catch(() => null)) as { error?: string } | null;
-                throw new Error(detail?.error || `Compression failed (${res.status})`);
-              }
-              const out = new Uint8Array(await res.arrayBuffer());
+              const out = await proc.compressBytes(data);
               inTotal += data.length;
               outTotal += out.length;
               return out;
@@ -1060,7 +1033,7 @@ export default function BgRemover() {
               compressed++;
               setProgress({
                 pct: 50 + (compressed / ready.length) * 50,
-                text: `Compressing ${compressed} of ${ready.length} with TinyPNG…`,
+                text: `Compressing ${compressed} of ${ready.length}…`,
               });
             }
           })
@@ -1128,11 +1101,10 @@ export default function BgRemover() {
       if (budgetLine) summary.push(budgetLine);
       if (outTotal) {
         summary.push(
-          `TinyPNG: ${formatKb(inTotal)} → ${formatKb(outTotal)} (saved ${Math.round((1 - outTotal / inTotal) * 100)}%)`,
+          `Compressed: ${formatKb(inTotal)} → ${formatKb(outTotal)} (saved ${Math.round((1 - outTotal / inTotal) * 100)}%)`,
         );
       }
       setCompressSummary(summary.join(' · '));
-      if (!key) toast.info('No TinyPNG key set — exporting uncompressed PNGs.');
       setProgress({
         pct: 100,
         text: failed
@@ -1161,9 +1133,7 @@ export default function BgRemover() {
   }
 
   const inputCard = (
-    <Card>
-      <HintCardHeader title="Images" hint="Files, a clipboard paste, or a CSV of image URLs." />
-      <CardContent>
+    <PanelSection title="Images" hint="Files, a clipboard paste, or a CSV of image URLs.">
         <ImageDropzone onAdd={handleAdd} onCsv={handleCsv} onProject={(file) => void handleProject(file)} itemCount={items.length} disabled={busy} />
         {csvInfo && (
           <div className="mt-4 space-y-4 border-t pt-4">
@@ -1221,8 +1191,7 @@ export default function BgRemover() {
             </Field>
           </div>
         )}
-      </CardContent>
-    </Card>
+      </PanelSection>
   );
 
   // The queue used to be a separate card of rows here; the results grid IS the queue now —
@@ -1235,12 +1204,8 @@ export default function BgRemover() {
     azureEndpoint.trim().length > 0 && azureKey.trim().length > 0 ||
     (typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('mock'));
   const aiCard = (
-    <Card>
-      <HintCardHeader
-        title="AI edit"
-        hint="Send an image to Azure GPT-Image from its dialog; the result replaces the image and its background is removed again."
-      />
-      <CardContent>
+    <PanelSection title="AI edit"
+        hint="Send an image to Azure GPT-Image from its dialog; the result replaces the image and its background is removed again.">
         <FieldGroup className="gap-4">
           <Field>
             <FieldLabel htmlFor="bg-ai-prompt">
@@ -1296,18 +1261,66 @@ export default function BgRemover() {
             />
           </Field>
         </FieldGroup>
-      </CardContent>
-    </Card>
+      </PanelSection>
+  );
+
+  // Tile fit — the old second tab, now a properties section: switch it on, tune the safe
+  // area, and the export renders tiles instead of raw cutouts. The live preview shows the
+  // SELECTED cutout, Figma-style: pick on the canvas, preview in the properties.
+  const tileFitCard = (
+    <PanelSection className="space-y-4">
+        <Field orientation="horizontal">
+          <Switch
+            id="bg-tile-fit"
+            checked={tileFitOn}
+            disabled={busy}
+            onCheckedChange={(checked) => setTileFitOn(checked === true)}
+            className="mt-0.5"
+          />
+          <FieldContent>
+            <FieldLabel htmlFor="bg-tile-fit" className="font-normal">
+              Tile fit
+            </FieldLabel>
+            <FieldDescription>
+              Export composites every cutout into the safe area below instead of keeping the
+              source frame.
+            </FieldDescription>
+          </FieldContent>
+        </Field>
+        {tileFitOn && (
+          <>
+            <SafeAreaControls
+              config={safeArea}
+              onChange={setSafeArea}
+              onReset={() => setSafeArea(structuredClone(DEFAULT_SAFE_AREA))}
+              disabled={busy}
+            />
+            <div className="rounded-xl bg-muted/30 p-3">
+              <TilePreview
+                source={selectedPreview}
+                bounds={selectedPreviewBounds}
+                config={safeArea}
+                showOverlay
+                maxSize={240}
+                sourceScale={
+                  selected?.cutout && selectedPreview
+                    ? previewScale(selected.cutout, selectedPreview)
+                    : 1
+                }
+              />
+              <p className="mt-1 truncate text-center text-xs text-muted-foreground">
+                {selected?.name || 'Select a cutout on the canvas to preview it'}
+              </p>
+            </div>
+          </>
+        )}
+      </PanelSection>
   );
 
   const keyCard = (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-sm">Compression</CardTitle>
-      </CardHeader>
-      <CardContent>
-        {/* CardContent sets no gap and Field carries no margin, so the fields need a group to
-            space them — same wrapper the Model card uses. */}
+    <PanelSection title="Compression">
+        {/* Field carries no margin, so the fields need a group to space them — same wrapper
+            the Model section uses. */}
         <FieldGroup className="gap-4">
           <Field orientation="horizontal">
             <Checkbox
@@ -1397,44 +1410,27 @@ export default function BgRemover() {
             </>
           )}
 
-          <Field>
-            <FieldLabel htmlFor="tiny-key">
-              <Hint hint="Shared with the Compositor. Exports go through TinyPNG when it is set.">
-                TinyPNG API key
-              </Hint>
-            </FieldLabel>
-            <Input
-              id="tiny-key"
-              type="password"
-              value={tinyKey}
-              onChange={(e) => setTinyKey(e.target.value)}
-              placeholder="TinyPNG key (optional)"
-            />
-          </Field>
         </FieldGroup>
-      </CardContent>
-    </Card>
+      </PanelSection>
   );
 
   const runFooter = (
-    <Card className="shrink-0 !py-3">
-      <CardContent className="flex gap-2">
-        <Button className="flex-1" disabled={busy || !pending.length} onClick={handleRun}>
-          {running ? <Spinner data-icon="inline-start" /> : <WandSparklesIcon data-icon="inline-start" />}
-          {pending.length
-            ? `${tab === 'tile' ? 'Run batch' : 'Remove backgrounds'} (${pending.length})`
-            : items.length
-              ? 'All images cut out'
-              : 'Nothing queued'}
+    <div className="flex gap-2">
+      <Button className="flex-1" disabled={busy || !pending.length} onClick={handleRun}>
+        {running ? <Spinner data-icon="inline-start" /> : <WandSparklesIcon data-icon="inline-start" />}
+        {pending.length
+          ? `Remove backgrounds (${pending.length})`
+          : items.length
+            ? 'All images cut out'
+            : 'Nothing queued'}
+      </Button>
+      {running && (
+        <Button variant="outline" onClick={handleCancel}>
+          <CircleStopIcon data-icon="inline-start" />
+          Cancel
         </Button>
-        {running && (
-          <Button variant="outline" onClick={handleCancel}>
-            <CircleStopIcon data-icon="inline-start" />
-            Cancel
-          </Button>
-        )}
-      </CardContent>
-    </Card>
+      )}
+    </div>
   );
 
   // progress.text is never cleared once a run or an export has finished, so the compression
@@ -1442,34 +1438,32 @@ export default function BgRemover() {
   const statusLine =
     (download && describeDownload(download)) ||
     [progress?.text, compressSummary].filter(Boolean).join(' · ') ||
-    (tinyKey.trim()
-      ? 'Exports are compressed with TinyPNG.'
-      : 'Everything runs locally — nothing leaves this browser.');
+    'Everything runs locally — nothing leaves this browser.';
 
   const exportFooter = (
-    <CardFooter className="sticky bottom-0 gap-3 border-t bg-card !py-3">
-      <div className="min-w-0 flex-1 space-y-1.5">
-        {progress && <Progress value={progress.pct} />}
-        {download?.ratio != null && <Progress value={download.ratio * 100} />}
-        <p className="truncate text-xs text-muted-foreground">
-          {statusLine}
-          {stage && stage !== 'done' ? ` · ${stage}` : ''}
-        </p>
+    <div className="space-y-2">
+      {progress && <Progress value={progress.pct} />}
+      {download?.ratio != null && <Progress value={download.ratio * 100} />}
+      <p className="text-xs break-words text-muted-foreground">
+        {statusLine}
+        {stage && stage !== 'done' ? ` · ${stage}` : ''}
+      </p>
+      <div className="flex flex-col gap-2">
+        <Button
+          variant="outline"
+          disabled={busy || !cutouts.length}
+          onClick={() => void handleSaveProject()}
+          title="Everything needed to reopen this batch later — cutouts, bounds and safe-area settings — without re-running the models"
+        >
+          <SaveIcon data-icon="inline-start" />
+          Save project
+        </Button>
+        <Button disabled={busy || !cutouts.length} onClick={handleExport}>
+          {exporting ? <Spinner data-icon="inline-start" /> : <DownloadIcon data-icon="inline-start" />}
+          Export ZIP
+        </Button>
       </div>
-      <Button
-        variant="outline"
-        disabled={busy || !cutouts.length}
-        onClick={() => void handleSaveProject()}
-        title="Everything needed to reopen this batch later — cutouts, bounds and safe-area settings — without re-running the models"
-      >
-        <SaveIcon data-icon="inline-start" />
-        Save project
-      </Button>
-      <Button disabled={busy || !cutouts.length} onClick={handleExport}>
-        {exporting ? <Spinner data-icon="inline-start" /> : <DownloadIcon data-icon="inline-start" />}
-        Export ZIP
-      </Button>
-    </CardFooter>
+    </div>
   );
 
   const emptyState = (
@@ -1499,37 +1493,20 @@ export default function BgRemover() {
 
   return (
     <div className="flex min-h-dvh flex-col">
-      <ProductHeader title="BG Remover" description="Browser-side background removal">
-        <Badge variant={modelReady ? 'default' : 'outline'} className="hidden md:inline-flex">
-          {spec.label}
-          {modelReady
-            ? ` · ready${backendLabel ? ` · ${backendLabel}` : ''}`
-            : spec.approxSizeMb
-              ? ` · ${spec.approxSizeMb} MB`
-              : ''}
-        </Badge>
-      </ProductHeader>
-
-      <Tabs
-        value={tab}
-        onValueChange={(value) => setTab(value as BgTab)}
-        className="flex flex-1 flex-col gap-0"
-      >
-        <div className="flex h-11 shrink-0 items-center border-b px-5">
-          <TabsList>
-            <TabsTrigger value="remove">Remove</TabsTrigger>
-            <TabsTrigger value="tile">Tile fit</TabsTrigger>
-          </TabsList>
-        </div>
-
-        {/* TAB 1 — background removal only; output is transparent (or flattened) PNGs. */}
-        <TabsContent value="remove">
-          <WorkGrid>
-            <ControlColumn hint="Input & model" footer={runFooter}>
+      <StudioShell>
+            <LeftPanel title="Setup" hint="Input & model" footer={runFooter}>
               {inputCard}
-              <Card>
-                <HintCardHeader title="Model" hint="Weights download once, then stay cached." />
-                <CardContent>
+              <PanelSection title="Model" hint="Weights download once, then stay cached.">
+                  <div className="mb-3">
+                    <Badge variant={modelReady ? 'default' : 'outline'}>
+                      {spec.label}
+                      {modelReady
+                        ? ` · ready${backendLabel ? ` · ${backendLabel}` : ''}`
+                        : spec.approxSizeMb
+                          ? ` · ${spec.approxSizeMb} MB`
+                          : ''}
+                    </Badge>
+                  </div>
                   <FieldGroup className="gap-4">
                     <Field>
                       <FieldLabel htmlFor="bg-model" className="sr-only">Model</FieldLabel>
@@ -1669,21 +1646,11 @@ export default function BgRemover() {
                       </Button>
                     )}
                   </FieldGroup>
-                </CardContent>
-              </Card>
-              {keyCard}
+                </PanelSection>
               {aiCard}
-            </ControlColumn>
+            </LeftPanel>
 
-            <ResultColumn
-              hint={
-                items.length
-                  ? `${cutouts.length}/${items.length} cut out${flaggedCount ? ` · ${flaggedCount} flagged` : ''}`
-                  : 'Cutouts'
-              }
-              footer={exportFooter}
-              scrollRef={removeScrollRef}
-            >
+            <Canvas scrollRef={removeScrollRef}>
               {setupBanner}
               {items.length === 0 ? (
                 emptyState
@@ -1726,12 +1693,17 @@ export default function BgRemover() {
                     </div>
                   )}
                   <VirtualGrid
-                    items={tab === 'remove' ? displayItems : EMPTY_ITEMS}
+                    items={displayItems}
                     scrollRef={removeScrollRef}
                     minCellWidth={GRID_MIN_CELL}
                     gap={GRID_GAP}
-                    // Square preview box plus the filename line beneath it.
-                    cellHeight={(w) => w + GRID_LABEL_HEIGHT}
+                    // Preview box plus the filename line beneath it. In tile mode the box carries
+                    // the tile's aspect ratio, so the row height has to follow it — rows stay
+                    // uniform because every cell shares one safe-area config.
+                    cellHeight={(w) =>
+                      (tileFitOn ? w * (safeArea.tile.height / safeArea.tile.width) : w) +
+                      GRID_LABEL_HEIGHT
+                    }
                     keyOf={(item) => item.id}
                     renderItem={(item, index) => (
                       <CutoutCell
@@ -1740,6 +1712,7 @@ export default function BgRemover() {
                         selected={item.id === highlightId}
                         background={outputBg}
                         running={busy}
+                        tileConfig={tileFitOn ? safeArea : null}
                         onSelect={selectById}
                         onCompare={compareById}
                         onRemove={removeById}
@@ -1748,104 +1721,30 @@ export default function BgRemover() {
                   />
                 </>
               )}
-            </ResultColumn>
-          </WorkGrid>
-        </TabsContent>
+            </Canvas>
 
-        {/* TAB 2 — the same queue composited onto tiles through the safe-area module. */}
-        <TabsContent value="tile">
-          <WorkGrid>
-            <ControlColumn hint="Input & safe area" footer={runFooter}>
-              {inputCard}
-              <Card>
-                <HintCardHeader title="Safe area" hint="Tile size, margins and where the subject sits." />
-                <CardContent>
-                  <SafeAreaControls
-                    config={safeArea}
-                    onChange={setSafeArea}
-                    onReset={() => setSafeArea(structuredClone(DEFAULT_SAFE_AREA))}
-                    disabled={busy}
-                  />
-                </CardContent>
-              </Card>
-              {keyCard}
-              {aiCard}
-            </ControlColumn>
-
-            <ResultColumn
-              scrollRef={tileScrollRef}
+            <RightPanel
+              title="Process & export"
               hint={
-                cutouts.length
-                  ? `${cutouts.length} tile${cutouts.length > 1 ? 's' : ''} · ${safeArea.tile.width}×${safeArea.tile.height}`
-                  : 'Tiles'
+                items.length
+                  ? `${cutouts.length}/${items.length} cut out${flaggedCount ? ` · ${flaggedCount} flagged` : ''}`
+                  : 'Cutouts'
               }
               footer={exportFooter}
             >
-              {setupBanner}
-              {cutouts.length === 0 ? (
-                items.length === 0 ? (
-                  emptyState
-                ) : (
-                  <Empty className="h-full min-h-60">
-                    <EmptyHeader>
-                      <EmptyMedia variant="icon">
-                        <WandSparklesIcon />
-                      </EmptyMedia>
-                      <EmptyTitle>No cutouts yet</EmptyTitle>
-                      <EmptyDescription>
-                        Run the batch to remove backgrounds — tiles are composited from the
-                        cutouts, so every image needs one first.
-                      </EmptyDescription>
-                    </EmptyHeader>
-                  </Empty>
-                )
-              ) : (
-                <div className="space-y-4">
-                  <div className="rounded-xl bg-muted/30 p-4">
-                    <TilePreview
-                      source={selectedPreview}
-                      bounds={selectedPreviewBounds}
-                      config={safeArea}
-                      showOverlay
-                      maxSize={340}
-                    />
-                    <p className="mt-1 truncate text-center text-xs text-muted-foreground">
-                      {selected?.name || 'No selection'}
-                    </p>
-                  </div>
-                  <Separator />
-                  <VirtualGrid
-                    items={tab === 'tile' ? cutouts : EMPTY_CUTOUTS}
-                    scrollRef={tileScrollRef}
-                    minCellWidth={GRID_MIN_CELL}
-                    gap={GRID_GAP}
-                    // TilePreview caps itself at 180px tall; the rest is caption + filename.
-                    cellHeight={() => TILE_CELL_HEIGHT}
-                    keyOf={(item) => item.id}
-                    renderItem={(item, index) => (
-                      <TileCell
-                        item={item}
-                        label={item.name || `Image ${index + 1}`}
-                        selected={item.id === highlightId}
-                        config={safeArea}
-                        running={busy}
-                        onSelect={selectById}
-                        onRemove={removeById}
-                      />
-                    )}
-                  />
-                </div>
-              )}
-            </ResultColumn>
-          </WorkGrid>
-        </TabsContent>
-      </Tabs>
+              {tileFitCard}
+              {proc.panel}
+              {keyCard}
+            </RightPanel>
+          </StudioShell>
+
+
 
       {/* One dialog for the whole product: queue rows and result images open the same view. */}
       <CompareDialog
         item={compareItem}
         index={compareIndex < 0 ? 0 : compareIndex}
-        background={tab === 'tile' ? TRANSPARENT : outputBg}
+        background={outputBg}
         numbered={numberFiles}
         onClose={() => setCompareId(null)}
         models={redoModels}
@@ -1869,75 +1768,50 @@ export default function BgRemover() {
 
 // ---- Layout scaffolding ---------------------------------------------------
 
-function WorkGrid({ children }: { children: React.ReactNode }) {
-  return (
-    <div
-      className="grid items-start gap-5 p-5 pb-6 lg:grid-cols-[minmax(320px,400px)_minmax(0,1fr)] lg:items-stretch"
-      style={{ '--pane-h': PANE_HEIGHT } as React.CSSProperties}
-    >
-      {children}
-    </div>
-  );
-}
-
-interface ColumnProps {
-  hint: string;
-  children: React.ReactNode;
-  footer: React.ReactNode;
-  scrollRef?: React.RefObject<HTMLDivElement | null>;
-}
-
-function ControlColumn({ hint, children, footer }: ColumnProps) {
-  return (
-    <section aria-label="Controls" className="min-w-0 space-y-4 lg:flex lg:h-(--pane-h) lg:flex-col">
-      <PaneHeading title="Setup" hint={hint} />
-      {/* p-1 keeps focus rings from being clipped by the scroll container. */}
-      <div className="space-y-4 lg:min-h-0 lg:flex-1 lg:overflow-y-auto lg:p-1">{children}</div>
-      {footer}
-    </section>
-  );
-}
-
-function ResultColumn({ hint, children, footer, scrollRef }: ColumnProps) {
-  return (
-    <section aria-label="Results" className="min-w-0 space-y-4 lg:flex lg:h-(--pane-h) lg:flex-col">
-      <PaneHeading title="Results" hint={hint} />
-      <Card className="lg:flex lg:min-h-0 lg:flex-1 lg:flex-col">
-        {/* The element the virtual grids measure and listen to. It must be a bounded scroll
-            container at EVERY width, not just at lg: a grid whose container can grow without
-            limit reports a viewport the size of its content, so windowing degrades to rendering
-            every cell — which with a few thousand items is exactly the hang this avoids. */}
-        <CardContent
-          ref={scrollRef}
-          className="max-h-[70dvh] min-h-0 overflow-y-auto lg:max-h-none lg:flex-1"
-        >
-          {children}
-        </CardContent>
-        {footer}
-      </Card>
-    </section>
-  );
-}
-
-function PaneHeading({ title, hint }: { title: string; hint: string }) {
-  return (
-    <div className="flex items-baseline gap-2 px-1">
-      <h2 className="text-sm font-semibold tracking-wide uppercase">{title}</h2>
-      <span className="ml-auto truncate text-xs text-muted-foreground">{hint}</span>
-    </div>
-  );
-}
-
 // Both result grids are memoised per cell. A batch patches state once per finished image, and
 // re-rendering every cell each time cost more than the inference did once a queue got long.
 // selected/label/background are primitives and onSelect is stable, so only the changed cell
 // re-renders.
+/**
+ * A cutout composited on its tile, for the canvas cells when Tile fit is on. Split out so the
+ * preview-cache hook only exists while a cell is on screen — with virtualisation that is a few
+ * dozen decodes, not one per queued image.
+ */
+function TileFitThumb({
+  itemId,
+  cutout,
+  config,
+}: {
+  itemId: number;
+  cutout: NonNullable<BgItem['cutout']>;
+  config: SafeAreaConfig;
+}) {
+  const preview = usePreview({ key: itemId, blob: cutout.blob, edge: 256 });
+  const scale = preview ? previewScale(cutout, preview) : 1;
+  const bounds = cutout.bounds && preview ? scaleBounds(cutout.bounds, scale) : null;
+  // sourceScale keeps the upscale guard honest: the thumb renders from a small preview, and
+  // without it a no-upscale config capped the subject at PREVIEW resolution — every cell a
+  // different size, none matching the export. No caption either; the cell has its own label.
+  return (
+    <TilePreview
+      source={preview}
+      bounds={bounds}
+      config={config}
+      showOverlay={false}
+      maxSize={230}
+      sourceScale={scale}
+      showCaption={false}
+    />
+  );
+}
+
 const CutoutCell = React.memo(function CutoutCell({
   item,
   label,
   selected,
   background,
   running,
+  tileConfig,
   onSelect,
   onCompare,
   onRemove,
@@ -1947,6 +1821,8 @@ const CutoutCell = React.memo(function CutoutCell({
   selected: boolean;
   background: string;
   running: boolean;
+  /** Set when Tile fit is on: the SAME cell then shows the cutout composited on its tile. */
+  tileConfig: SafeAreaConfig | null;
   onSelect: (id: number) => void;
   /** Clicking a finished result opens the same before/after view as a queue row. */
   onCompare: (id: number) => void;
@@ -1968,11 +1844,29 @@ const CutoutCell = React.memo(function CutoutCell({
       removeDisabled={running}
     >
       <div
-        className="relative grid aspect-square place-items-center overflow-hidden rounded-lg border p-2"
-        style={backdropStyle(background)}
+        // TilePreview frames itself, so tile mode drops the cell's own border and backdrop —
+        // a wrapper box would double-frame it.
+        //
+        // The cell takes the TILE's aspect ratio in tile mode rather than staying square: a
+        // definite-width frame with an aspect-ratio cannot shrink its width back when a
+        // max-height binds, so a portrait tile in a square cell came out both distorted and
+        // cropped. Matching the ratio here means the frame is only ever width-constrained.
+        className={cn(
+          'relative grid place-items-center overflow-hidden rounded-lg',
+          tileConfig && item.cutout ? undefined : 'aspect-square border p-2',
+        )}
+        style={
+          tileConfig && item.cutout
+            ? { aspectRatio: `${tileConfig.tile.width} / ${tileConfig.tile.height}` }
+            : backdropStyle(background)
+        }
       >
         {item.cutout ? (
-          <CutoutImage itemId={item.id} cutout={item.cutout} max={240} className="max-h-full max-w-full" />
+          tileConfig ? (
+            <TileFitThumb itemId={item.id} cutout={item.cutout} config={tileConfig} />
+          ) : (
+            <CutoutImage itemId={item.id} cutout={item.cutout} max={240} className="max-h-full max-w-full" />
+          )
         ) : (
           // The original stands in until its cutout replaces it — the tile is the queue row now,
           // so an image is visible from the moment it is added, not only once it is done.
@@ -2001,57 +1895,3 @@ const CutoutCell = React.memo(function CutoutCell({
   );
 });
 
-/**
- * A grid tile fed by the preview cache. Split out of TileCell so the hook lives in a component
- * that only exists while the cell is on screen — with virtualisation that is a few dozen
- * decodes, not one per queued image.
- */
-function TileCellPreview({
-  cutout,
-  itemId,
-  config,
-}: {
-  cutout: BgCutout;
-  itemId: number;
-  config: SafeAreaConfig;
-}) {
-  const preview = usePreview({ key: itemId, blob: cutout.blob, edge: TILE_CELL_EDGE });
-  const bounds =
-    cutout.bounds && preview ? scaleBounds(cutout.bounds, previewScale(cutout, preview)) : null;
-  return (
-    <TilePreview source={preview} bounds={bounds} config={config} showOverlay={false} maxSize={180} />
-  );
-}
-
-const TileCell = React.memo(function TileCell({
-  item,
-  label,
-  selected,
-  config,
-  running,
-  onSelect,
-  onRemove,
-}: {
-  // Only ever rendered for items that already have a cutout, so no null-guarding here.
-  item: CutoutItem;
-  label: string;
-  selected: boolean;
-  config: SafeAreaConfig;
-  running: boolean;
-  onSelect: (id: number) => void;
-  onRemove: (id: number) => void;
-}) {
-  return (
-    <ResultCell
-      label={label}
-      selected={selected}
-      onSelect={() => onSelect(item.id)}
-      onRemove={() => onRemove(item.id)}
-      removeDisabled={running}
-    >
-      {/* TilePreview sizes and frames itself — no wrapper box here, or the tile ends up
-          double-bordered. */}
-      <TileCellPreview cutout={item.cutout} itemId={item.id} config={config} />
-    </ResultCell>
-  );
-});

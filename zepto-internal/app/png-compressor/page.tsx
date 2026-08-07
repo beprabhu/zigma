@@ -13,9 +13,7 @@ import {
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent } from '@/components/ui/card';
 import { Hint } from '@/components/hint';
-import { HintCardHeader } from '@/components/hint-card-header';
 import {
   Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle,
 } from '@/components/ui/empty';
@@ -29,10 +27,12 @@ import {
 import { Spinner } from '@/components/ui/spinner';
 import { Switch } from '@/components/ui/switch';
 
-import { ProductHeader } from '@/components/product-header';
+import { Canvas, PanelSection, RightPanel, StudioShell } from '@/components/pane-layout';
 import { cn } from '@/lib/utils';
 import { buildZip, type ZipFileEntry } from '@/lib/zip';
-import { formatKb, mapWithLimit } from '@/lib/bg/batch';
+import { canvasToPngBlob, formatKb, loadImageFromFile, mapWithLimit, releaseCanvas } from '@/lib/bg/batch';
+import { compressPng } from '@/lib/compress';
+import { useProcessing } from '@/components/process-panel';
 
 type ItemStatus = 'queued' | 'working' | 'done' | 'error';
 
@@ -56,6 +56,14 @@ function savingsPct(input: number, output: number): number {
   return input ? Math.round((100 * (input - output)) / input) : 0;
 }
 
+function imageToCanvas(img: HTMLImageElement): Promise<HTMLCanvasElement> {
+  const c = document.createElement('canvas');
+  c.width = img.naturalWidth || img.width;
+  c.height = img.naturalHeight || img.height;
+  c.getContext('2d')!.drawImage(img, 0, 0);
+  return Promise.resolve(c);
+}
+
 export default function PngCompressorPage() {
   const [items, setItems] = React.useState<Item[]>([]);
   const [colors, setColors] = React.useState<number>(256);
@@ -64,6 +72,8 @@ export default function PngCompressorPage() {
   const [dragOver, setDragOver] = React.useState(false);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const abortRef = React.useRef<AbortController | null>(null);
+
+  const proc = useProcessing({ prefix: 'skuc_png', removeBg: true, tileFit: true, compress: false, busy: running });
 
   const patch = React.useCallback((id: string, delta: Partial<Item>) => {
     setItems((prev) => prev.map((it) => (it.id === id ? { ...it, ...delta } : it)));
@@ -111,21 +121,18 @@ export default function PngCompressorPage() {
     async (item: Item, signal: AbortSignal) => {
       patch(item.id, { status: 'working', error: undefined });
       try {
-        const res = await fetch('/api/compress-local', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'image/png',
-            'x-colors': String(colors),
-            ...(lossless ? { 'x-lossless': '1' } : {}),
-          },
-          body: item.file,
-          signal,
-        });
-        if (!res.ok) {
-          const body = await res.json().catch(() => ({}));
-          throw new Error(body?.error || `Server returned ${res.status}`);
+        // The processing space runs first (pixels), then the shared compress step (bytes) —
+        // the same order every product's export uses.
+        let source: Blob = item.file;
+        if (proc.stepsActive) {
+          const img = await loadImageFromFile(item.file);
+          const canvas = await proc.apply(await imageToCanvas(img));
+          if (img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
+          source = await canvasToPngBlob(canvas);
+          releaseCanvas(canvas);
         }
-        const output = await res.blob();
+        const bytes = await compressPng(source, { colors, lossless, signal });
+        const output = new Blob([bytes as BlobPart], { type: 'image/png' });
         patch(item.id, { status: 'done', output, outputUrl: URL.createObjectURL(output) });
       } catch (e) {
         if ((e as Error).name === 'AbortError') {
@@ -135,7 +142,7 @@ export default function PngCompressorPage() {
         }
       }
     },
-    [colors, lossless, patch],
+    [colors, lossless, patch, proc],
   );
 
   const compressAll = React.useCallback(async () => {
@@ -177,84 +184,9 @@ export default function PngCompressorPage() {
 
   return (
     <div className="flex min-h-dvh flex-col">
-      <ProductHeader
-        title="PNG Compressor"
-        description="pngquant + oxipng, fully local — files never leave this machine"
-      >
-        {items.length > 0 && (
-          <Button variant="ghost" size="sm" onClick={() => setItems([])} disabled={running}>
-            <Trash2Icon /> Clear
-          </Button>
-        )}
-      </ProductHeader>
-
-      <div className="grid flex-1 gap-4 p-4 lg:grid-cols-[280px_1fr]">
-        <div className="flex flex-col gap-4">
-          <Card>
-            <HintCardHeader title="Settings" hint="Applied to the next compression run." />
-            <CardContent>
-              <FieldGroup>
-                <Field orientation="horizontal">
-                  <FieldContent>
-                    <FieldLabel htmlFor="lossless"><Hint hint="Skip quantization; oxipng squeeze only.">Lossless only</Hint></FieldLabel>
-                  </FieldContent>
-                  <Switch id="lossless" checked={lossless} onCheckedChange={setLossless} />
-                </Field>
-                <Field data-disabled={lossless || undefined}>
-                  <FieldLabel htmlFor="colors"><Hint hint="Fewer colors → smaller files, more banding.">Palette colors</Hint></FieldLabel>
-                  <Select
-                    value={String(colors)}
-                    onValueChange={(v) => setColors(Number(v))}
-                    disabled={lossless}
-                  >
-                    <SelectTrigger id="colors" className="w-full">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {COLOR_CHOICES.map((c) => (
-                        <SelectItem key={c} value={String(c)}>
-                          {c} colors{c === 256 ? ' (best quality)' : ''}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </Field>
-              </FieldGroup>
-            </CardContent>
-          </Card>
-
-          <Button onClick={compressAll} disabled={running || !items.length}>
-            {running ? <Spinner /> : <ShrinkIcon />}
-            {running ? 'Compressing…' : 'Compress all'}
-          </Button>
-          {running && (
-            <Button variant="outline" onClick={() => abortRef.current?.abort()}>
-              Stop
-            </Button>
-          )}
-          <Button variant="secondary" onClick={downloadZip} disabled={!doneCount}>
-            <FileArchiveIcon /> Download ZIP ({doneCount})
-          </Button>
-
-          {doneCount > 0 && (
-            <Card>
-              <CardContent className="space-y-2 text-sm">
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Total</span>
-                  <span>
-                    {formatKb(totalIn)} → {formatKb(totalOut)}
-                  </span>
-                </div>
-                <Progress value={savingsPct(totalIn, totalOut)} />
-                <p className="text-xs text-muted-foreground">
-                  {savingsPct(totalIn, totalOut)}% smaller overall
-                </p>
-              </CardContent>
-            </Card>
-          )}
-        </div>
-
-        <div className="flex flex-col gap-4">
+      <StudioShell>
+        <Canvas>
+          <div className="mx-auto flex max-w-4xl flex-col gap-4">
           <div
             role="button"
             tabIndex={0}
@@ -369,8 +301,81 @@ export default function PngCompressorPage() {
               ))}
             </ul>
           )}
-        </div>
-      </div>
+          </div>
+        </Canvas>
+
+        <RightPanel
+          title="Process & compress"
+          hint={proc.summary || (doneCount ? `${doneCount} done` : 'Applied on the next run')}
+          footer={
+            <div className="flex flex-col gap-2">
+              {items.length > 0 && (
+                <Button variant="ghost" size="sm" onClick={() => setItems([])} disabled={running}>
+                  <Trash2Icon /> Clear queue
+                </Button>
+              )}
+              <Button onClick={compressAll} disabled={running || !items.length}>
+                {running ? <Spinner /> : <ShrinkIcon />}
+                {running ? 'Compressing…' : 'Compress all'}
+              </Button>
+              {running && (
+                <Button variant="outline" onClick={() => abortRef.current?.abort()}>
+                  Stop
+                </Button>
+              )}
+              <Button variant="secondary" onClick={downloadZip} disabled={!doneCount}>
+                <FileArchiveIcon /> Download ZIP ({doneCount})
+              </Button>
+            </div>
+          }
+        >
+          {proc.panel}
+          <PanelSection title="Compression" hint="Applied to the next compression run.">
+              <FieldGroup>
+                <Field orientation="horizontal">
+                  <FieldContent>
+                    <FieldLabel htmlFor="lossless"><Hint hint="Skip quantization; oxipng squeeze only.">Lossless only</Hint></FieldLabel>
+                  </FieldContent>
+                  <Switch id="lossless" checked={lossless} onCheckedChange={setLossless} />
+                </Field>
+                <Field data-disabled={lossless || undefined}>
+                  <FieldLabel htmlFor="colors"><Hint hint="Fewer colors → smaller files, more banding.">Palette colors</Hint></FieldLabel>
+                  <Select
+                    value={String(colors)}
+                    onValueChange={(v) => setColors(Number(v))}
+                    disabled={lossless}
+                  >
+                    <SelectTrigger id="colors" className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {COLOR_CHOICES.map((c) => (
+                        <SelectItem key={c} value={String(c)}>
+                          {c} colors{c === 256 ? ' (best quality)' : ''}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </Field>
+              </FieldGroup>
+            </PanelSection>
+
+          {doneCount > 0 && (
+            <PanelSection className="space-y-2 text-sm">
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Total</span>
+                  <span>
+                    {formatKb(totalIn)} → {formatKb(totalOut)}
+                  </span>
+                </div>
+                <Progress value={savingsPct(totalIn, totalOut)} />
+                <p className="text-xs text-muted-foreground">
+                  {savingsPct(totalIn, totalOut)}% smaller overall
+                </p>
+              </PanelSection>
+          )}
+        </RightPanel>
+      </StudioShell>
     </div>
   );
 }

@@ -90,3 +90,100 @@ export async function callAzure(
   if (!res.ok) throw new Error(json.error || `Generate failed (${res.status})`);
   return b64ToImage(json.b64);
 }
+
+/**
+ * Text-to-image: no source image, so this hits the generations endpoint via the proxy's
+ * `mode: 'generations'` branch. `size` matters more here than for edits — with no input to
+ * follow, 'auto' lets the model pick the shape, so callers wanting a consistent set pass one.
+ */
+/**
+ * The URL a given endpoint + mode will actually be called at. The proxy keeps only the ORIGIN
+ * of whatever is pasted and appends the path the mode needs, so a value copied from the Azure
+ * portal works in every product regardless of which image path it happens to carry.
+ *
+ * Exported so the settings UI can SHOW that resolution rather than silently discarding half of
+ * what the user typed — a field that ignores part of its own input has to say so.
+ * Returns null while the value is not yet a parseable URL (i.e. mid-typing).
+ */
+export function azureImageUrl(endpoint: string, mode: 'edits' | 'generations'): string | null {
+  const trimmed = endpoint.trim();
+  if (!/^https?:\/\//i.test(trimmed)) return null;
+  try {
+    return new URL(trimmed).origin + `/openai/v1/images/${mode}`;
+  } catch {
+    return null;
+  }
+}
+
+export async function callAzureGenerate(
+  prompt: string,
+  opts: {
+    endpoint: string;
+    apiKey: string;
+    quality?: 'low' | 'medium' | 'high';
+    size?: 'auto' | '1024x1024' | '1536x1024' | '1024x1536';
+  },
+): Promise<HTMLImageElement> {
+  const res = await fetch('/api/generate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      mode: 'generations',
+      endpoint: opts.endpoint,
+      apiKey: opts.apiKey,
+      prompt,
+      quality: opts.quality ?? 'low',
+      size: opts.size ?? '1024x1024',
+    }),
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(json.error || `Generate failed (${res.status})`);
+  return b64ToImage(json.b64);
+}
+
+/**
+ * Keyless stand-in for callAzureGenerate under ?mock=1. It paints the prompt itself onto the
+ * canvas, so a mock run still proves the RIGHT prompt reached the call — a blank placeholder
+ * would pass whether or not the brief and row were assembled correctly.
+ */
+export function mockGenerate(prompt: string, size = 1024): Promise<HTMLImageElement> {
+  const c = document.createElement('canvas');
+  c.width = size;
+  c.height = size;
+  const ctx = c.getContext('2d')!;
+  const grad = ctx.createLinearGradient(0, 0, size, size);
+  grad.addColorStop(0, '#2b2b3d');
+  grad.addColorStop(1, '#4a2f52');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, size, size);
+
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 34px sans-serif';
+  ctx.fillText('MOCK GENERATION', 48, 84);
+
+  ctx.font = '22px monospace';
+  ctx.fillStyle = '#e6e6f0';
+  const maxWidth = size - 96;
+  const lines: string[] = [];
+  for (const rawLine of prompt.split('\n')) {
+    let line = '';
+    for (const word of rawLine.split(/\s+/)) {
+      const test = line ? `${line} ${word}` : word;
+      if (ctx.measureText(test).width > maxWidth && line) {
+        lines.push(line);
+        line = word;
+      } else {
+        line = test;
+      }
+    }
+    lines.push(line);
+    if (lines.length > 34) break;
+  }
+  lines.slice(0, 34).forEach((line, i) => ctx.fillText(line, 48, 140 + i * 26));
+
+  return new Promise((resolve) => {
+    const out = new Image();
+    out.onload = () => resolve(out);
+    out.src = c.toDataURL('image/png');
+  });
+}

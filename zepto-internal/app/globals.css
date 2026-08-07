@@ -2,43 +2,50 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/*
+ * Figma UI3 design system theme.
+ * Color values sourced from Figma's official UI color tokens
+ * (--figma-color-*), Figma Design light & dark themes:
+ * https://developers.figma.com/docs/plugins/css-variables/
+ */
+
 :root {
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.1450 0 0);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.1450 0 0);
+  --background: oklch(1 0 0);                                /* figma bg #ffffff */
+  --foreground: oklch(0 0 0 / 0.90);                         /* figma text #000000e5 */
+  --card: oklch(1 0 0);                                      /* figma bg */
+  --card-foreground: oklch(0 0 0 / 0.90);
   --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.1450 0 0);
-  --primary: oklch(0.5838 0.2695 313.8699);
-  --primary-foreground: oklch(0.9850 0 0);
-  --secondary: oklch(0.9700 0 0);
-  --secondary-foreground: oklch(0.5838 0.2695 313.8699);
-  --muted: oklch(0.9700 0 0);
-  --muted-foreground: oklch(0.5560 0 0);
-  --accent: oklch(0.9700 0 0);
-  --accent-foreground: oklch(0.2050 0 0);
-  --destructive: oklch(0.5770 0.2450 27.3250);
-  --destructive-foreground: oklch(1 0 0);
-  --border: oklch(0.9220 0 0);
-  --input: oklch(0.9220 0 0);
-  --ring: oklch(0.7080 0 0);
-  --chart-1: oklch(0.8100 0.1000 252);
-  --chart-2: oklch(0.6200 0.1900 260);
-  --chart-3: oklch(0.5500 0.2200 263);
-  --chart-4: oklch(0.4900 0.2200 264);
-  --chart-5: oklch(0.4200 0.1800 266);
-  --sidebar: oklch(0.9850 0 0);
-  --sidebar-foreground: oklch(0.1450 0 0);
-  --sidebar-primary: oklch(0.2050 0 0);
-  --sidebar-primary-foreground: oklch(0.9850 0 0);
-  --sidebar-accent: oklch(0.9700 0 0);
-  --sidebar-accent-foreground: oklch(0.2050 0 0);
-  --sidebar-border: oklch(0.9220 0 0);
-  --sidebar-ring: oklch(0.7080 0 0);
-  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
+  --popover-foreground: oklch(0 0 0 / 0.90);
+  --primary: oklch(0.6698 0.1827 249.2237);                  /* figma bg-brand #0d99ff */
+  --primary-foreground: oklch(1 0 0);                        /* figma text-onbrand #ffffff */
+  --secondary: oklch(0.9702 0 0);                            /* figma bg-secondary #f5f5f5 */
+  --secondary-foreground: oklch(0 0 0 / 0.90);
+  --muted: oklch(0.9702 0 0);                                /* figma bg-secondary #f5f5f5 */
+  --muted-foreground: oklch(0 0 0 / 0.50);                   /* figma text-secondary #00000080 */
+  --accent: oklch(0.9593 0.0217 239.4249);                   /* figma bg-selected #e5f4ff */
+  --accent-foreground: oklch(0.5860 0.1843 253.6341);        /* figma text-brand #007be5 */
+  --destructive: oklch(0.6424 0.2123 33.7237);               /* figma bg-danger #f24822 */
+  --destructive-foreground: oklch(1 0 0);                    /* figma text-ondanger #ffffff */
+  --border: oklch(0.9249 0 0);                               /* figma border #e6e6e6 */
+  --input: oklch(0.9249 0 0);
+  --ring: oklch(0.6698 0.1827 249.2237);                     /* figma border-selected #0d99ff */
+  --chart-1: oklch(0.6698 0.1827 249.2237);                  /* figma blue #0d99ff */
+  --chart-2: oklch(0.5981 0.2541 298.0106);                  /* figma purple #9747ff */
+  --chart-3: oklch(0.6595 0.1678 152.3190);                  /* figma green #14ae5c */
+  --chart-4: oklch(0.8681 0.1690 89.7533);                   /* figma yellow #ffcd29 */
+  --chart-5: oklch(0.6424 0.2123 33.7237);                   /* figma red #f24822 */
+  --sidebar: oklch(1 0 0);                                   /* figma panel bg #ffffff */
+  --sidebar-foreground: oklch(0 0 0 / 0.90);
+  --sidebar-primary: oklch(0.6698 0.1827 249.2237);
+  --sidebar-primary-foreground: oklch(1 0 0);
+  --sidebar-accent: oklch(0.9702 0 0);                       /* figma bg-hover #f5f5f5 */
+  --sidebar-accent-foreground: oklch(0 0 0 / 0.90);
+  --sidebar-border: oklch(0.9249 0 0);
+  --sidebar-ring: oklch(0.6698 0.1827 249.2237);
+  --font-sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   --font-serif: ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-  --radius: 0.625rem;
+  --radius: 0.4rem; /* 13px — figma UI3 floating panel/menu radius */
   --shadow-x: 0;
   --shadow-y: 1px;
   --shadow-blur: 3px;
@@ -58,42 +65,42 @@
 }
 
 .dark {
-  --background: oklch(0.1450 0 0);
-  --foreground: oklch(0.9850 0 0);
-  --card: oklch(0.2050 0 0);
-  --card-foreground: oklch(0.9850 0 0);
-  --popover: oklch(0.2690 0 0);
-  --popover-foreground: oklch(0.9850 0 0);
-  --primary: oklch(0.5838 0.2695 313.8699);
-  --primary-foreground: oklch(1.0000 0 0);
-  --secondary: oklch(0.4748 0 0);
-  --secondary-foreground: oklch(0.9850 0 0);
-  --muted: oklch(0.2690 0 0);
-  --muted-foreground: oklch(0.7080 0 0);
-  --accent: oklch(0.6066 0 0);
-  --accent-foreground: oklch(0.9850 0 0);
-  --destructive: oklch(0.7040 0.1910 22.2160);
-  --destructive-foreground: oklch(0.9850 0 0);
-  --border: oklch(0.2750 0 0);
-  --input: oklch(0.3250 0 0);
-  --ring: oklch(0.5560 0 0);
-  --chart-1: oklch(0.8100 0.1000 252);
-  --chart-2: oklch(0.6200 0.1900 260);
-  --chart-3: oklch(0.5500 0.2200 263);
-  --chart-4: oklch(0.4900 0.2200 264);
-  --chart-5: oklch(0.4200 0.1800 266);
-  --sidebar: oklch(0.2050 0 0);
-  --sidebar-foreground: oklch(0.9850 0 0);
-  --sidebar-primary: oklch(0.4880 0.2430 264.3760);
-  --sidebar-primary-foreground: oklch(0.9850 0 0);
-  --sidebar-accent: oklch(0.2690 0 0);
-  --sidebar-accent-foreground: oklch(0.9850 0 0);
-  --sidebar-border: oklch(0.2750 0 0);
-  --sidebar-ring: oklch(0.4390 0 0);
-  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
+  --background: oklch(0.2931 0 0);                           /* figma bg #2c2c2c */
+  --foreground: oklch(1 0 0);                                /* figma text #ffffff */
+  --card: oklch(0.2931 0 0);
+  --card-foreground: oklch(1 0 0);
+  --popover: oklch(0.3407 0 0);                              /* figma bg-secondary #383838 */
+  --popover-foreground: oklch(1 0 0);
+  --primary: oklch(0.6272 0.1699 249.0172);                  /* figma bg-brand #0c8ce9 */
+  --primary-foreground: oklch(1 0 0);                        /* figma text-onbrand #ffffff */
+  --secondary: oklch(0.3407 0 0);                            /* figma bg-secondary #383838 */
+  --secondary-foreground: oklch(1 0 0);
+  --muted: oklch(0.3407 0 0);
+  --muted-foreground: oklch(1 0 0 / 0.70);                   /* figma text-secondary #ffffffb2 */
+  --accent: oklch(0.4619 0.0553 266.0264);                   /* figma bg-selected #4a5878 */
+  --accent-foreground: oklch(1 0 0 / 0.90);                  /* figma text-onselected #ffffffe5 */
+  --destructive: oklch(0.6019 0.2039 33.5232);               /* figma bg-danger #e03e1a */
+  --destructive-foreground: oklch(1 0 0);                    /* figma text-ondanger #ffffff */
+  --border: oklch(0.3867 0 0);                               /* figma border #444444 */
+  --input: oklch(0.3867 0 0);
+  --ring: oklch(0.6272 0.1699 249.0172);                     /* figma border-selected #0c8ce9 */
+  --chart-1: oklch(0.6272 0.1699 249.0172);                  /* figma blue #0c8ce9 */
+  --chart-2: oklch(0.5609 0.2574 296.7040);                  /* figma purple #8a38f5 */
+  --chart-3: oklch(0.5736 0.1371 153.8892);                  /* figma green #198f51 */
+  --chart-4: oklch(0.8322 0.1655 89.1189);                   /* figma yellow #f3c11b */
+  --chart-5: oklch(0.6019 0.2039 33.5232);                   /* figma red #e03e1a */
+  --sidebar: oklch(0.2931 0 0);                              /* figma panel bg #2c2c2c */
+  --sidebar-foreground: oklch(1 0 0);
+  --sidebar-primary: oklch(0.6272 0.1699 249.0172);
+  --sidebar-primary-foreground: oklch(1 0 0);
+  --sidebar-accent: oklch(0.3407 0 0);                       /* figma bg-hover #383838 */
+  --sidebar-accent-foreground: oklch(1 0 0);
+  --sidebar-border: oklch(0.3867 0 0);
+  --sidebar-ring: oklch(0.6272 0.1699 249.0172);
+  --font-sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   --font-serif: ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-  --radius: 0.625rem;
+  --radius: 0.4rem;
   --shadow-x: 0;
   --shadow-y: 1px;
   --shadow-blur: 3px;

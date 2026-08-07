@@ -5,8 +5,9 @@ the same components and pipelines.
 
 | Product | Route | What it does |
 |---|---|---|
-| **Compositor** | `/compositor` | CSV of product image URLs → branded composite tiles via Azure GPT-Image-2, TinyPNG compression, ZIP export. |
+| **Compositor** | `/compositor` | CSV of product image URLs → branded composite tiles via Azure GPT-Image-2, local compression, ZIP export. |
 | **BG Remover** | `/bg-remover` | Strips backgrounds in the browser (single, batch or CSV), and fits cutouts into a customisable safe area on a tile. |
+| **Image Generator** | `/image-generator` | A Markdown brief + a CSV of rows → one generated image per row via Azure GPT-Image. |
 
 ## Run
 
@@ -29,6 +30,23 @@ Three steps, no plumbing:
 
 The sidebar ([`components/app-sidebar.tsx`](components/app-sidebar.tsx)) and the launcher on `/`
 both read that array, so nothing else needs editing.
+
+## The studio layout & the processing space
+
+Every product is the same Figma-style surface: a fixed icon rail, a left panel (setup), a
+center canvas (the work), and a right panel — the **processing space**. The right pane hosts
+shared post-processing steps, implemented once and mounted per product
+([`components/process-panel.tsx`](components/process-panel.tsx)):
+
+- **Remove background** ([`lib/process.ts`](lib/process.ts)) — the BG Remover's model applied
+  to any product's results on export (Image Generator, PNG Compressor).
+- **Tile fit** — the safe-area module, available wherever a subject needs placing on a fixed
+  tile. In the BG Remover it is a switch (the old second tab), with the selected cutout
+  previewed in the panel.
+- **Compress PNGs** ([`lib/compress.ts`](lib/compress.ts)) — pngquant + oxipng via
+  `/api/compress-local`, the PNG Compressor's own pipeline. This REPLACED TinyPNG everywhere:
+  no key, nothing uploaded, and because every export funnels through `compressPng`, a change
+  to the compression logic lands in all four products at once.
 
 ## Background removal
 
@@ -163,6 +181,43 @@ toward a leftover strip rather than a lost product: a panel the same colour as t
 two-tone backdrop whose second colour reads as a panel candidate (rejected by the slab-rim
 guard), and a strip whose exact colour also appears on the packaging nearby.
 
+## Image Generator
+
+Text-to-image, one image per CSV row. The other two products call Azure's **edits** endpoint
+(they always send a source image); this one calls **generations**, so
+[`app/api/generate/route.ts`](app/api/generate/route.ts) takes a `mode` — `'edits'` stays the
+default, and only this product passes `'generations'`. Either image URL can be pasted as the
+endpoint: the route keeps the origin and appends the path its mode needs.
+
+Each row's prompt is assembled by `buildRowPrompt` in [`lib/gen.ts`](lib/gen.ts) as the brief,
+then a separator, then the row's cells **labelled with their column headers**:
+
+```
+<brief.md, verbatim>
+
+---
+Generate an image for this row:
+sku: diwali-banner
+subject: Brass diya lamps on a marigold-strewn table
+use: Homepage hero for the Diwali sale
+```
+
+The headers are sent, not just the values — `subject: a diya lamp` carries intent that a bare
+`a diya lamp` loses, and the header is the only place that intent is written down. Blank cells
+are dropped rather than sent as an empty `use:`, which reads as an instruction to leave that
+aspect out. Columns can be unticked to keep internal IDs away from the model.
+
+The assembled string is shown in every cell and, in full, in the dialog — `sentPrompt` is
+captured at send time, so a row generated before a brief edit still shows what it was actually
+built from rather than the current preview. The brief itself is session-only on purpose: it is
+document-sized and batch-specific, and persisting it would silently apply an old brief to a new
+CSV.
+
+Rows fan out `skuc_genParallel` at a time (default 3, cap 8) — the Azure round trip dominates
+each row's wall-clock, so overlapping the waits is the whole speed story; the ceiling is the
+deployment's rate limit. `?mock=1` runs the product keyless, painting each prompt onto its own
+placeholder image so a mock run still proves the right prompt reached the call.
+
 ### Working files (.zesku)
 
 "Save project" in the BG Remover packs every finished cutout, its subject bounds and the current
@@ -199,8 +254,8 @@ so a generous budget costs one encode and loses nothing:
    if needed* is on and every palette has already missed.
 
 Off by default, and off reproduces today's export exactly. The format stays PNG at every rung, so
-nothing downstream changes. It runs before TinyPNG, so a key set alongside it only takes the file
-further under the ceiling. `CompressionStream` is required; without it the switch is disabled and
+nothing downstream changes. It runs before the local compress step, which only takes the
+file further under the ceiling. `CompressionStream` is required; without it the switch is disabled and
 exports are uncapped.
 
 Degradation is never silent — the export report gives the counts (untouched, quantised,
@@ -216,7 +271,7 @@ app/
   bg-remover/           product 2
   api/                  fetch-image · generate · compress · remove-hq
 components/
-  app-sidebar.tsx  product-header.tsx
+  app-sidebar.tsx  pane-layout.tsx  process-panel.tsx  result-cell.tsx
   bg-remover/           product 2's components
   ui/                   shadcn primitives (base-nova style, on Base UI)
 lib/

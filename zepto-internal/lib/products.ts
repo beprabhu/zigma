@@ -1,4 +1,4 @@
-import { EraserIcon, LayersIcon, ShrinkIcon, type LucideIcon } from 'lucide-react';
+import { EraserIcon, ImagePlusIcon, LayersIcon, ShrinkIcon, type LucideIcon } from 'lucide-react';
 
 export interface Product {
   slug: string;
@@ -22,6 +22,12 @@ export const PRODUCTS: Product[] = [
     name: 'BG Remover',
     description: 'Strip backgrounds from product shots, entirely in the browser.',
     icon: EraserIcon,
+  },
+  {
+    slug: 'image-generator',
+    name: 'Image Generator',
+    description: 'Generate an image per CSV row from a Markdown brief, via Azure GPT-Image.',
+    icon: ImagePlusIcon,
   },
   {
     slug: 'png-compressor',
