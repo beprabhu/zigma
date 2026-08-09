@@ -38,10 +38,16 @@ export function parseCSV(text: string): ParsedCsv {
   // Drop fully empty trailing rows
   while (rows.length && rows[rows.length - 1].every((f) => f.trim() === '')) rows.pop();
   if (!rows.length) return { headers: [], records: [] };
-  const headers = rows[0].map((h) => h.trim());
+  // Records are keyed by header NAME, so an empty header (trailing commas in the header row)
+  // or a duplicate name cannot address a column of its own — later writes just overwrite
+  // earlier ones. Surface each usable name once: empties dropped, duplicates collapsed to the
+  // one entry whose values (by the overwrite rule) come from the LAST column with that name.
+  // Consumers map over headers as React keys and checkbox ids, so uniqueness is load-bearing.
+  const rawHeaders = rows[0].map((h) => h.trim());
+  const headers = [...new Set(rawHeaders.filter(Boolean))];
   const records = rows.slice(1).map((r) => {
     const obj: CsvRecord = {};
-    headers.forEach((h, idx) => { obj[h] = (r[idx] ?? '').trim(); });
+    rawHeaders.forEach((h, idx) => { if (h) obj[h] = (r[idx] ?? '').trim(); });
     return obj;
   });
   return { headers, records };

@@ -22,7 +22,9 @@ export type BgItemStatus =
   | 'cancelled';
 
 export type BgItemSource =
-  | { kind: 'file'; file: File }
+  // `regenerated` marks a file the AI edit produced (paid Azure output). Autosave uses it to
+  // decide which file sources are worth persisting — ordinary dropped originals are not.
+  | { kind: 'file'; file: File; regenerated?: boolean }
   | { kind: 'url'; url: string }
   // Restored from a saved project: the cutout exists but the original bytes were never saved,
   // so there is nothing to re-run inference on. `label` is the provenance shown in the UI.

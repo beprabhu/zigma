@@ -1,0 +1,51 @@
+{
+  "name": "zigma-desktop",
+  "productName": "Zigma",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Desktop shell for the Zigma image suite \u2014 loads the team server like Figma's app loads figma.com",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --mac"
+  },
+  "build": {
+    "appId": "com.zepto.zigma",
+    "productName": "Zigma",
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "icon": "build/icon.icns",
+      "category": "public.app-category.graphics-design",
+      "identity": null
+    },
+    "files": [
+      "main.js",
+      "preload-settings.js",
+      "settings.html"
+    ]
+  },
+  "devDependencies": {
+    "electron": "^43.3.0",
+    "electron-builder": "^26.15.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "electron",
+      "electron-builder",
+      "electron-winstaller"
+    ]
+  }
+}

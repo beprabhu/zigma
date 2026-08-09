@@ -6,10 +6,16 @@
 // canvases, the original-image element, the status vocabulary, and the CompareDialog.
 
 import * as React from 'react';
-import { CheckIcon, CopyIcon, DownloadIcon, RefreshCwIcon, SparklesIcon } from 'lucide-react';
+import {
+  CheckIcon, ChevronRightIcon, CopyIcon, DownloadIcon, RefreshCwIcon, SparklesIcon,
+} from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
+import { Textarea } from '@/components/ui/textarea';
+import {
+  Collapsible, CollapsibleContent, CollapsibleTrigger,
+} from '@/components/ui/collapsible';
 import {
   Dialog,
   DialogContent,
@@ -272,10 +278,17 @@ export interface CompareDialogProps {
   defaultRefine?: boolean;
   onRedo?: (item: BgItem, options: CompareRedoOptions) => void;
   /**
-   * Send this image to Azure GPT-Image with the product's default prompt; the result replaces
-   * the item's source. Omitted (or ready=false) hides/disables the button.
+   * Send this image to Azure GPT-Image; the result replaces the item's source. The dialog
+   * shows `defaultPrompt` in an editable per-image field and hands the (possibly tweaked)
+   * text to onEdit — the product's default prompt is never rewritten from here. Omitted
+   * (or ready=false) hides/disables the section.
    */
-  aiEdit?: { ready: boolean; hint: string; onEdit: (item: BgItem) => void };
+  aiEdit?: {
+    ready: boolean;
+    hint: string;
+    defaultPrompt: string;
+    onEdit: (item: BgItem, prompt: string) => void;
+  };
   /** A run is in progress; redo stays visible but disabled. */
   busy?: boolean;
 }
@@ -353,12 +366,22 @@ function CompareView({
   defaultModel?: string;
   defaultRefine?: boolean;
   onRedo?: (item: BgItem, options: CompareRedoOptions) => void;
-  aiEdit?: { ready: boolean; hint: string; onEdit: (item: BgItem) => void };
+  aiEdit?: {
+    ready: boolean;
+    hint: string;
+    defaultPrompt: string;
+    onEdit: (item: BgItem, prompt: string) => void;
+  };
   busy?: boolean;
 }) {
   const [saving, setSaving] = React.useState(false);
   const [saveError, setSaveError] = React.useState<string | null>(null);
   const [copied, setCopied] = React.useState(false);
+
+  // Per-image prompt, seeded from the product default. CompareView is keyed by item id, so
+  // opening another image reseeds it — a tweak made for one image never leaks into the next.
+  const [aiPromptDraft, setAiPromptDraft] = React.useState(aiEdit?.defaultPrompt ?? '');
+  const promptEdited = aiPromptDraft.trim() !== (aiEdit?.defaultPrompt ?? '').trim();
 
   // A one-off choice: redoing from here must not rewrite the global model setting. CompareView
   // is keyed by item id, so opening a different image remounts this and the picker resets to the
@@ -474,9 +497,70 @@ function CompareView({
         <RegionTable regions={item.regionReport} />
       )}
 
+      {aiEdit && canRetry(item) && (
+        <Collapsible className="rounded-lg border">
+          {/* Chevron rotation: a static rule in base.css keys off Base UI's data-panel-open
+              (the JIT variants proved unreliable under the long-lived dev server's scan). */}
+          <CollapsibleTrigger className="flex w-full cursor-pointer items-center gap-2 px-3 py-2 text-sm font-medium">
+            <ChevronRightIcon className="size-4 transition-transform" />
+            <SparklesIcon className="size-4 text-primary" />
+            AI edit
+            <span className="ml-auto text-xs font-normal text-muted-foreground">
+              {item.status === 'editing'
+                ? 'Regenerating…'
+                : promptEdited
+                  ? 'Custom prompt'
+                  : 'Default prompt'}
+            </span>
+          </CollapsibleTrigger>
+          <CollapsibleContent>
+            <div className="space-y-2 border-t p-3">
+              <Textarea
+                value={aiPromptDraft}
+                onChange={(e) => setAiPromptDraft(e.target.value)}
+                rows={5}
+                disabled={busy || item.status === 'editing'}
+                aria-label="Prompt for this image"
+                className="text-xs"
+              />
+              <div className="flex flex-wrap items-center gap-2">
+                <p className="mr-auto text-xs text-muted-foreground">
+                  Applies to this image only — the default prompt stays unchanged.
+                </p>
+                {promptEdited && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={busy || item.status === 'editing'}
+                    onClick={() => setAiPromptDraft(aiEdit.defaultPrompt)}
+                  >
+                    Reset
+                  </Button>
+                )}
+                <Button
+                  size="sm"
+                  disabled={busy || !aiEdit.ready || item.status === 'editing' || !aiPromptDraft.trim()}
+                  title={aiEdit.hint}
+                  onClick={() => aiEdit.onEdit(item, aiPromptDraft)}
+                >
+                  {item.status === 'editing' ? (
+                    <Spinner data-icon="inline-start" />
+                  ) : (
+                    <SparklesIcon data-icon="inline-start" />
+                  )}
+                  Regenerate
+                </Button>
+              </div>
+            </div>
+          </CollapsibleContent>
+        </Collapsible>
+      )}
+
       {saveError && <p className="text-xs text-destructive">{saveError}</p>}
 
-      <DialogFooter showCloseButton className="flex-wrap gap-2">
+      {/* One close affordance only — DialogContent's top-right X. A second Close button here
+          competed with Download PNG for the primary slot. */}
+      <DialogFooter className="flex-wrap gap-2">
         {onRedo && models?.length && canRetry(item) ? (
           <div className="mr-auto flex min-w-0 items-center gap-2">
             <Select
@@ -519,21 +603,6 @@ function CompareView({
             </Button>
           </div>
         ) : null}
-        {aiEdit && canRetry(item) && (
-          <Button
-            variant="outline"
-            disabled={busy || !aiEdit.ready || item.status === 'editing'}
-            title={aiEdit.hint}
-            onClick={() => aiEdit.onEdit(item)}
-          >
-            {item.status === 'editing' ? (
-              <Spinner data-icon="inline-start" />
-            ) : (
-              <SparklesIcon data-icon="inline-start" />
-            )}
-            AI edit
-          </Button>
-        )}
         <Button disabled={!item.cutout || saving} onClick={handleDownload}>
           {saving ? <Spinner data-icon="inline-start" /> : <DownloadIcon data-icon="inline-start" />}
           Download PNG

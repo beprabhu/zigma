@@ -1,0 +1,54 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        margin: 0;
+        padding: 20px;
+        font: 13px -apple-system, system-ui, sans-serif;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      label { font-weight: 600; }
+      input {
+        font: inherit;
+        padding: 7px 9px;
+        border-radius: 6px;
+        border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+        background: transparent;
+        color: inherit;
+      }
+      .row { display: flex; justify-content: flex-end; gap: 8px; }
+      button { font: inherit; padding: 6px 14px; border-radius: 6px; }
+      .error { color: #d33; min-height: 1.2em; margin: 0; }
+      p.hint { margin: 0; opacity: 0.65; }
+    </style>
+  </head>
+  <body>
+    <label for="url">Zigma server URL</label>
+    <input id="url" type="url" spellcheck="false" placeholder="http://mac-mini.local:3000" />
+    <p class="hint">The app relaunches and loads this address. Ask whoever runs the Mac&nbsp;mini.</p>
+    <p class="error" id="error"></p>
+    <div class="row">
+      <button onclick="window.close()">Cancel</button>
+      <button id="save">Save &amp; Relaunch</button>
+    </div>
+    <script>
+      const params = new URLSearchParams(location.search);
+      const input = document.getElementById('url');
+      input.value = params.get('current') || '';
+      input.focus();
+      input.select();
+      async function save() {
+        const problem = await window.zigma.setServerUrl(input.value);
+        // On success the app relaunches before this resolves; reaching here means rejection.
+        if (problem) document.getElementById('error').textContent = problem;
+      }
+      document.getElementById('save').addEventListener('click', save);
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') save(); });
+    </script>
+  </body>
+</html>

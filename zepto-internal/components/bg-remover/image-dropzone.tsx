@@ -143,6 +143,38 @@ export function ImageDropzone({ onAdd, onCsv, onProject, itemCount, disabled = f
     [add, onCsv, onProject],
   );
 
+  // Drops are bound to the window, like paste below: the zone itself is small, and a file
+  // dropped a few pixels outside it hits the browser default instead — navigating away from
+  // the app and taking the session with it. The zone's own drag handlers were removed in
+  // favour of these; the highlight now signals "drop anywhere on this page".
+  React.useEffect(() => {
+    if (disabled) return;
+    const hasFiles = (event: DragEvent) => event.dataTransfer?.types.includes('Files');
+    const onDragOver = (event: DragEvent) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      setDrag(true);
+    };
+    const onDragLeave = (event: DragEvent) => {
+      // relatedTarget is null only when the drag leaves the window, not when crossing children.
+      if (event.relatedTarget === null) setDrag(false);
+    };
+    const onDrop = (event: DragEvent) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      setDrag(false);
+      void handleFiles(Array.from(event.dataTransfer?.files ?? []));
+    };
+    window.addEventListener('dragover', onDragOver);
+    window.addEventListener('dragleave', onDragLeave);
+    window.addEventListener('drop', onDrop);
+    return () => {
+      window.removeEventListener('dragover', onDragOver);
+      window.removeEventListener('dragleave', onDragLeave);
+      window.removeEventListener('drop', onDrop);
+    };
+  }, [disabled, handleFiles]);
+
   // Paste is bound to the window because there is nothing sensible to focus first; the listener
   // only exists while this product is mounted, so other pages keep their own paste behaviour.
   React.useEffect(() => {
@@ -184,17 +216,6 @@ export function ImageDropzone({ onAdd, onCsv, onProject, itemCount, disabled = f
           browse();
         }
       }}
-      onDragOver={(e) => {
-        e.preventDefault();
-        if (!disabled) setDrag(true);
-      }}
-      onDragLeave={() => setDrag(false)}
-      onDrop={(e) => {
-        e.preventDefault();
-        setDrag(false);
-        if (disabled) return;
-        void handleFiles(Array.from(e.dataTransfer.files));
-      }}
       className={cn(
         'flex cursor-pointer flex-col items-center gap-2 rounded-lg border-2 border-dashed border-border px-3 py-6 text-center text-sm text-muted-foreground transition-colors',
         drag && 'border-primary bg-accent',
@@ -225,7 +246,8 @@ export function ImageDropzone({ onAdd, onCsv, onProject, itemCount, disabled = f
       ) : (
         <div className="space-y-0.5">
           <div>
-            Drop images or a CSV here, or <u className="text-primary">browse</u>
+            Drop images, a CSV or a .zesku project anywhere on this page, or{' '}
+            <u className="text-primary">browse</u>
           </div>
           <div className="text-xs">You can also paste an image from the clipboard</div>
         </div>

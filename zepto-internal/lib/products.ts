@@ -13,25 +13,25 @@ export interface Product {
 export const PRODUCTS: Product[] = [
   {
     slug: 'compositor',
-    name: 'Compositor',
+    name: 'Banners',
     description: 'Turn a CSV of product image URLs into branded composite tiles.',
     icon: LayersIcon,
   },
   {
     slug: 'bg-remover',
-    name: 'BG Remover',
+    name: 'Cleanup',
     description: 'Strip backgrounds from product shots, entirely in the browser.',
     icon: EraserIcon,
   },
   {
     slug: 'image-generator',
-    name: 'Image Generator',
+    name: 'Generate',
     description: 'Generate an image per CSV row from a Markdown brief, via Azure GPT-Image.',
     icon: ImagePlusIcon,
   },
   {
     slug: 'png-compressor',
-    name: 'PNG Compressor',
+    name: 'Compress',
     description: 'Shrink PNGs locally with pngquant + oxipng — no API key, no upload.',
     icon: ShrinkIcon,
   },

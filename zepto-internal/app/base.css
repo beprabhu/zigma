@@ -52,13 +52,32 @@
   --font-heading: var(--font-sans);
 }
 
-/* Font wiring: Lexend (loaded via next/font in layout.tsx) leads the sans
-   stack. Declared unlayered and after globals.css, so it overrides whatever
+/* Root scale: 1rem = 90% of the browser default (14.4px at the stock 16px).
+   Every rem in the app keys off this — type, and spacing/radii too, since
+   --spacing is rem-based — so the whole UI densifies uniformly. Percentage,
+   not px, so a user's browser font-size preference still applies on top.
+   Canvas-drawn tile text (ZeptoNorms) is pixel-based and unaffected. */
+html {
+  font-size: 90%;
+}
+
+/* Font wiring: Google Sans (self-hosted via next/font/local in layout.tsx) leads
+   the sans stack. Declared unlayered and after globals.css, so it overrides whatever
    --font-sans a pasted theme sets — pastes only change color/radius/shadows. */
 :root,
 .dark {
-  --font-sans: var(--font-lexend), "Segoe UI", "Helvetica Neue", Helvetica,
+  --font-sans: var(--font-app-sans), "Segoe UI", "Helvetica Neue", Helvetica,
     "Lucida Grande", Arial, Ubuntu, Cantarell, "Fira Sans", sans-serif;
+}
+
+/* Collapsible triggers: Base UI flags the open state with data-panel-open; the leading
+   chevron icon turns to point down. Static rule (not a JIT variant) so it cannot fall out
+   of a stale utility scan. */
+[data-slot='collapsible-trigger'] > svg:first-child {
+  transition: rotate 150ms ease;
+}
+[data-slot='collapsible-trigger'][data-panel-open] > svg:first-child {
+  rotate: 90deg;
 }
 
 @layer base {

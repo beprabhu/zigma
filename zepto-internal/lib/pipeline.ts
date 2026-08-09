@@ -1,5 +1,7 @@
 // Client-side image pipeline: fetch via proxy, preprocess, call Azure, decode result.
 
+import { recordUsage } from '@/lib/usage';
+
 export async function loadImageFromUrl(url: string): Promise<HTMLImageElement> {
   const res = await fetch('/api/fetch-image?url=' + encodeURIComponent(url));
   if (!res.ok) {
@@ -88,6 +90,7 @@ export async function callAzure(
   });
   const json = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(json.error || `Generate failed (${res.status})`);
+  recordUsage('edits', json.usage);
   return b64ToImage(json.b64);
 }
 
@@ -138,6 +141,7 @@ export async function callAzureGenerate(
   });
   const json = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(json.error || `Generate failed (${res.status})`);
+  recordUsage('generations', json.usage);
   return b64ToImage(json.b64);
 }
 

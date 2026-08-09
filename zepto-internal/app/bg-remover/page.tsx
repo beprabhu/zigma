@@ -12,6 +12,11 @@ import {
   TriangleAlertIcon,
   WandSparklesIcon,
 } from 'lucide-react';
+import {
+  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
+} from '@/components/ui/dialog';
+import { MdFileIcon, MdFileTile } from '@/components/md-file-tile';
+import { SessionHeader, type SessionChip } from '@/components/session-header';
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -58,8 +63,9 @@ import {
   exportFileNames, flattenOnBackground, formatKb, isAbortError,
   decodeCutout, loadImageFromFile, looksLikeMissingWeights, mapWithLimit, needsCutout,
   nextItemId, pickSave, previewScale, releaseCanvas, releaseItem, releaseOriginal, saveTo, withCutout,
-  type BgItem, type BgItemDraft, type BgItemStatus,
+  type BgItem, type BgItemDraft, type BgItemSource, type BgItemStatus,
 } from '@/lib/bg/batch';
+import { useAutosave, type AutosaveRecord } from '@/lib/bg/autosave';
 import { describeBudget, fitToBudget, type BudgetResult } from '@/lib/bg/budget';
 import { isPng8Supported } from '@/lib/bg/png8';
 import {
@@ -73,6 +79,7 @@ import { STORE_TYPE } from '@/lib/bg/constants';
 import { callAzure, loadImageFromUrl, mockComposite } from '@/lib/pipeline';
 import { buildZip, type ZipFileEntry } from '@/lib/zip';
 import { cn } from '@/lib/utils';
+import { usePersistedState } from '@/hooks/use-persisted-state';
 
 const WHITE = '#ffffff';
 const DEFAULT_CUSTOM_BG = '#f4f4f5';
@@ -105,7 +112,6 @@ interface RunOverrides {
   model?: BgModelId;
   refine?: boolean;
 }
-
 
 // Ships as the AI-edit prompt so the flow works out of the box. The reference image carries the
 // product's identity, so one generic prompt covers every SKU; fidelity comes first and loudest
@@ -196,35 +202,34 @@ async function cropToHero(item: BgItem, source: HTMLImageElement): Promise<HTMLI
   });
 }
 
-// localStorage-backed state. Reads after mount (not in the initializer) so the server-rendered
-// HTML matches the first client render and hydration stays clean. Copied from the compositor.
-function usePersistedState<T>(key: string, initial: T): [T, (v: T | ((p: T) => T)) => void] {
-  const [value, setValue] = React.useState<T>(initial);
-  React.useEffect(() => {
-    let saved: string | null = null;
-    try { saved = localStorage.getItem(key); } catch { /* private mode etc. */ }
-    if (saved !== null) {
-      try {
-        const parsed = JSON.parse(saved) as T;
-        // eslint-disable-next-line react-hooks/set-state-in-effect -- one-time hydration from external store
-        setValue(parsed);
-      } catch {
-        if (typeof initial === 'string') {
-           
-          setValue(saved as unknown as T);
+
+// Rebuilds a queue item from a crash-recovery record — the same shape project restore uses.
+// URL sources come back as URLs (redo works); AI-regenerated files come back as files (their
+// bytes were saved because they cost an Azure call); everything else is provenance-only.
+function itemFromAutosave(record: AutosaveRecord, id: number): BgItem {
+  const source: BgItemSource = record.sourceUrl
+    ? { kind: 'url', url: record.sourceUrl }
+    : record.sourceFile
+      ? {
+          kind: 'file',
+          file: new File([record.sourceFile], record.sourceFileName || `${record.name}.png`, {
+            type: record.sourceFile.type || 'image/png',
+          }),
+          regenerated: true,
         }
-      }
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-  const set = React.useCallback((v: T | ((p: T) => T)) => {
-    setValue((prev) => {
-      const next = typeof v === 'function' ? (v as (p: T) => T)(prev) : v;
-      try { localStorage.setItem(key, JSON.stringify(next)); } catch { /* quota / private mode */ }
-      return next;
-    });
-  }, [key]);
-  return [value, set];
+      : { kind: 'archived', label: record.origin };
+  return {
+    id,
+    name: record.name,
+    source,
+    original: null,
+    cutout: record.cutout
+      ? { blob: record.cutout, bounds: record.bounds, width: record.width, height: record.height }
+      : null,
+    // A record without a cutout is an AI-regenerated source that crashed before re-removal —
+    // it comes back queued, one "Remove backgrounds" away from where it left off.
+    status: record.cutout ? 'done' : 'ready',
+  };
 }
 
 export default function BgRemover() {
@@ -244,8 +249,8 @@ export default function BgRemover() {
   const [safeArea, setSafeArea] = usePersistedState<SafeAreaConfig>('skuc_bgSafeArea', DEFAULT_SAFE_AREA);
   // Azure credentials are the compositor's own keys, read from the same storage so the two
   // products never hold different values; only the default prompt is this product's.
-  const [azureEndpoint, setAzureEndpoint] = usePersistedState('skuc_azureEndpoint', '');
-  const [azureKey, setAzureKey] = usePersistedState('skuc_azureKey', '');
+  const [azureEndpoint] = usePersistedState('skuc_azureEndpoint', '');
+  const [azureKey] = usePersistedState('skuc_azureKey', '');
   // Crop the AI-edit reference to the hero region so the model never sees scene props. On by
   // default — it is the only lever that has actually beaten the edit endpoint's layout anchor.
   const [aiFocusCrop, setAiFocusCrop] = usePersistedState('skuc_bgAiFocusCrop', true);
@@ -253,6 +258,9 @@ export default function BgRemover() {
   // A blank stored prompt (saved before the default existed, or cleared) falls back to the
   // default — with a bulk AI-fix button on the page, "no prompt" must never be a reachable state.
   const aiPrompt = storedAiPrompt.trim() ? storedAiPrompt : DEFAULT_AI_PROMPT;
+  const promptCustomised = aiPrompt.trim() !== DEFAULT_AI_PROMPT.trim();
+  // The AI-edit card shows the prompt as a compact .md tile; this opens its editor modal.
+  const [promptEditorOpen, setPromptEditorOpen] = React.useState(false);
   // PNG file-size ceiling. Off by default: on, an export can lose colours or pixels, and that
   // has to be something the user asked for rather than something they discover on the CDN.
   const [budgetOn, setBudgetOn] = usePersistedState('skuc_bgBudgetOn', false);
@@ -281,6 +289,47 @@ export default function BgRemover() {
 
   // ---- Queue ----
   const [items, setItems] = React.useState<BgItem[]>([]);
+  // Crash recovery: mirrors finished work into IndexedDB and offers the previous session back
+  // after a crash. Declared against `items` so every mutation path syncs through one place.
+  const {
+    pending: autosavePending,
+    restore: restoreAutosave,
+    discard: discardAutosave,
+    lastSavedAt: autosavedAt,
+  } = useAutosave(items);
+
+  // Figma-style "file name" for the session, shown in the panel header. Working state, not
+  // decoration: it seeds the .zesku and export ZIP filenames. Auto-seeded from the first
+  // CSV/project file dropped, but never over a name the user already typed.
+  const [sessionName, setSessionName] = React.useState('');
+  const sessionSlug = sessionName.trim().replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '');
+  const seedSessionName = React.useCallback((fileName: string) => {
+    setSessionName((prev) => (prev.trim() ? prev : fileName.replace(/\.[^.]+$/, '')));
+  }, []);
+
+  React.useEffect(() => {
+    if (!autosavePending) return;
+    const { count, savedAt } = autosavePending;
+    toast(`Unsaved session found — ${count} image${count === 1 ? '' : 's'}`, {
+      // Fixed id: React 18 dev double-fires effects, and two identical prompts reads as a bug.
+      id: 'bg-autosave-restore',
+      duration: Infinity,
+      description: `Autosaved ${new Date(savedAt).toLocaleString()}. Restore it, or discard to start fresh.`,
+      action: {
+        label: 'Restore',
+        onClick: () => {
+          void restoreAutosave().then((records) => {
+            setItems((prev) => {
+              const base = nextItemId(prev);
+              return [...prev, ...records.map((r, i) => itemFromAutosave(r, base + i))];
+            });
+            toast.success(`Restored ${records.length} image${records.length === 1 ? '' : 's'}.`);
+          });
+        },
+      },
+      cancel: { label: 'Discard', onClick: () => discardAutosave() },
+    });
+  }, [autosavePending, restoreAutosave, discardAutosave]);
   const [selectedId, setSelectedId] = React.useState<number | null>(null);
   // Display-only reordering for the results grid — never touches `items`, so export naming and
   // retry-by-id are unaffected. Worst-first; ties keep queue order (Array#sort is stable).
@@ -363,6 +412,15 @@ export default function BgRemover() {
   const backendLabel =
     backend === 'webgpu' ? 'GPU' : backend === 'wasm' ? 'CPU' : backend === 'server' ? 'server' : '';
   const busy = running || exporting || warming || aiFixing;
+
+  // A mid-run tab close aborts everything still in flight; autosave keeps what finished, but
+  // only the browser's own prompt can stop the close itself.
+  React.useEffect(() => {
+    if (!busy) return;
+    const warn = (event: BeforeUnloadEvent) => event.preventDefault();
+    window.addEventListener('beforeunload', warn);
+    return () => window.removeEventListener('beforeunload', warn);
+  }, [busy]);
 
   // Offered in the compare dialog's redo picker. Mirrors the main model select, including the
   // sidecar being unavailable, but choosing one here does not change the global setting.
@@ -498,6 +556,7 @@ export default function BgRemover() {
 
   const handleCsv = React.useCallback(
     ({ fileName, text, imported }: CsvPayload) => {
+      seedSessionName(fileName);
       setCsvInfo({
         fileName,
         text,
@@ -510,7 +569,7 @@ export default function BgRemover() {
         toast.warning(`No image URLs auto-detected in ${fileName} — pick the columns below.`);
       }
     },
-    [replaceCsvItems],
+    [replaceCsvItems, seedSessionName],
   );
 
   function updateCsvMapping(next: { nameColumn?: string; imageColumns?: string[] }) {
@@ -527,7 +586,7 @@ export default function BgRemover() {
   async function handleSaveProject() {
     const ready = withCutout(itemsRef.current);
     if (!ready.length || busy) return;
-    const projectName = `zesku-project-${new Date().toISOString().slice(0, 10)}${PROJECT_EXTENSION}`;
+    const projectName = `${sessionSlug || `zesku-project-${new Date().toISOString().slice(0, 10)}`}${PROJECT_EXTENSION}`;
     const dest = await pickSave(projectName);
     if (dest === 'cancelled') return;
     setExporting(true);
@@ -572,6 +631,7 @@ export default function BgRemover() {
       setSafeArea(restored.safeArea);
       setOutputBg(restored.outputBg);
       setTileFitOn(true);
+      seedSessionName(file.name);
       const count = restored.items.length;
       toast.success(
         `${file.name}: restored ${count} cutout${count === 1 ? '' : 's'} — safe-area settings applied, ready for tile fit.`,
@@ -800,7 +860,7 @@ export default function BgRemover() {
     const mock =
       typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('mock');
     if (!mock && (!azureEndpoint.trim() || !azureKey.trim())) {
-      toast.error('Enter the Azure endpoint and API key (shared with the Compositor), or use ?mock=1.');
+      toast.error('Set the Azure endpoint and API key in Settings (gear at the bottom of the rail), or use ?mock=1.');
       return null;
     }
     return { prompt, mock };
@@ -843,7 +903,7 @@ export default function BgRemover() {
       dropPreview(item.id);
       const updated: BgItem = {
         ...item,
-        source: { kind: 'file', file },
+        source: { kind: 'file', file, regenerated: true },
         original: edited,
         cutout: null,
         status: 'ready',
@@ -859,11 +919,13 @@ export default function BgRemover() {
   }
 
   /** ?mock=1 short-circuits Azure, same as the compositor. */
-  async function handleAiEdit(item: BgItem) {
+  async function handleAiEdit(item: BgItem, promptOverride?: string) {
     if (busy || item.status === 'editing' || !canRetry(item)) return;
     const guards = aiEditGuards();
     if (!guards) return;
-    const updated = await aiEditOne(item, guards.prompt, guards.mock);
+    // The dialog's per-image prompt wins for this one run; blank falls back to the default,
+    // so "select all + delete" in the dialog can never fire an empty instruction.
+    const updated = await aiEditOne(item, promptOverride?.trim() || guards.prompt, guards.mock);
     if (!updated) {
       toast.error('AI edit failed — see the image for the error.');
       return;
@@ -961,7 +1023,11 @@ export default function BgRemover() {
     const tiles = tileFitOn;
     // The save dialog opens now, while the click still counts as user activation — after
     // minutes of encoding Chrome would refuse it. Cancelling the dialog cancels the export.
-    const zipName = tiles ? 'safe-area-tiles.zip' : 'bg-cutouts.zip';
+    const zipName = sessionSlug
+      ? `${sessionSlug}-${tiles ? 'tiles' : 'cutouts'}.zip`
+      : tiles
+        ? 'safe-area-tiles.zip'
+        : 'bg-cutouts.zip';
     const dest = await pickSave(zipName);
     if (dest === 'cancelled') return;
     // Snapshotted once: editing the ceiling mid-export must not give the ZIP two different rules.
@@ -1207,21 +1273,15 @@ export default function BgRemover() {
     <PanelSection title="AI edit"
         hint="Send an image to Azure GPT-Image from its dialog; the result replaces the image and its background is removed again.">
         <FieldGroup className="gap-4">
-          <Field>
-            <FieldLabel htmlFor="bg-ai-prompt">
-              <Hint hint="Used for every AI edit, including the AI-fix flagged batch. Ships with a studio-packshot recreation prompt; clearing the box restores it.">
-                Default prompt
-              </Hint>
-            </FieldLabel>
-            <Textarea
-              id="bg-ai-prompt"
-              value={aiPrompt}
-              onChange={(e) => setAiPrompt(e.target.value)}
-              placeholder="e.g. Recreate this product photo on a clean white studio background, keeping the product exactly as it is."
-              rows={3}
-              disabled={busy}
-            />
-          </Field>
+          {/* The .md tile is its own label — a "Prompt" heading above it read as a second
+              section title. The per-image override note lives in the editor dialog. */}
+          <MdFileTile
+            name="ai-edit-prompt.md"
+            text={aiPrompt}
+            badge={promptCustomised ? 'Customised' : 'Default'}
+            onClick={() => setPromptEditorOpen(true)}
+            disabled={busy}
+          />
           <Field orientation="horizontal">
             <Checkbox
               id="bg-ai-focus-crop"
@@ -1237,29 +1297,6 @@ export default function BgRemover() {
               </FieldLabel>
             </FieldContent>
           </Field>
-          <Field>
-            <FieldLabel htmlFor="bg-azure-endpoint">Azure endpoint</FieldLabel>
-            <Input
-              id="bg-azure-endpoint"
-              value={azureEndpoint}
-              onChange={(e) => setAzureEndpoint(e.target.value)}
-              placeholder="https://<resource>.openai.azure.com"
-              disabled={busy}
-            />
-          </Field>
-          <Field>
-            <FieldLabel htmlFor="bg-azure-key">
-              <Hint hint="Shared with the Compositor.">Azure API key</Hint>
-            </FieldLabel>
-            <Input
-              id="bg-azure-key"
-              type="password"
-              value={azureKey}
-              onChange={(e) => setAzureKey(e.target.value)}
-              placeholder="Azure API key"
-              disabled={busy}
-            />
-          </Field>
         </FieldGroup>
       </PanelSection>
   );
@@ -1268,26 +1305,20 @@ export default function BgRemover() {
   // area, and the export renders tiles instead of raw cutouts. The live preview shows the
   // SELECTED cutout, Figma-style: pick on the canvas, preview in the properties.
   const tileFitCard = (
-    <PanelSection className="space-y-4">
-        <Field orientation="horizontal">
-          <Switch
-            id="bg-tile-fit"
-            checked={tileFitOn}
-            disabled={busy}
-            onCheckedChange={(checked) => setTileFitOn(checked === true)}
-            className="mt-0.5"
-          />
-          <FieldContent>
-            <FieldLabel htmlFor="bg-tile-fit" className="font-normal">
-              Tile fit
-            </FieldLabel>
-            <FieldDescription>
-              Export composites every cutout into the safe area below instead of keeping the
-              source frame.
-            </FieldDescription>
-          </FieldContent>
-        </Field>
-        {tileFitOn && (
+    <PanelSection
+      title="Tile fit"
+      hint="Export composites every cutout into the safe area below instead of keeping the source frame."
+      action={
+        <Switch
+          aria-label="Tile fit"
+          checked={tileFitOn}
+          disabled={busy}
+          onCheckedChange={(checked) => setTileFitOn(checked === true)}
+        />
+      }
+      className="space-y-4"
+    >
+        {tileFitOn ? (
           <>
             <SafeAreaControls
               config={safeArea}
@@ -1313,7 +1344,7 @@ export default function BgRemover() {
               </p>
             </div>
           </>
-        )}
+        ) : undefined}
       </PanelSection>
   );
 
@@ -1494,7 +1525,28 @@ export default function BgRemover() {
   return (
     <div className="flex min-h-dvh flex-col">
       <StudioShell>
-            <LeftPanel title="Setup" hint="Input & model" footer={runFooter}>
+            <LeftPanel
+              title="Setup"
+              footer={runFooter}
+              header={
+                <SessionHeader
+                  name={sessionName}
+                  onNameChange={setSessionName}
+                  placeholder="Untitled batch"
+                  product="Cleanup"
+                  chips={
+                    [
+                      items.length > 0 && { label: `${items.length} image${items.length === 1 ? '' : 's'}` },
+                      cutouts.length > 0 && { label: `${cutouts.length} cut out` },
+                      flaggedCount > 0 && { label: `${flaggedCount} flagged`, tone: 'warn' as const },
+                      autosavedAt !== null && {
+                        label: `Autosaved ${new Date(autosavedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`,
+                      },
+                    ].filter(Boolean) as SessionChip[]
+                  }
+                />
+              }
+            >
               {inputCard}
               <PanelSection title="Model" hint="Weights download once, then stay cached.">
                   <div className="mb-3">
@@ -1725,11 +1777,6 @@ export default function BgRemover() {
 
             <RightPanel
               title="Process & export"
-              hint={
-                items.length
-                  ? `${cutouts.length}/${items.length} cut out${flaggedCount ? ` · ${flaggedCount} flagged` : ''}`
-                  : 'Cutouts'
-              }
               footer={exportFooter}
             >
               {tileFitCard}
@@ -1756,12 +1803,52 @@ export default function BgRemover() {
         aiEdit={{
           ready: aiReady && !busy,
           hint: aiReady
-            ? 'Send to Azure GPT-Image with the default prompt; the result replaces this image'
-            : 'Set the default prompt (and Azure endpoint + key) in the AI edit card first',
-          onEdit: (item) => void handleAiEdit(item),
+            ? 'Send to Azure GPT-Image with this prompt; the result replaces this image'
+            : 'Set the Azure endpoint + key in Settings (gear in the rail) first',
+          defaultPrompt: aiPrompt,
+          onEdit: (item, prompt) => void handleAiEdit(item, prompt),
         }}
         busy={busy}
       />
+
+      {/* Prompt editor — the .md tile in the AI edit card opens this. Edits bind live to the
+          persisted default; Reset restores the shipped packshot prompt. */}
+      <Dialog open={promptEditorOpen} onOpenChange={setPromptEditorOpen}>
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <MdFileIcon className="size-4 text-muted-foreground" />
+              ai-edit-prompt.md
+            </DialogTitle>
+            <DialogDescription>
+              The default prompt for every AI edit, including the AI-fix flagged batch.
+              Individual images can override it from their compare dialog without changing this.
+            </DialogDescription>
+          </DialogHeader>
+          {/* Capped: the textarea auto-grows with content (field-sizing-content), so a long
+              prompt would otherwise push the dialog past the viewport. */}
+          <Textarea
+            value={aiPrompt}
+            onChange={(e) => setAiPrompt(e.target.value)}
+            rows={16}
+            disabled={busy}
+            aria-label="Default AI edit prompt"
+            className="max-h-[55dvh] min-h-40 overflow-y-auto text-xs"
+          />
+          <DialogFooter>
+            {promptCustomised && (
+              <Button
+                variant="ghost"
+                disabled={busy}
+                onClick={() => setAiPrompt(DEFAULT_AI_PROMPT)}
+              >
+                Reset to default
+              </Button>
+            )}
+            <Button onClick={() => setPromptEditorOpen(false)}>Done</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

@@ -25,6 +25,7 @@ import { Textarea } from '@/components/ui/textarea';
 
 import { TemplateEditor } from '@/components/template-editor';
 import { CsvDropzone } from '@/components/csv-dropzone';
+import { SessionHeader, type SessionChip } from '@/components/session-header';
 import { TileGrid, TileDialog } from '@/components/tile-grid';
 import { Canvas, LeftPanel, PanelSection, RightPanel, StudioShell } from '@/components/pane-layout';
 import { useProcessing } from '@/components/process-panel';
@@ -32,7 +33,7 @@ import { useProcessing } from '@/components/process-panel';
 import { DEFAULT_TEMPLATE, TileTemplate, tileToPngBlob } from '@/lib/tile';
 import { parseCSV, detectImageColumns, detectTitleColumn, detectOfferColumn, CsvRecord } from '@/lib/csv';
 import { buildZip, ZipFileEntry } from '@/lib/zip';
-import { azureImageUrl, loadImageFromUrl, callAzure, mockComposite } from '@/lib/pipeline';
+import { loadImageFromUrl, callAzure, mockComposite } from '@/lib/pipeline';
 import {
   BG_MODELS, BG_MODEL_ORDER, DEFAULT_MODEL_ID, probeServerModel, removeBackground, type BgModelId,
 } from '@/lib/bg/engine';
@@ -41,43 +42,12 @@ import { describeBudget, fitToBudget, type BudgetResult } from '@/lib/bg/budget'
 import { isPng8Supported } from '@/lib/bg/png8';
 import { TILE_PRESETS } from '@/lib/bg/safe-area';
 import { QueueItem, DEFAULT_ENDPOINT, DEFAULT_PROMPT } from '@/lib/types';
+import { usePersistedState } from '@/hooks/use-persisted-state';
 
 const NONE = '__none__';
 // Bounds how many tile canvases encode at once on export; TinyPNG stays narrower (rate limits).
 const ENCODE_CONCURRENCY = 8;
 const COMPRESS_CONCURRENCY = 4;
-
-// localStorage-backed state. Reads after mount (not in the initializer) so the
-// server-rendered HTML matches the first client render and hydration stays clean.
-function usePersistedState<T>(key: string, initial: T): [T, (v: T | ((p: T) => T)) => void] {
-  const [value, setValue] = React.useState<T>(initial);
-  React.useEffect(() => {
-    let saved: string | null = null;
-    try { saved = localStorage.getItem(key); } catch { /* private mode etc. */ }
-    if (saved !== null) {
-      try {
-        const parsed = JSON.parse(saved) as T;
-        // eslint-disable-next-line react-hooks/set-state-in-effect -- one-time hydration from external store
-        setValue(parsed);
-      } catch {
-        // Legacy value from the pre-Next app, which stored strings raw (unquoted).
-        if (typeof initial === 'string') {
-           
-          setValue(saved as unknown as T);
-        }
-      }
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-  const set = React.useCallback((v: T | ((p: T) => T)) => {
-    setValue((prev) => {
-      const next = typeof v === 'function' ? (v as (p: T) => T)(prev) : v;
-      try { localStorage.setItem(key, JSON.stringify(next)); } catch { /* quota / private mode */ }
-      return next;
-    });
-  }, [key]);
-  return [value, set];
-}
 
 // The tile renderer draws an HTMLImageElement, so a cutout canvas has to be re-encoded.
 // The load must be awaited: drawing an undecoded image paints nothing.
@@ -98,8 +68,8 @@ export default function Compositor() {
   const [offerVisible, setOfferVisible] = React.useState(true);
 
   // Keys / prompt
-  const [endpoint, setEndpoint] = usePersistedState('skuc_azureEndpoint', DEFAULT_ENDPOINT);
-  const [azureKey, setAzureKey] = usePersistedState('skuc_azureKey', '');
+  const [endpoint] = usePersistedState('skuc_azureEndpoint', DEFAULT_ENDPOINT);
+  const [azureKey] = usePersistedState('skuc_azureKey', '');
   const [parallel, setParallel] = usePersistedState('skuc_azureParallel', 3);
   // The CDN ceiling is one rule for the whole suite, so these keys are the BG remover's own.
   const [budgetOn, setBudgetOn] = usePersistedState('skuc_bgBudgetOn', false);
@@ -135,6 +105,10 @@ export default function Compositor() {
   const [fileName, setFileName] = React.useState<string | null>(null);
   const [headers, setHeaders] = React.useState<string[]>([]);
   const [records, setRecords] = React.useState<CsvRecord[]>([]);
+  // Figma-style session name in the panel header; seeds the export ZIP filename. Auto-seeded
+  // from the dropped CSV, but never over a name the user already typed.
+  const [sessionName, setSessionName] = React.useState('');
+  const sessionSlug = sessionName.trim().replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '');
   const [imageCols, setImageCols] = React.useState<string[]>([]);
   const [titleCol, setTitleCol] = React.useState('');
   const [offerCol, setOfferCol] = React.useState('');
@@ -160,7 +134,6 @@ export default function Compositor() {
 
   const mock = typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('mock');
   // The proxy keeps only this field's origin; showing the result keeps that from being silent.
-  const resolvedUrl = azureImageUrl(endpoint, 'edits');
 
   // isPng8Supported() reads a browser global, so it must not decide the server-rendered markup.
   const png8Ready = React.useSyncExternalStore(
@@ -181,6 +154,7 @@ export default function Compositor() {
       const tCol = detectTitleColumn(headers, imgCols);
       const oCol = detectOfferColumn(headers, imgCols);
       setFileName(file.name);
+      setSessionName((prev) => (prev.trim() ? prev : file.name.replace(/\.[^.]+$/, '')));
       setHeaders(headers);
       setRecords(records);
       setImageCols(imgCols);
@@ -266,7 +240,7 @@ export default function Compositor() {
   async function handleGenerateAll() {
     if (running) return;
     if (!mock && (!endpoint.trim() || !azureKey.trim())) {
-      toast.error('Enter your Azure endpoint and API key (or use ?mock=1 for testing).');
+      toast.error('Set the Azure endpoint and API key in Settings (gear at the bottom of the rail), or use ?mock=1.');
       return;
     }
     const todo = items.filter((it) => it.urls.length);
@@ -317,7 +291,8 @@ export default function Compositor() {
     if (!done.length) return;
     // Save dialog first, while the click still counts as user activation — TinyPNG passes can
     // take minutes, after which Chrome would refuse to open it. Cancelling cancels the export.
-    const dest = await pickSave('sku-tiles.zip');
+    const zipName = sessionSlug ? `${sessionSlug}-tiles.zip` : 'sku-tiles.zip';
+    const dest = await pickSave(zipName);
     if (dest === 'cancelled') return;
 
     setRunning(true);
@@ -439,7 +414,7 @@ export default function Compositor() {
       });
 
       const zip = buildZip(files);
-      await saveTo(dest, zip, 'sku-tiles.zip');
+      await saveTo(dest, zip, zipName);
     } catch (e) {
       toast.error(`Export failed: ${(e as Error).message}`);
       setProgress({ pct: 100, text: `Export failed: ${(e as Error).message}` });
@@ -464,7 +439,20 @@ export default function Compositor() {
       <StudioShell>
         <LeftPanel
           title="Design & Generate"
-          hint="Template · data · prompt · keys"
+          header={
+            <SessionHeader
+              name={sessionName}
+              onNameChange={setSessionName}
+              placeholder="Untitled batch"
+              product="Banners"
+              chips={
+                [
+                  records.length > 0 && { label: `${records.length} row${records.length === 1 ? '' : 's'}` },
+                  items.length > 0 && { label: `${doneCount}/${items.length} tiles` },
+                ].filter(Boolean) as SessionChip[]
+              }
+            />
+          }
           footer={
             <Button className="w-full" disabled={!canGenerate || running} onClick={handleGenerateAll}>
               {running && <Spinner data-icon="inline-start" />}
@@ -651,23 +639,8 @@ export default function Compositor() {
               </FieldGroup>
             </PanelSection>
 
-          <PanelSection title="Keys">
+          <PanelSection title="Requests" hint="Azure credentials moved to Settings — the gear at the bottom of the rail.">
               <FieldGroup className="gap-4">
-                <Field>
-                  <FieldLabel htmlFor="azure-endpoint">Azure resource</FieldLabel>
-                  <Input id="azure-endpoint" value={endpoint} onChange={(e) => setEndpoint(e.target.value)} placeholder={DEFAULT_ENDPOINT} />
-                  <FieldDescription>
-                    {resolvedUrl ? (
-                      <>Calls <code className="break-all">{resolvedUrl}</code> — only the resource host is taken from this field.</>
-                    ) : (
-                      'Paste the resource URL, or any image URL from the Azure portal.'
-                    )}
-                  </FieldDescription>
-                </Field>
-                <Field>
-                  <FieldLabel htmlFor="azure-key">Azure API key</FieldLabel>
-                  <Input id="azure-key" type="password" value={azureKey} onChange={(e) => setAzureKey(e.target.value)} placeholder="Azure OpenAI key" />
-                </Field>
                 <Field>
                   <FieldLabel htmlFor="azure-parallel">
                     <Hint hint="Tiles generated at once. Raise it until the deployment’s rate limit pushes back (429s), then step down one.">Parallel requests</Hint>
@@ -722,7 +695,6 @@ export default function Compositor() {
 
         <RightPanel
           title="Export"
-          hint={items.length ? `${doneCount}/${items.length} tiles ready` : 'Generated tiles'}
           footer={
             <div className="space-y-2">
               {/* No children: the Progress root renders its own track+indicator;
@@ -781,7 +753,7 @@ export default function Compositor() {
                       />
                       <FieldContent>
                         <FieldLabel htmlFor="co-budget-on" className="font-normal">
-                          <Hint hint="Colours go first — full colour, then a 256 · 128 · 64 · 32 palette — and the export stops at the first step that fits. Shared setting with the BG Remover.">Limit file size</Hint>
+                          <Hint hint="Colours go first — full colour, then a 256 · 128 · 64 · 32 palette — and the export stops at the first step that fits. Shared setting with Cleanup.">Limit file size</Hint>
                         </FieldLabel>
                         {!png8Ready && (
                           <FieldDescription>

@@ -28,6 +28,7 @@ import { Spinner } from '@/components/ui/spinner';
 import { Switch } from '@/components/ui/switch';
 
 import { Canvas, PanelSection, RightPanel, StudioShell } from '@/components/pane-layout';
+import { SessionHeader, type SessionChip } from '@/components/session-header';
 import { cn } from '@/lib/utils';
 import { buildZip, type ZipFileEntry } from '@/lib/zip';
 import { canvasToPngBlob, formatKb, loadImageFromFile, mapWithLimit, releaseCanvas } from '@/lib/bg/batch';
@@ -66,6 +67,10 @@ function imageToCanvas(img: HTMLImageElement): Promise<HTMLCanvasElement> {
 
 export default function PngCompressorPage() {
   const [items, setItems] = React.useState<Item[]>([]);
+  // Figma-style session name in the panel header; seeds the download ZIP filename. Auto-seeded
+  // from the first PNG dropped, but never over a name the user already typed.
+  const [sessionName, setSessionName] = React.useState('');
+  const sessionSlug = sessionName.trim().replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '');
   const [colors, setColors] = React.useState<number>(256);
   const [lossless, setLossless] = React.useState(false);
   const [running, setRunning] = React.useState(false);
@@ -86,6 +91,7 @@ export default function PngCompressorPage() {
     const skipped = Array.from(files).length - pngs.length;
     if (skipped > 0) toast.warning(`Skipped ${skipped} non-PNG file${skipped === 1 ? '' : 's'}`);
     if (!pngs.length) return;
+    setSessionName((prev) => (prev.trim() ? prev : pngs[0].name.replace(/\.[^.]+$/, '')));
     setItems((prev) => [
       ...prev,
       ...pngs.map((file) => ({
@@ -171,10 +177,10 @@ export default function PngCompressorPage() {
     const url = URL.createObjectURL(buildZip(entries));
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'compressed-pngs.zip';
+    a.download = sessionSlug ? `${sessionSlug}-compressed.zip` : 'compressed-pngs.zip';
     a.click();
     URL.revokeObjectURL(url);
-  }, [items]);
+  }, [items, sessionSlug]);
 
   const doneCount = items.filter((it) => it.status === 'done').length;
   const totalIn = items.reduce((s, it) => s + it.file.size, 0);
@@ -306,7 +312,21 @@ export default function PngCompressorPage() {
 
         <RightPanel
           title="Process & compress"
-          hint={proc.summary || (doneCount ? `${doneCount} done` : 'Applied on the next run')}
+          header={
+            <SessionHeader
+              name={sessionName}
+              onNameChange={setSessionName}
+              placeholder="Untitled batch"
+              product="Compress"
+              chips={
+                [
+                  items.length > 0 && { label: `${items.length} file${items.length === 1 ? '' : 's'}` },
+                  doneCount > 0 && { label: `${doneCount} compressed` },
+                  doneCount > 0 && { label: `${savingsPct(totalIn, totalOut)}% smaller` },
+                ].filter(Boolean) as SessionChip[]
+              }
+            />
+          }
           footer={
             <div className="flex flex-col gap-2">
               {items.length > 0 && (

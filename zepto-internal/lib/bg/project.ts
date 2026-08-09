@@ -117,7 +117,7 @@ export async function loadProject(file: File): Promise<RestoredProject> {
   const byName = new Map(entries.map((e) => [e.name, e.blob]));
 
   const manifestBlob = byName.get(MANIFEST);
-  if (!manifestBlob) throw new Error(`${file.name} is not a Zesku project (no ${MANIFEST})`);
+  if (!manifestBlob) throw new Error(`${file.name} is not a Zigma project (no ${MANIFEST})`);
   let manifest: Manifest;
   try {
     manifest = JSON.parse(await manifestBlob.text()) as Manifest;
@@ -131,7 +131,7 @@ export async function loadProject(file: File): Promise<RestoredProject> {
   }
   if (manifest.version !== VERSION) {
     throw new Error(
-      `${file.name} was saved by a newer version of Zesku (format v${manifest.version}) — update the app to open it`,
+      `${file.name} was saved by a newer version of Zigma (format v${manifest.version}) — update the app to open it`,
     );
   }
   if (!Array.isArray(manifest.items)) throw new Error(`${file.name} has no items`);

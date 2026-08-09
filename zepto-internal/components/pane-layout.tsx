@@ -18,6 +18,11 @@ import { cn } from '@/lib/utils';
 // identity lives in the rail and panel titles.
 export const STUDIO_HEIGHT = '100dvh';
 
+// Figma's Show/Hide UI shortcut (⌘\ / Ctrl+\): both side panels vanish and the canvas takes
+// the full viewport; the same press brings them back. Session-scoped like Figma — a reload
+// restores the panels.
+const PanelsHiddenContext = React.createContext(false);
+
 export function StudioShell({
   children,
   height = STUDIO_HEIGHT,
@@ -25,27 +30,49 @@ export function StudioShell({
   children: React.ReactNode;
   height?: string;
 }) {
+  const [panelsHidden, setPanelsHidden] = React.useState(false);
+
+  React.useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.repeat) return;
+      if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey) return;
+      if (event.key !== '\\') return;
+      event.preventDefault();
+      setPanelsHidden((prev) => !prev);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
+
   return (
-    <div
-      className="flex min-w-0 flex-col lg:h-(--studio-h) lg:flex-row lg:overflow-hidden"
-      style={{ '--studio-h': height } as React.CSSProperties}
-    >
-      {children}
-    </div>
+    <PanelsHiddenContext.Provider value={panelsHidden}>
+      <div
+        className="flex min-w-0 flex-col lg:h-(--studio-h) lg:flex-row lg:overflow-hidden"
+        style={{ '--studio-h': height } as React.CSSProperties}
+      >
+        {children}
+      </div>
+    </PanelsHiddenContext.Provider>
   );
 }
 
 interface PanelProps {
-  /** Uppercase panel caption, Figma-style; the hint sits right-aligned beside it. */
+  /** Accessible name only — panels render no visible title strip; the session header and
+      section headings carry the visual structure. */
   title: string;
-  hint?: string;
   children: React.ReactNode;
+  /** Rendered at the panel's top edge — the Figma-style file/session header slot. */
+  header?: React.ReactNode;
   /** Pinned to the panel's bottom edge, outside the scroll region. */
   footer?: React.ReactNode;
   className?: string;
 }
 
-function Panel({ side, title, hint, children, footer, className }: PanelProps & { side: 'left' | 'right' }) {
+function Panel({ side, title, children, header, footer, className }: PanelProps & { side: 'left' | 'right' }) {
+  // Unmounted, not width-zeroed: hidden panels must not keep canvases, previews and effects
+  // alive off screen — a 3,000-cell grid behind a collapsed panel would still be paying rent.
+  const panelsHidden = React.useContext(PanelsHiddenContext);
+  if (panelsHidden) return null;
   return (
     <section
       aria-label={title}
@@ -57,14 +84,13 @@ function Panel({ side, title, hint, children, footer, className }: PanelProps & 
         className,
       )}
     >
-      <div className="flex shrink-0 items-baseline gap-2 border-b px-4 py-2.5">
-        <h2 className="text-xs font-semibold tracking-wide uppercase">{title}</h2>
-        {hint && <span className="ml-auto truncate text-xs text-muted-foreground">{hint}</span>}
-      </div>
+      {/* pt-4: both panes open with 16px of air above their first block — the session header
+          when there is one, otherwise the first section inside the scroll region. */}
+      {header && <div className="shrink-0 border-b pt-4">{header}</div>}
       {/* Flat, Figma-style body: sections divided by hairlines instead of card outlines,
           and the scrollbar (ScrollArea) fades in only while hovering or scrolling. */}
       <ScrollArea className="min-h-0 flex-1">
-        <div className="divide-y divide-border">{children}</div>
+        <div className={cn('divide-y divide-border', !header && 'pt-4')}>{children}</div>
       </ScrollArea>
       {footer && <div className="shrink-0 border-t p-3">{footer}</div>}
     </section>
@@ -90,29 +116,43 @@ export function PanelSection({
   description?: React.ReactNode;
   /** Rendered right-aligned beside the title. */
   action?: React.ReactNode;
-  children: React.ReactNode;
+  /** Omit for a heading-only section — a titled switch row with its body collapsed. */
+  children?: React.ReactNode;
   className?: string;
 }) {
+  // Descriptions live in the title's tooltip, not as visible subtext — panels stay dense and
+  // the explanation is one hover away. A description WITHOUT a title has no tooltip anchor,
+  // so that one case stays visible rather than silently vanishing.
+  const tip =
+    hint != null && description != null ? (
+      <>
+        {hint} {description}
+      </>
+    ) : (
+      hint ?? description
+    );
   return (
     <section className="px-4 py-4">
       {(title != null || action != null) && (
-        <div className="mb-3 flex items-center gap-2">
+        <div className={cn('flex items-center gap-2', children != null && 'mb-3')}>
           {title != null && (
-            <h3 className="text-sm font-medium">{hint ? <Hint hint={hint}>{title}</Hint> : title}</h3>
+            // font-semibold, one visual rank above FieldLabel (text-xs regular) — the
+            // section/property hierarchy the whole panel column reads by.
+            <h3 className="text-sm font-semibold">{tip ? <Hint hint={tip}>{title}</Hint> : title}</h3>
           )}
           {action != null && <div className="ml-auto">{action}</div>}
         </div>
       )}
-      {description != null && (
-        <p className="-mt-2 mb-3 text-xs text-muted-foreground">{description}</p>
+      {title == null && description != null && (
+        <p className="mb-3 text-xs text-muted-foreground">{description}</p>
       )}
-      <div className={cn('space-y-3', className)}>{children}</div>
+      {children != null && <div className={cn('space-y-3', className)}>{children}</div>}
     </section>
   );
 }
 
 export function LeftPanel(props: PanelProps) {
-  return <Panel side="left" {...props} className={cn('lg:w-[380px] lg:shrink-0', props.className)} />;
+  return <Panel side="left" {...props} className={cn('lg:w-[320px] lg:shrink-0', props.className)} />;
 }
 
 export function RightPanel(props: PanelProps) {

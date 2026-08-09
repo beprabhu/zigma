@@ -1,4 +1,4 @@
-import { Lexend } from "next/font/google"
+import localFont from "next/font/local"
 
 // Single CSS entry: app.css chains globals.css (theme paste target) then
 // base.css (app plumbing) inside one Tailwind graph. Import order inside
@@ -10,14 +10,19 @@ import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
 
 export const metadata = {
-  title: "Zesku",
+  title: "Zigma",
   description:
     "Zepto's internal image suite — composite product tiles and background removal.",
 }
 
-// Lexend is the UI face; --font-sans in globals.css consumes this variable
-// (with the system stack as fallback).
-const lexend = Lexend({ subsets: ["latin"], variable: "--font-lexend" })
+// Google Sans (self-hosted variable TTF: wght 400-700) is the UI face; --font-sans in
+// base.css consumes this variable (with the system stack as fallback). The tile renderer's
+// ZeptoNorms faces in public/fonts are separate and untouched by this.
+const googleSans = localFont({
+  src: "./fonts/GoogleSans-Variable.ttf",
+  variable: "--font-app-sans",
+  weight: "400 700",
+})
 
 export default function RootLayout({
   children,
@@ -28,7 +33,7 @@ export default function RootLayout({
     <html
       lang="en"
       suppressHydrationWarning
-      className={`${lexend.variable} antialiased font-sans`}
+      className={`${googleSans.variable} antialiased font-sans`}
     >
       {/* The tweakcn live-preview <script> used to sit in a <head> block here.
           next.config.ts now sends Cross-Origin-Embedder-Policy: require-corp so

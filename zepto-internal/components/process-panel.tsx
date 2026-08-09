@@ -8,7 +8,7 @@
 import * as React from 'react';
 
 import { PanelSection } from '@/components/pane-layout';
-import { Field, FieldContent, FieldDescription, FieldLabel } from '@/components/ui/field';
+import { Field, FieldContent, FieldLabel } from '@/components/ui/field';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import { SafeAreaControls } from '@/components/bg-remover/safe-area-controls';
@@ -18,29 +18,7 @@ import {
   COMPRESS_COLOR_CHOICES, COMPRESS_DEFAULT_COLORS, compressPng,
 } from '@/lib/compress';
 import { isProcessingActive, processCanvas, type ProcessSteps } from '@/lib/process';
-
-function usePersistedState<T>(key: string, initial: T): [T, (v: T | ((p: T) => T)) => void] {
-  const [value, setValue] = React.useState<T>(initial);
-  React.useEffect(() => {
-    let saved: string | null = null;
-    try { saved = localStorage.getItem(key); } catch { /* private mode */ }
-    if (saved !== null) {
-      try {
-        // eslint-disable-next-line react-hooks/set-state-in-effect -- one-time hydration
-        setValue(JSON.parse(saved) as T);
-      } catch { /* legacy raw string */ }
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-  const set = React.useCallback((v: T | ((p: T) => T)) => {
-    setValue((prev) => {
-      const next = typeof v === 'function' ? (v as (p: T) => T)(prev) : v;
-      try { localStorage.setItem(key, JSON.stringify(next)); } catch { /* quota */ }
-      return next;
-    });
-  }, [key]);
-  return [value, set];
-}
+import { usePersistedState } from '@/hooks/use-persisted-state';
 
 export interface UseProcessingOptions {
   /** Persisted-key namespace, e.g. 'skuc_gen' — keeps each product's choices its own. */
@@ -117,119 +95,104 @@ export function useProcessing({
     .filter(Boolean)
     .join(' · ');
 
+  // Each step is its own titled section with the switch in the heading row, so the right pane
+  // reads as a uniform list of named sections (the toggle no longer moonlights as the title).
+  // Explanations live in the title tooltips; a section's body only exists while its step is on.
   const panel = (
-    <PanelSection className="space-y-4">
-        {offerRemoveBg && (
-          <Field orientation="horizontal">
+    <>
+      {offerRemoveBg && (
+        <PanelSection
+          title="Remove background"
+          hint="Cleanup's model, applied on export. Weights download once and are shared with that product."
+          action={
             <Switch
-              id={`${prefix}-proc-bg`}
+              aria-label="Remove background"
               checked={removeBg}
               disabled={busy}
               onCheckedChange={(checked) => setRemoveBg(checked === true)}
-              className="mt-0.5"
             />
-            <FieldContent>
-              <FieldLabel htmlFor={`${prefix}-proc-bg`} className="font-normal">
-                Remove background
-              </FieldLabel>
-              <FieldDescription>
-                The BG Remover&rsquo;s model, applied on export. Weights download once and are
-                shared with that product.
-              </FieldDescription>
-            </FieldContent>
-          </Field>
-        )}
+          }
+        />
+      )}
 
-        {offerTileFit && (
-          <>
-            <Field orientation="horizontal">
-              <Switch
-                id={`${prefix}-proc-tile`}
-                checked={tileFitOn}
-                disabled={busy}
-                onCheckedChange={(checked) => setTileFitOn(checked === true)}
-                className="mt-0.5"
-              />
-              <FieldContent>
-                <FieldLabel htmlFor={`${prefix}-proc-tile`} className="font-normal">
-                  Tile fit
-                </FieldLabel>
-                <FieldDescription>
-                  Fits the subject into a safe area on a fixed tile — the BG Remover&rsquo;s
-                  module, same settings shape.
-                </FieldDescription>
-              </FieldContent>
-            </Field>
-            {tileFitOn && (
-              <SafeAreaControls
-                config={safeArea}
-                onChange={setSafeArea}
-                onReset={() => setSafeArea(structuredClone(DEFAULT_SAFE_AREA))}
-                disabled={busy}
-              />
-            )}
-          </>
-        )}
+      {offerTileFit && (
+        <PanelSection
+          title="Tile fit"
+          hint="Fits the subject into a safe area on a fixed tile — Cleanup's module, same settings shape."
+          action={
+            <Switch
+              aria-label="Tile fit"
+              checked={tileFitOn}
+              disabled={busy}
+              onCheckedChange={(checked) => setTileFitOn(checked === true)}
+            />
+          }
+        >
+          {tileFitOn ? (
+            <SafeAreaControls
+              config={safeArea}
+              onChange={setSafeArea}
+              onReset={() => setSafeArea(structuredClone(DEFAULT_SAFE_AREA))}
+              disabled={busy}
+            />
+          ) : undefined}
+        </PanelSection>
+      )}
 
-        {offerCompress && (
-        <Field orientation="horizontal">
-          <Switch
-            id={`${prefix}-proc-compress`}
-            checked={compressOn}
-            disabled={busy}
-            onCheckedChange={(checked) => setCompressOn(checked === true)}
-            className="mt-0.5"
-          />
-          <FieldContent>
-            <FieldLabel htmlFor={`${prefix}-proc-compress`} className="font-normal">
-              Compress PNGs
-            </FieldLabel>
-            <FieldDescription>
-              pngquant + oxipng on this machine — the PNG Compressor&rsquo;s exact pipeline, no
-              key, nothing uploaded.
-            </FieldDescription>
-          </FieldContent>
-        </Field>
-        )}
-        {offerCompress && compressOn && (
-          <>
-            <Field orientation="horizontal">
-              <FieldContent>
-                <FieldLabel htmlFor={`${prefix}-proc-lossless`} className="font-normal">
-                  Lossless only
-                </FieldLabel>
-              </FieldContent>
-              <Switch
-                id={`${prefix}-proc-lossless`}
-                checked={lossless}
-                disabled={busy}
-                onCheckedChange={(checked) => setLossless(checked === true)}
-              />
-            </Field>
-            {!lossless && (
-              <Field>
-                <FieldLabel htmlFor={`${prefix}-proc-colors`}>Palette colors</FieldLabel>
-                <Select
-                  value={String(colors)}
-                  onValueChange={(v) => setColors(Number(v) || COMPRESS_DEFAULT_COLORS)}
+      {offerCompress && (
+        <PanelSection
+          title="Compress PNGs"
+          hint="pngquant + oxipng on this machine — Compress's exact pipeline, no key, nothing uploaded."
+          action={
+            <Switch
+              aria-label="Compress PNGs"
+              checked={compressOn}
+              disabled={busy}
+              onCheckedChange={(checked) => setCompressOn(checked === true)}
+            />
+          }
+        >
+          {compressOn ? (
+            <>
+              <Field orientation="horizontal">
+                <FieldContent>
+                  <FieldLabel htmlFor={`${prefix}-proc-lossless`} className="font-normal">
+                    Lossless only
+                  </FieldLabel>
+                </FieldContent>
+                <Switch
+                  id={`${prefix}-proc-lossless`}
+                  checked={lossless}
                   disabled={busy}
-                >
-                  <SelectTrigger id={`${prefix}-proc-colors`} className="w-full">
-                    <SelectValue>{(v) => `${v} colors`}</SelectValue>
-                  </SelectTrigger>
-                  <SelectContent>
-                    {COMPRESS_COLOR_CHOICES.map((c) => (
-                      <SelectItem key={c} value={String(c)}>
-                        {c} colors{c === COMPRESS_DEFAULT_COLORS ? ' (best quality)' : ''}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                  onCheckedChange={(checked) => setLossless(checked === true)}
+                />
               </Field>
-            )}
-          </>
-        )}
-      </PanelSection>
+              {!lossless && (
+                <Field>
+                  <FieldLabel htmlFor={`${prefix}-proc-colors`}>Palette colors</FieldLabel>
+                  <Select
+                    value={String(colors)}
+                    onValueChange={(v) => setColors(Number(v) || COMPRESS_DEFAULT_COLORS)}
+                    disabled={busy}
+                  >
+                    <SelectTrigger id={`${prefix}-proc-colors`} className="w-full">
+                      <SelectValue>{(v) => `${v} colors`}</SelectValue>
+                    </SelectTrigger>
+                    <SelectContent>
+                      {COMPRESS_COLOR_CHOICES.map((c) => (
+                        <SelectItem key={c} value={String(c)}>
+                          {c} colors{c === COMPRESS_DEFAULT_COLORS ? ' (best quality)' : ''}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </Field>
+              )}
+            </>
+          ) : undefined}
+        </PanelSection>
+      )}
+    </>
   );
 
   return {

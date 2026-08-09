@@ -11,12 +11,16 @@
 import * as React from 'react';
 import { toast } from 'sonner';
 import {
-  ChevronDownIcon, DownloadIcon, FileTextIcon, ImagePlusIcon, SparklesIcon, UploadCloudIcon,
+  DownloadIcon, ImagePlusIcon, SparklesIcon, UploadCloudIcon,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
+import {
+  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
+} from '@/components/ui/dialog';
+import { MdFileIcon, MdFileTile } from '@/components/md-file-tile';
+import { SessionHeader, type SessionChip } from '@/components/session-header';
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty';
 import { Field, FieldContent, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
@@ -33,12 +37,13 @@ import {
   PROMPT_WARN_CHARS, buildRowPrompt, createGenItems, genFileStem, isPromptEmpty,
   type GenItem,
 } from '@/lib/gen';
-import { azureImageUrl, callAzureGenerate, mockGenerate } from '@/lib/pipeline';
+import { callAzureGenerate, mockGenerate } from '@/lib/pipeline';
 import { canvasToPngBlob, mapWithLimit, pickSave, releaseCanvas, saveTo } from '@/lib/bg/batch';
 import { processImage } from '@/lib/process';
 import { useProcessing } from '@/components/process-panel';
 import { buildZip, type ZipFileEntry } from '@/lib/zip';
 import { cn } from '@/lib/utils';
+import { usePersistedState } from '@/hooks/use-persisted-state';
 
 const NONE = '__none__';
 const SIZES = ['1024x1024', '1536x1024', '1024x1536', 'auto'] as const;
@@ -46,33 +51,10 @@ const QUALITIES = ['low', 'medium', 'high'] as const;
 type GenSize = (typeof SIZES)[number];
 type GenQuality = (typeof QUALITIES)[number];
 
-function usePersistedState<T>(key: string, initial: T): [T, (v: T | ((p: T) => T)) => void] {
-  const [value, setValue] = React.useState<T>(initial);
-  React.useEffect(() => {
-    let saved: string | null = null;
-    try { saved = localStorage.getItem(key); } catch { /* private mode */ }
-    if (saved !== null) {
-      try {
-        // eslint-disable-next-line react-hooks/set-state-in-effect -- one-time hydration
-        setValue(JSON.parse(saved) as T);
-      } catch { /* legacy raw string */ }
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-  const set = React.useCallback((v: T | ((p: T) => T)) => {
-    setValue((prev) => {
-      const next = typeof v === 'function' ? (v as (p: T) => T)(prev) : v;
-      try { localStorage.setItem(key, JSON.stringify(next)); } catch { /* quota */ }
-      return next;
-    });
-  }, [key]);
-  return [value, set];
-}
-
 export default function ImageGenerator() {
   // Azure credentials are the suite's shared pair — set them once in any product.
-  const [endpoint, setEndpoint] = usePersistedState('skuc_azureEndpoint', '');
-  const [azureKey, setAzureKey] = usePersistedState('skuc_azureKey', '');
+  const [endpoint] = usePersistedState('skuc_azureEndpoint', '');
+  const [azureKey] = usePersistedState('skuc_azureKey', '');
   const [size, setSize] = usePersistedState<GenSize>('skuc_genSize', '1024x1024');
   const [quality, setQuality] = usePersistedState<GenQuality>('skuc_genQuality', 'low');
   const [parallel, setParallel] = usePersistedState('skuc_genParallel', 3);
@@ -82,9 +64,17 @@ export default function ImageGenerator() {
   // persisting it would silently apply an old brief to a new CSV.
   const [brief, setBrief] = React.useState('');
   const [briefName, setBriefName] = React.useState<string | null>(null);
-  const [briefOpen, setBriefOpen] = React.useState(false);
+  // The brief renders as an .md tile in the panel; this opens its editor modal.
+  const [briefEditorOpen, setBriefEditorOpen] = React.useState(false);
 
   const [csvName, setCsvName] = React.useState<string | null>(null);
+  // Figma-style session name in the panel header; seeds the export ZIP filename. Auto-seeded
+  // from the dropped CSV, but never over a name the user already typed.
+  const [sessionName, setSessionName] = React.useState('');
+  const sessionSlug = sessionName.trim().replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '');
+  const seedSessionName = React.useCallback((fileName: string) => {
+    setSessionName((prev) => (prev.trim() ? prev : fileName.replace(/\.[^.]+$/, '')));
+  }, []);
   const [headers, setHeaders] = React.useState<string[]>([]);
   const [records, setRecords] = React.useState<CsvRecord[]>([]);
   const [nameCol, setNameCol] = React.useState('');
@@ -110,9 +100,6 @@ export default function ImageGenerator() {
     (item: GenItem) => buildRowPrompt(brief, headers, item.record, excludedSet),
     [brief, headers, excludedSet],
   );
-
-  // Shown under the endpoint field so the path the proxy substitutes is never a surprise.
-  const resolvedUrl = azureImageUrl(endpoint, 'generations');
 
   const proc = useProcessing({ prefix: 'skuc_gen', removeBg: true, tileFit: true, busy });
 
@@ -151,6 +138,7 @@ export default function ImageGenerator() {
           // leaving every row named "Row 1" and every export file numbered but anonymous.
           const detected = detectTitleColumn(parsed.headers, []) || parsed.headers[0] || '';
           setCsvName(file.name);
+          seedSessionName(file.name);
           setHeaders(parsed.headers);
           setRecords(parsed.records);
           setNameCol(detected);
@@ -187,7 +175,7 @@ export default function ImageGenerator() {
   function guards(): boolean {
     if (!items.length) return false;
     if (!mock && (!endpoint.trim() || !azureKey.trim())) {
-      toast.error('Enter the Azure endpoint and API key (shared with the other products), or use ?mock=1.');
+      toast.error('Set the Azure endpoint and API key in Settings (gear at the bottom of the rail), or use ?mock=1.');
       return false;
     }
     return true;
@@ -263,7 +251,8 @@ export default function ImageGenerator() {
   async function handleExport() {
     const ready = itemsRef.current.filter((it) => it.status === 'done' && it.image);
     if (!ready.length || busy) return;
-    const dest = await pickSave('generated-images.zip');
+    const zipName = sessionSlug ? `${sessionSlug}-generated.zip` : 'generated-images.zip';
+    const dest = await pickSave(zipName);
     if (dest === 'cancelled') return;
 
     setExporting(true);
@@ -289,7 +278,7 @@ export default function ImageGenerator() {
         n++;
         setProgress({ pct: (n / ready.length) * 100, text: `Packing ${n} of ${ready.length}…` });
       }
-      await saveTo(dest, buildZip(files), 'generated-images.zip');
+      await saveTo(dest, buildZip(files), zipName);
       setProgress({ pct: 100, text: `Exported ${files.length} image${files.length > 1 ? 's' : ''}.` });
     } catch (e) {
       toast.error(`Export failed: ${(e as Error).message}`);
@@ -326,7 +315,7 @@ export default function ImageGenerator() {
       <span>Drop the brief (.md) and the rows (.csv), or click to browse</span>
       <span className="flex flex-wrap justify-center gap-2 text-xs">
         <span className={cn('rounded-md border px-2 py-0.5', briefName && 'border-primary text-foreground')}>
-          <FileTextIcon className="mr-1 inline size-3" />
+          <MdFileIcon className="mr-1 inline size-3" />
           {briefName ?? 'no brief'}
         </span>
         <span className={cn('rounded-md border px-2 py-0.5', csvName && 'border-primary text-foreground')}>
@@ -359,35 +348,43 @@ export default function ImageGenerator() {
   return (
     <div className="flex min-h-dvh flex-col">
       <StudioShell>
-        <LeftPanel title="Setup" hint="Brief, rows & model" footer={runFooter}>
+        <LeftPanel
+          title="Setup"
+          footer={runFooter}
+          header={
+            <SessionHeader
+              name={sessionName}
+              onNameChange={setSessionName}
+              placeholder="Untitled run"
+              product="Generate"
+              chips={
+                [
+                  items.length > 0 && { label: `${items.length} row${items.length === 1 ? '' : 's'}` },
+                  doneCount > 0 && { label: `${doneCount} generated` },
+                  briefName !== null && {
+                    label: brief.trim() ? 'brief loaded' : 'brief empty',
+                    tone: (brief.trim() ? 'default' : 'warn') as SessionChip['tone'],
+                  },
+                ].filter(Boolean) as SessionChip[]
+              }
+            />
+          }
+        >
           <PanelSection title="Input" description={<>One image per CSV row. Each prompt is the brief followed by that row&rsquo;s
                 fields, labelled with their column names.</>}>{dropzone}</PanelSection>
 
           {briefName !== null && (
-            <PanelSection>
-                <Collapsible open={briefOpen} onOpenChange={setBriefOpen}>
-                  <CollapsibleTrigger className="group flex w-full items-center justify-between text-left">
-                    <span className="text-sm font-medium">Brief</span>
-                    <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                      {brief.trim() ? `${brief.trim().length} chars` : 'empty'}
-                      <ChevronDownIcon className="size-4 transition-transform group-aria-expanded:rotate-180" />
-                    </span>
-                  </CollapsibleTrigger>
-                  <CollapsibleContent>
-                    <Textarea
-                      className="mt-3"
-                      rows={10}
-                      value={brief}
-                      disabled={busy}
-                      onChange={(e) => setBrief(e.target.value)}
-                    />
-                    <p className="mt-1.5 text-xs text-muted-foreground">
-                      Edits apply to the next run — rows already generated keep the prompt they
-                      were built from.
-                    </p>
-                  </CollapsibleContent>
-                </Collapsible>
-              </PanelSection>
+            <PanelSection title="Brief">
+              {/* Same .md tile as the BG Remover's prompt: the brief is configuration, so the
+                  panel shows the file card and editing happens in the modal below. */}
+              <MdFileTile
+                name={briefName}
+                text={brief}
+                badge={brief.trim() ? `${brief.trim().length.toLocaleString()} chars` : 'empty'}
+                onClick={() => setBriefEditorOpen(true)}
+                disabled={busy}
+              />
+            </PanelSection>
           )}
 
           {headers.length > 0 && (
@@ -440,40 +437,9 @@ export default function ImageGenerator() {
               </PanelSection>
           )}
 
-          <PanelSection title="Model & keys" description={<>Calls Azure GPT-Image&rsquo;s generations endpoint. Credentials are shared with
-                the Compositor.</>}>
+          <PanelSection title="Model" description={<>Calls Azure GPT-Image&rsquo;s generations endpoint. Credentials live in
+                Settings — the gear at the bottom of the rail.</>}>
               <FieldGroup className="gap-4">
-                <Field>
-                  <FieldLabel htmlFor="gen-endpoint">Azure resource</FieldLabel>
-                  <Input
-                    id="gen-endpoint"
-                    value={endpoint}
-                    disabled={busy}
-                    onChange={(e) => setEndpoint(e.target.value)}
-                    placeholder="https://<resource>.services.ai.azure.com"
-                  />
-                  <FieldDescription>
-                    {resolvedUrl ? (
-                      <>
-                        Calls <code className="break-all">{resolvedUrl}</code> — the path is set
-                        by the product, so pasting any image URL from the portal works.
-                      </>
-                    ) : (
-                      'Paste the resource URL, or any image URL from the Azure portal.'
-                    )}
-                  </FieldDescription>
-                </Field>
-                <Field>
-                  <FieldLabel htmlFor="gen-key">Azure API key</FieldLabel>
-                  <Input
-                    id="gen-key"
-                    type="password"
-                    value={azureKey}
-                    disabled={busy}
-                    onChange={(e) => setAzureKey(e.target.value)}
-                    placeholder="Azure OpenAI key"
-                  />
-                </Field>
                 <Field>
                   <FieldLabel htmlFor="gen-size">Size</FieldLabel>
                   <Select value={size} onValueChange={(v) => setSize(String(v ?? '1024x1024') as GenSize)} disabled={busy}>
@@ -554,7 +520,6 @@ export default function ImageGenerator() {
 
         <RightPanel
           title="Process & export"
-          hint={proc.summary || (items.length ? `${doneCount}/${items.length} generated` : 'Nothing yet')}
           footer={exportFooter}
         >
           {proc.panel}
@@ -590,6 +555,35 @@ export default function ImageGenerator() {
         onClose={() => setOpenId(null)}
         onRegenerate={handleRegenerate}
       />
+
+      {/* Brief editor — the .md tile in the Input card opens this. */}
+      <Dialog open={briefEditorOpen} onOpenChange={setBriefEditorOpen}>
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <MdFileIcon className="size-4 text-muted-foreground" />
+              {briefName ?? 'Brief'}
+            </DialogTitle>
+            <DialogDescription>
+              The brief leads every row&rsquo;s prompt. Edits apply to the next run — rows
+              already generated keep the prompt they were built from.
+            </DialogDescription>
+          </DialogHeader>
+          {/* Capped: the textarea auto-grows with content (field-sizing-content), so a long
+              brief would otherwise push the dialog past the viewport. */}
+          <Textarea
+            value={brief}
+            onChange={(e) => setBrief(e.target.value)}
+            rows={16}
+            disabled={busy}
+            aria-label="Markdown brief"
+            className="max-h-[55dvh] min-h-40 overflow-y-auto text-xs"
+          />
+          <DialogFooter>
+            <Button onClick={() => setBriefEditorOpen(false)}>Done</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
