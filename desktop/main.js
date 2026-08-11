@@ -50,12 +50,23 @@ function createWindow() {
     minHeight: 600,
     title: 'Zigma',
     backgroundColor: '#1e1e1e',
+    // No title bar and no title — just the traffic lights floating over the page, which runs
+    // edge to edge behind them. The rail in the web app pads its top to clear them and makes
+    // that strip the drag handle (components/app-sidebar.tsx).
+    titleBarStyle: 'hiddenInset',
+    trafficLightPosition: { x: 16, y: 14 },
     webPreferences: {
       // The renderer is the remote web app; it gets no Node access.
       nodeIntegration: false,
       contextIsolation: true,
     },
   });
+
+  // How the web app tells it's inside this shell (and so must clear the traffic lights) rather
+  // than in a browser tab. A distinct token, not a check for 'Electron': other Electron-based
+  // browsers carry that in their UA too and would wrongly get the desktop chrome. Set on the
+  // webContents so it survives reloads and in-app navigation.
+  win.webContents.setUserAgent(`${win.webContents.getUserAgent()} ZigmaShell/${app.getVersion()}`);
 
   // Target=_blank and friends open in the real browser, not in more shell windows.
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -127,6 +138,15 @@ if (!app.requestSingleInstanceLock()) {
   });
 
   app.whenReady().then(() => {
+    // A packaged .app takes its Dock icon from the bundle (build/icon.icns, wired up in
+    // package.json). Running unpackaged there is no bundle, so the Dock falls back to the
+    // generic Electron icon unless we set it here from the same artwork.
+    if (!app.isPackaged && process.platform === 'darwin') {
+      try {
+        app.dock?.setIcon(path.join(__dirname, 'build', 'icon-1024.png'));
+      } catch {}
+    }
+
     // Standard roles keep every system shortcut working inside the web app — copy/paste in
     // fields, ⌘R reload, zoom, fullscreen. The page's own shortcuts (⌘\ panels, D theme)
     // pass through untouched.

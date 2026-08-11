@@ -66,6 +66,7 @@ import {
   type BgItem, type BgItemDraft, type BgItemSource, type BgItemStatus,
 } from '@/lib/bg/batch';
 import { useAutosave, type AutosaveRecord } from '@/lib/bg/autosave';
+import { measureFaintResidue } from '@/lib/bg/regions';
 import { describeBudget, fitToBudget, type BudgetResult } from '@/lib/bg/budget';
 import { isPng8Supported } from '@/lib/bg/png8';
 import {
@@ -74,6 +75,7 @@ import {
 } from '@/lib/bg/pool';
 import { PROJECT_EXTENSION, loadProject, saveProject } from '@/lib/bg/project';
 import { assessQuality, countFlagged, sortByQuality } from '@/lib/bg/quality';
+import { readParallel } from '@/lib/rate';
 import { clearPreviews, dropPreview, usePreview } from '@/lib/bg/preview-store';
 import { STORE_TYPE } from '@/lib/bg/constants';
 import { callAzure, loadImageFromUrl, mockComposite } from '@/lib/pipeline';
@@ -143,9 +145,8 @@ REMOVE EVERYTHING ELSE:
   or repeated duplicates. Shrunk to a 40x40 thumbnail, the image must still read
   instantly as this product.`;
 
-/** Parallel Azure requests during "AI-fix flagged" — enough to hide per-request latency
- *  without tripping the deployment's rate limit. */
-const AI_EDIT_CONCURRENCY = 6;
+// Parallel Azure requests during "AI-fix flagged": suite-wide, from Settings → Image model
+// (lib/rate.ts) — this was a local constant (6) before the knob moved there.
 
 /** Padding around the hero region's bbox when focus-cropping the AI-edit reference. */
 const HERO_CROP_PAD = 0.08;
@@ -368,6 +369,9 @@ export default function BgRemover() {
   const removeScrollRef = React.useRef<HTMLDivElement>(null);
 
   const abortRef = React.useRef<AbortController | null>(null);
+  // Separate from abortRef (removal batches): Cancel during an AI-edit Azure phase aborts the
+  // in-flight generation requests; already-regenerated rows keep their (paid-for) results.
+  const aiAbortRef = React.useRef<AbortController | null>(null);
   // The run loop reads the queue across awaits, so it needs the committed value, not a closure.
   const itemsRef = React.useRef<BgItem[]>(items);
   React.useEffect(() => { itemsRef.current = items; }, [items]);
@@ -658,11 +662,13 @@ export default function BgRemover() {
       ),
     );
     const bounds = subjectBounds(result.pixels);
+    const residueFraction = measureFaintResidue(result.pixels, bounds);
     // The engine's canvas is a full-resolution buffer we are done with.
     releaseCanvas(result.canvas);
     return {
       blob,
       bounds,
+      residueFraction,
       width: result.width,
       height: result.height,
       durationMs: result.durationMs,
@@ -746,6 +752,7 @@ export default function BgRemover() {
         bounds: produced.bounds,
         width: produced.width,
         height: produced.height,
+        residueFraction: produced.residueFraction,
       },
       original: null,
       status: 'done',
@@ -872,9 +879,15 @@ export default function BgRemover() {
    * old one. Returns the updated item (background not yet re-removed), or null on failure —
    * failures mark the item and keep going, one bad request must not sink a batch.
    */
-  async function aiEditOne(item: BgItem, prompt: string, mock: boolean): Promise<BgItem | null> {
+  async function aiEditOne(
+    item: BgItem,
+    prompt: string,
+    mock: boolean,
+    signal?: AbortSignal,
+  ): Promise<BgItem | null> {
     patchItem(item.id, { status: 'editing', error: undefined });
     try {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       const src = item.source;
       if (src.kind === 'archived') return null; // callers exclude this via canRetry
       const loaded =
@@ -883,10 +896,11 @@ export default function BgRemover() {
       const edited = mock
         ? await mockComposite([source])
         : await callAzure([source], {
+            signal,
             endpoint: azureEndpoint,
             apiKey: azureKey,
             prompt,
-            quality: 'medium',
+            // quality: suite-wide, from Settings → Quality.
             // The focus crop makes the reference non-square; without an explicit size the
             // edits endpoint mirrors that aspect and returns rectangular images.
             size: '1024x1024',
@@ -913,6 +927,12 @@ export default function BgRemover() {
       patchItem(item.id, updated);
       return updated;
     } catch (e) {
+      if (isAbortError(e)) {
+        // Stopped, not failed — the tile goes back exactly where it was (nothing was replaced;
+        // the source swap happens atomically after the Azure call succeeds).
+        patchItem(item.id, { status: item.status, error: undefined });
+        return null;
+      }
       patchItem(item.id, { status: 'error', error: `AI edit failed: ${errorMessage(e)}` });
       return null;
     }
@@ -923,9 +943,24 @@ export default function BgRemover() {
     if (busy || item.status === 'editing' || !canRetry(item)) return;
     const guards = aiEditGuards();
     if (!guards) return;
-    // The dialog's per-image prompt wins for this one run; blank falls back to the default,
-    // so "select all + delete" in the dialog can never fire an empty instruction.
-    const updated = await aiEditOne(item, promptOverride?.trim() || guards.prompt, guards.mock);
+    const controller = new AbortController();
+    aiAbortRef.current = controller;
+    setAiFixing(true);
+    let updated: BgItem | null = null;
+    try {
+      // The dialog's per-image prompt wins for this one run; blank falls back to the default,
+      // so "select all + delete" in the dialog can never fire an empty instruction.
+      updated = await aiEditOne(
+        item,
+        promptOverride?.trim() || guards.prompt,
+        guards.mock,
+        controller.signal,
+      );
+    } finally {
+      aiAbortRef.current = null;
+      setAiFixing(false);
+    }
+    if (controller.signal.aborted) return; // stopped by the user — no error, no re-removal
     if (!updated) {
       toast.error('AI edit failed — see the image for the error.');
       return;
@@ -934,7 +969,8 @@ export default function BgRemover() {
   }
 
   /**
-   * Every quality-flagged image through Azure, AI_EDIT_CONCURRENCY at a time, then one normal
+   * Every quality-flagged image through Azure, the suite's parallel-requests setting at a
+   * time, then one normal
    * removal batch over the regenerated images. Per-image failures mark their own tile and never
    * stop the rest; the re-removal only sees the successes.
    */
@@ -942,12 +978,15 @@ export default function BgRemover() {
     if (busy || !flaggedItems.length) return;
     const guards = aiEditGuards();
     if (!guards) return;
+    const controller = new AbortController();
+    aiAbortRef.current = controller;
     setAiFixing(true);
     let finished = 0;
     setProgress({ pct: 0, text: `AI edit 1 of ${flaggedItems.length}` });
     try {
-      const results = await mapWithLimit(flaggedItems, AI_EDIT_CONCURRENCY, async (item) => {
-        const updated = await aiEditOne(item, guards.prompt, guards.mock);
+      const results = await mapWithLimit(flaggedItems, readParallel(), async (item) => {
+        if (controller.signal.aborted) return null; // stopped: leave the rest untouched
+        const updated = await aiEditOne(item, guards.prompt, guards.mock, controller.signal);
         finished++;
         setProgress({
           pct: (finished / flaggedItems.length) * 100,
@@ -956,9 +995,15 @@ export default function BgRemover() {
         return updated;
       });
       const updated = results.filter((r): r is BgItem => r !== null);
-      const failed = flaggedItems.length - updated.length;
-      if (failed) {
-        toast.error(`${failed} AI edit${failed === 1 ? '' : 's'} failed — their tiles show the error.`);
+      if (controller.signal.aborted) {
+        toast.info(
+          `AI fix stopped — ${updated.length} of ${flaggedItems.length} regenerated${updated.length ? '; re-removing those' : ''}.`,
+        );
+      } else {
+        const failed = flaggedItems.length - updated.length;
+        if (failed) {
+          toast.error(`${failed} AI edit${failed === 1 ? '' : 's'} failed — their tiles show the error.`);
+        }
       }
       // Release the lock BEFORE the removal batch: runBatch takes running for itself, and this
       // handler's stale `busy` closure would otherwise not matter — but the flag must not
@@ -966,6 +1011,7 @@ export default function BgRemover() {
       setAiFixing(false);
       if (updated.length) await runBatch(updated, 'Re-removing');
     } finally {
+      aiAbortRef.current = null;
       setAiFixing(false);
     }
   }
@@ -987,6 +1033,7 @@ export default function BgRemover() {
 
   function handleCancel() {
     abortRef.current?.abort();
+    aiAbortRef.current?.abort();
     // from_pretrained takes no signal, so a download in flight runs to completion and the abort
     // only lands at the next checkpoint. Say so, or a 452 MB fetch looks like a hung button.
     if (stage === 'loading') {
@@ -1455,7 +1502,7 @@ export default function BgRemover() {
             ? 'All images cut out'
             : 'Nothing queued'}
       </Button>
-      {running && (
+      {(running || aiFixing) && (
         <Button variant="outline" onClick={handleCancel}>
           <CircleStopIcon data-icon="inline-start" />
           Cancel
@@ -1716,7 +1763,7 @@ export default function BgRemover() {
                         disabled={busy || !aiReady || !flaggedItems.length}
                         title={
                           aiReady
-                            ? `Regenerate every flagged image with the AI edit prompt, ${AI_EDIT_CONCURRENCY} at a time, then re-remove their backgrounds`
+                            ? 'Regenerate every flagged image with the AI edit prompt, then re-remove their backgrounds. Parallelism comes from Settings → Image model.'
                             : 'Enter the Azure endpoint and API key in the AI edit card first'
                         }
                         onClick={() => void handleAiEditFlagged()}

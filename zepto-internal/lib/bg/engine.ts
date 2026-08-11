@@ -9,7 +9,7 @@
 import type { PreTrainedModel, Processor, RawImage, Tensor } from '@huggingface/transformers';
 
 import { refineAlpha, type RefineMode } from './refine';
-import { keepProductRegions, type RegionReport } from './regions';
+import { analyzeRegions, keepProductRegions, type RegionReport } from './regions';
 
 export type BgModelId = 'rmbg2' | 'rmbg' | 'birefnet' | 'ben2' | 'modnet';
 
@@ -361,7 +361,7 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
     // bounds too, or tile fit keeps reserving room for something that is no longer there.
     const filtered = productOnly ? keepProductRegions(pixels) : null;
     const removedRegions = filtered?.removed ?? 0;
-    const regionReport = filtered?.regions ?? [];
+    const regionReport = filtered ? filtered.regions : analyzeRegions(pixels);
     if (refine || removedRegions) ctx.putImageData(pixels, 0, 0);
     opts.onStage?.('done');
     return {
@@ -469,7 +469,7 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
   }
   const browserFiltered = productOnly ? keepProductRegions(pixels) : null;
   const removedRegions = browserFiltered?.removed ?? 0;
-  const regionReport = browserFiltered?.regions ?? [];
+  const regionReport = browserFiltered ? browserFiltered.regions : analyzeRegions(pixels);
   ctx.putImageData(pixels, 0, 0);
 
   opts.onStage?.('done');

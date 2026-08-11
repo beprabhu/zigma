@@ -68,6 +68,9 @@ export interface RegionReport {
    *  cluster rule's grouping key, surfaced so a cluster drop stays auditable. */
   dominantBin: number;
   removed: boolean;
+  /** Analysis-only runs (Product only OFF): the classifier would drop this region, but nothing
+   *  was deleted. Quality triage flags these; the dialog table shows "kept · graphic?". */
+  flagged?: boolean;
 }
 
 export interface ProductFilterResult {
@@ -605,4 +608,52 @@ export function keepProductRegions(
   }
 
   return { removed, kept: accs.length - removed, removedPixels, regions };
+}
+
+/**
+ * The classifier as a pure REPORTER: identical verdicts to keepProductRegions, zero deletions.
+ * Runs on a throwaway copy of the pixels so the cutout is untouched; would-drop regions come
+ * back as kept-but-flagged. This is what keeps quality triage awake when the Product-only
+ * filter is off — before this, regionReport simply didn't exist and every multi-object check
+ * in lib/bg/quality.ts silently passed (which is how badge collages sailed through unflagged).
+ */
+export function analyzeRegions(
+  pixels: ImageData,
+  options: ProductFilterOptions = {},
+): RegionReport[] {
+  const probe = new ImageData(new Uint8ClampedArray(pixels.data), pixels.width, pixels.height);
+  const result = keepProductRegions(probe, options);
+  return result.regions.map((r) => (r.removed ? { ...r, removed: false, flagged: true } : r));
+}
+
+/**
+ * Share of the canvas covered by FAINT pixels (alpha in (low, high)) outside the padded subject
+ * bbox — the signature of ghosted overlay graphics the matte half-erased (semi-transparent
+ * icons, watermarks) or a stray soft shadow. Pixels in this band are invisible to both the
+ * bbox scan and the region classifier (both gate on alpha > high), so nothing else can see them.
+ */
+export function measureFaintResidue(
+  pixels: ImageData,
+  bounds: SubjectBounds | null,
+  opts: { low?: number; high?: number; pad?: number } = {},
+): number {
+  const { low = 16, high = 128, pad = 4 } = opts;
+  const { width: w, height: h, data } = pixels;
+  const n = w * h;
+  if (!n) return 0;
+  const bx0 = bounds ? Math.max(0, bounds.x - pad) : 0;
+  const by0 = bounds ? Math.max(0, bounds.y - pad) : 0;
+  const bx1 = bounds ? Math.min(w, bounds.x + bounds.w + pad) : 0;
+  const by1 = bounds ? Math.min(h, bounds.y + bounds.h + pad) : 0;
+  let count = 0;
+  for (let y = 0; y < h; y++) {
+    const insideY = bounds !== null && y >= by0 && y < by1;
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      if (insideY && x >= bx0 && x < bx1) continue;
+      const a = data[(row + x) * 4 + 3];
+      if (a > low && a < high) count++;
+    }
+  }
+  return count / n;
 }

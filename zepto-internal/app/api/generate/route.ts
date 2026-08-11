@@ -90,7 +90,9 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const upstream = await fetch(url, { method: 'POST', headers, body: payload });
+    // req.signal fires when the browser aborts (the Stop button) — forwarding it drops the
+    // Azure connection instead of letting an unwanted generation run to completion.
+    const upstream = await fetch(url, { method: 'POST', headers, body: payload, signal: req.signal });
     const text = await upstream.text();
     let json: {
       error?: { message?: string } | string;

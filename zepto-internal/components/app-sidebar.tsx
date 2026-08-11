@@ -20,18 +20,47 @@ export function AppSidebar() {
   const current = productForPathname(pathname);
   const [settingsOpen, setSettingsOpen] = React.useState(false);
 
+  // The desktop shell hides the native title bar and floats only the traffic lights over the
+  // window (desktop/main.js, titleBarStyle: 'hiddenInset'). They land inside this rail's
+  // column, so the rail alone clears them — the rest of the app keeps running to the top edge.
+  // Served in a browser there are no lights, so it keeps its normal size. The shell stamps
+  // ZigmaShell into its UA for this; a bare 'Electron' check would also match Electron-based
+  // browsers, which have an ordinary title bar and must not get the desktop treatment.
+  const [desktopShell, setDesktopShell] = React.useState(false);
+  React.useEffect(() => {
+    setDesktopShell(navigator.userAgent.includes('ZigmaShell'));
+  }, []);
+
   return (
     <aside
       aria-label="Products"
-      className="sticky top-0 flex h-dvh w-[4.75rem] shrink-0 flex-col items-center gap-3 border-r bg-sidebar py-3"
+      className={cn(
+        'sticky top-0 flex h-dvh shrink-0 flex-col items-center gap-3 border-r bg-sidebar pb-3',
+        // Desktop: the lights run from the 16px inset in main.js out to x≈72, past the 68px
+        // the rail is wide in the browser — that's why they sat across its edge. 88px = 72 + a
+        // right margin equal to their 16px left inset, so they sit centred in the rail. In px,
+        // not rem: the root font-size is 14.4px, so rem widths land ~10% short.
+        desktopShell ? 'w-[88px] pt-10' : 'w-[4.75rem] pt-3',
+      )}
     >
-      {/* The mark stands on its own, Figma-rail style — no tile behind it. */}
+      {/* The strip the lights sit in is the window's drag handle — without it a frameless
+          window can't be moved. Electron-only CSS; inert in a browser. */}
+      {desktopShell && (
+        <div
+          aria-hidden
+          className="absolute inset-x-0 top-0 h-9"
+          style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}
+        />
+      )}
+      {/* The mark stands on its own, Figma-rail style — no tile behind it. Sized up from the
+          product icons (size-8 vs size-5) so it reads as the app's identity, not another tool;
+          the extra top/bottom margin separates "logo" from "navigation". */}
       <Link
         href="/"
         title="Zigma — all products"
-        className="mb-2 flex size-9 items-center justify-center rounded-lg outline-none transition-colors hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+        className="mt-2 mb-4 flex size-11 items-center justify-center rounded-xl outline-none transition-colors hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-sidebar-ring"
       >
-        <ZigmaMark className="size-6" />
+        <ZigmaMark className="size-8" />
       </Link>
 
       {PRODUCTS.map((product) => {

@@ -38,6 +38,7 @@ import {
   BG_MODELS, BG_MODEL_ORDER, DEFAULT_MODEL_ID, probeServerModel, removeBackground, type BgModelId,
 } from '@/lib/bg/engine';
 import { mapWithLimit, pickSave, saveTo } from '@/lib/bg/batch';
+import { readParallel } from '@/lib/rate';
 import { describeBudget, fitToBudget, type BudgetResult } from '@/lib/bg/budget';
 import { isPng8Supported } from '@/lib/bg/png8';
 import { TILE_PRESETS } from '@/lib/bg/safe-area';
@@ -70,7 +71,6 @@ export default function Compositor() {
   // Keys / prompt
   const [endpoint] = usePersistedState('skuc_azureEndpoint', DEFAULT_ENDPOINT);
   const [azureKey] = usePersistedState('skuc_azureKey', '');
-  const [parallel, setParallel] = usePersistedState('skuc_azureParallel', 3);
   // The CDN ceiling is one rule for the whole suite, so these keys are the BG remover's own.
   const [budgetOn, setBudgetOn] = usePersistedState('skuc_bgBudgetOn', false);
   const [budgetKb, setBudgetKb] = usePersistedState('skuc_bgBudgetKb', 150);
@@ -247,10 +247,10 @@ export default function Compositor() {
     if (!todo.length) return;
 
     setRunning(true);
-    // Groups of `parallel` requests in flight at once: the Azure round trip dominates a tile's
-    // wall-clock, so overlapping the waits is where a batch gets its speed. The ceiling is the
-    // deployment's rate limit, which is exactly what the setting expresses.
-    const limit = Math.max(1, Math.min(8, parallel));
+    // Requests in flight at once: the Azure round trip dominates a tile's wall-clock, so
+    // overlapping the waits is where a batch gets its speed. Suite-wide, from Settings →
+    // Image model (lib/rate.ts); read at run start, so it holds for the whole batch.
+    const limit = readParallel();
     let done = 0;
     let finished = 0;
     setProgress({ pct: 0, text: `0 of ${todo.length} tiles — ${limit} at a time with ${mock ? 'mock' : 'azure'}…` });
@@ -639,24 +639,7 @@ export default function Compositor() {
               </FieldGroup>
             </PanelSection>
 
-          <PanelSection title="Requests" hint="Azure credentials moved to Settings — the gear at the bottom of the rail.">
-              <FieldGroup className="gap-4">
-                <Field>
-                  <FieldLabel htmlFor="azure-parallel">
-                    <Hint hint="Tiles generated at once. Raise it until the deployment’s rate limit pushes back (429s), then step down one.">Parallel requests</Hint>
-                  </FieldLabel>
-                  <Input
-                    id="azure-parallel"
-                    type="number"
-                    min={1}
-                    max={8}
-                    className="w-24"
-                    value={parallel}
-                    onChange={(e) => setParallel(Math.max(1, Math.min(8, Number(e.target.value) || 1)))}
-                  />
-                </Field>
-              </FieldGroup>
-            </PanelSection>
+          {/* Parallel requests moved to Settings → Image model — suite-wide (lib/rate.ts). */}
 
         </LeftPanel>
 

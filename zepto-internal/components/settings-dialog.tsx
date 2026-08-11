@@ -9,7 +9,7 @@
 // this pane is a live subscriber, so totals tick up while runs are in flight.
 
 import * as React from 'react';
-import { ChartColumnIcon, KeyRoundIcon, PlugZapIcon } from 'lucide-react';
+import { ChartColumnIcon, KeyRoundIcon, PlugZapIcon, SlidersHorizontalIcon } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { Hint } from '@/components/hint';
@@ -19,18 +19,24 @@ import {
 import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
 import { Spinner } from '@/components/ui/spinner';
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from '@/components/ui/select';
 import { usePersistedState } from '@/hooks/use-persisted-state';
 import { azureImageUrl } from '@/lib/pipeline';
+import { QUALITIES, QUALITY_BLURB, useImageQuality, type ImageQuality } from '@/lib/quality';
+import { clampParallel, clampRpm, useParallel, useRpm } from '@/lib/rate';
 import {
   PRICE_USD_PER_MTOK, PRICING_ASOF, USAGE_KEY, USD_TO_INR, costUsd, emptyLedger, formatInr,
   resetUsage, type UsageLedger,
 } from '@/lib/usage';
 import { cn } from '@/lib/utils';
 
-type SettingsTab = 'api-keys' | 'usage';
+type SettingsTab = 'api-keys' | 'image-model' | 'usage';
 
 const TABS: { id: SettingsTab; label: string; icon: typeof KeyRoundIcon }[] = [
   { id: 'api-keys', label: 'API keys', icon: KeyRoundIcon },
+  { id: 'image-model', label: 'Image model', icon: SlidersHorizontalIcon },
   { id: 'usage', label: 'Usage', icon: ChartColumnIcon },
 ];
 
@@ -71,7 +77,9 @@ export function SettingsDialog({
             ))}
           </nav>
           <div className="min-w-0 flex-1 overflow-y-auto p-5">
-            {tab === 'api-keys' ? <ApiKeysPane /> : <UsagePane />}
+            {tab === 'api-keys' && <ApiKeysPane />}
+            {tab === 'image-model' && <ImageModelPane />}
+            {tab === 'usage' && <UsagePane />}
           </div>
         </div>
       </DialogContent>
@@ -191,6 +199,83 @@ function ApiKeysPane() {
           {test.phase === 'failed' && test.message}
         </span>
       </div>
+    </FieldGroup>
+  );
+}
+
+function ImageModelPane() {
+  const [quality, setQuality] = useImageQuality();
+  const [parallel, setParallel] = useParallel();
+  const [rpm, setRpm] = useRpm();
+  return (
+    <FieldGroup className="gap-4">
+      <Field>
+        <FieldLabel htmlFor="settings-quality">
+          <Hint hint="One knob for the whole suite — Compositor tiles, BG Remover AI fixes and Generate all send this on every Azure call.">
+            Image quality
+          </Hint>
+        </FieldLabel>
+        <Select
+          value={quality}
+          onValueChange={(v) => setQuality(String(v ?? quality) as ImageQuality)}
+        >
+          <SelectTrigger id="settings-quality" className="w-40 capitalize">
+            <SelectValue>{(v) => String(v ?? quality)}</SelectValue>
+          </SelectTrigger>
+          <SelectContent>
+            {QUALITIES.map((q) => (
+              <SelectItem key={q} value={q} className="capitalize">{q}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <FieldDescription>{QUALITY_BLURB[quality]}</FieldDescription>
+      </Field>
+      <Field>
+        <FieldLabel htmlFor="settings-parallel">
+          <Hint hint="How many Azure calls run at once — Banners tiles, Generate rows and BG Remover AI fixes all fan out this wide. Applies from the next run.">
+            Parallel requests
+          </Hint>
+        </FieldLabel>
+        <Input
+          id="settings-parallel"
+          type="number"
+          min={1}
+          max={8}
+          className="w-40"
+          value={parallel}
+          onChange={(e) => setParallel(clampParallel(Number(e.target.value)))}
+        />
+        <FieldDescription>
+          Raise it until the deployment&rsquo;s rate limit pushes back (429s), then step down
+          one — or set a request budget below instead.
+        </FieldDescription>
+      </Field>
+      <Field>
+        <FieldLabel htmlFor="settings-rpm">
+          <Hint hint="One budget shared by every product in this tab — a run in Banners and a run in Generate draw from the same window. Counted per tab, like the usage ledger.">
+            Requests per minute
+          </Hint>
+        </FieldLabel>
+        <Input
+          id="settings-rpm"
+          type="number"
+          min={0}
+          max={600}
+          className="w-40"
+          value={rpm === 0 ? '' : rpm}
+          placeholder="Unlimited"
+          onChange={(e) => setRpm(clampRpm(e.target.value === '' ? 0 : Number(e.target.value)))}
+        />
+        <FieldDescription>
+          {rpm === 0
+            ? 'No throttle — products only cap how many requests run at once.'
+            : `Calls beyond ${rpm}/min wait their turn instead of erroring. Match your Azure deployment's rate limit to avoid 429s.`}
+        </FieldDescription>
+      </Field>
+      <p className="border-t pt-3 text-[11px] text-muted-foreground">
+        Applies from the next request — runs already in flight keep the value they started with.
+        Higher quality costs more output tokens per image (see Usage).
+      </p>
     </FieldGroup>
   );
 }

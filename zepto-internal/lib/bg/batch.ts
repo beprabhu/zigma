@@ -47,6 +47,9 @@ export interface BgCutout {
   bounds: SubjectBounds | null;
   width: number;
   height: number;
+  /** Faint out-of-bbox pixel share from lib/bg/regions.measureFaintResidue — quality signal.
+   *  Absent on restored projects/autosaves (not persisted; only fresh runs measure it). */
+  residueFraction?: number;
 }
 
 export interface BgItem {

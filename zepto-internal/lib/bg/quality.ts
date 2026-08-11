@@ -38,6 +38,10 @@ const EDGE_SLACK = 1;
  *  them means the matte kept a scene prop (a bowl of beans beside the drink) or a second
  *  product. Measured on a real miss: the prop was 3.5% of the canvas, far above any speck. */
 const SUBSTANTIAL_REGION_FRACTION = 0.01;
+/** Faint out-of-bbox coverage (measureFaintResidue) above this share of the canvas reads as
+ *  ghosted overlay graphics or a stray soft shadow. Kept high on purpose: matte edges always
+ *  bleed a little, and a flag that fires on every soft-edged cutout teaches people to ignore it. */
+const RESIDUE_MIN_FRACTION = 0.01;
 
 /** Pure — safe to call on every render; no image decode, just arithmetic over stored fields. */
 export function assessQuality(item: BgItem): QualityAssessment {
@@ -90,6 +94,20 @@ export function assessQuality(item: BgItem): QualityAssessment {
   const substantial = kept.filter((r) => r.area / canvasArea >= SUBSTANTIAL_REGION_FRACTION);
   if (substantial.length >= 2) {
     reasons.push(`${substantial.length} separate objects kept — a scene prop may have survived the cutout`);
+  }
+
+  // Analysis-only runs (Product only OFF) mark would-drop regions instead of deleting them.
+  // This is the badge-collage catcher: green marketing circles, floating text columns.
+  const flaggedGraphics = kept.filter((r) => r.flagged);
+  if (flaggedGraphics.length > 0) {
+    reasons.push(
+      `${flaggedGraphics.length} region${flaggedGraphics.length === 1 ? '' : 's'} look like graphic overlays (badges/text) — the Product-only filter would drop them`,
+    );
+  }
+
+  // Ghosted overlays live below the alpha threshold, invisible to every check above.
+  if ((item.cutout.residueFraction ?? 0) >= RESIDUE_MIN_FRACTION) {
+    reasons.push('Faint semi-transparent residue outside the subject — ghosted graphics or a leftover shadow');
   }
 
   if (regions.length > 1 && removedCount / regions.length > HEAVY_REMOVAL_FRACTION) {

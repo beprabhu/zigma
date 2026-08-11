@@ -11,7 +11,7 @@ import type { PreTrainedModel, Processor, RawImage, Tensor } from '@huggingface/
 import { BG_MODELS, type BgBackend, type BgModelId } from './engine';
 import { refineAlpha, type RefineMode } from './refine';
 import { detectBands, maskBands, type DetectedBand } from './bands';
-import { keepProductRegions, type RegionReport } from './regions';
+import { analyzeRegions, keepProductRegions, measureFaintResidue, type RegionReport } from './regions';
 import { subjectBounds, type SubjectBounds } from './safe-area';
 import { MAX_EDGE, STORE_TYPE } from './constants';
 
@@ -52,6 +52,8 @@ export type WorkerResponse =
       removedRegions: number;
       /** Per-region measurements behind that decision — shown in the compare dialog. */
       regionReport: RegionReport[];
+      /** Share of canvas covered by faint (sub-threshold) pixels outside the subject bbox. */
+      residueFraction: number;
       /** Flat edge strips masked from the source before region analysis. */
       bands: DetectedBand[];
       width: number;
@@ -263,10 +265,17 @@ async function remove(req: WorkerRemoveRequest): Promise<void> {
     removedRegions = result.removed;
     // Kept for the UI: a heuristic that cannot be inspected cannot be tuned.
     regionReport = result.regions;
+  } else {
+    // Filter off: analyse anyway (report-only) so quality triage can still see badge collages,
+    // duplicate products and floating text. One extra classical-CV pass per image, off the
+    // main thread — cheap next to the inference that just ran.
+    regionReport = analyzeRegions(pixels);
   }
 
   // The bbox is scanned here, off the main thread, while we still hold the pixels.
   const bounds = subjectBounds(pixels);
+  // Ghosted overlay graphics live below the alpha threshold where nothing else can see them.
+  const residueFraction = measureFaintResidue(pixels, bounds);
 
   source2d.putImageData(pixels, 0, 0);
 
@@ -282,6 +291,7 @@ async function remove(req: WorkerRemoveRequest): Promise<void> {
     bounds,
     removedRegions,
     regionReport,
+    residueFraction,
     bands,
     width,
     height,

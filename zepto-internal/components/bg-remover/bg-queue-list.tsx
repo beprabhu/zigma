@@ -195,7 +195,7 @@ function RegionTable({ regions }: { regions: RegionReport[] }) {
   const sorted = [...regions].sort((a, b) => b.area - a.area).slice(0, 8);
   return (
     <div className="min-w-0 space-y-1.5">
-      <div className="text-xs font-medium">Product-only analysis</div>
+      <div className="text-xs font-medium">Region analysis</div>
       {/* The table has a min width; this scroller is what keeps that from widening the dialog. */}
       <div className="min-w-0 overflow-x-auto">
         <table className="w-full min-w-96 text-left text-[11px] tabular-nums">
@@ -221,8 +221,17 @@ function RegionTable({ regions }: { regions: RegionReport[] }) {
                 <td className="py-1 pr-3">{r.distinctColors}</td>
                 <td className="py-1 pr-3">{r.fillRatio.toFixed(2)}</td>
                 <td className="py-1 pr-3">{r.flatness.toFixed(1)}</td>
-                <td className={cn('py-1', r.removed ? 'text-destructive' : 'text-muted-foreground')}>
-                  {r.removed ? 'removed' : 'kept'}
+                <td
+                  className={cn(
+                    'py-1',
+                    r.removed
+                      ? 'text-destructive'
+                      : r.flagged
+                        ? 'text-amber-600 dark:text-amber-400'
+                        : 'text-muted-foreground',
+                  )}
+                >
+                  {r.removed ? 'removed' : r.flagged ? 'kept · graphic?' : 'kept'}
                 </td>
               </tr>
             ))}

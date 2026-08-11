@@ -1,5 +1,7 @@
 // Client-side image pipeline: fetch via proxy, preprocess, call Azure, decode result.
 
+import { readImageQuality, type ImageQuality } from '@/lib/quality';
+import { acquireRpmSlot } from '@/lib/rate';
 import { recordUsage } from '@/lib/usage';
 
 export async function loadImageFromUrl(url: string): Promise<HTMLImageElement> {
@@ -68,23 +70,28 @@ export async function callAzure(
     endpoint: string;
     apiKey: string;
     prompt: string;
-    quality?: 'low' | 'medium' | 'high';
+    /** Omit — the suite-wide Settings value applies. Only pass to pin one call site. */
+    quality?: ImageQuality;
     /** 'auto' (default) follows the input's aspect; pass '1024x1024' to force a square tile. */
     size?: 'auto' | '1024x1024' | '1536x1024' | '1024x1536';
+    /** Stop button support: aborts the proxy request (the route forwards the abort to Azure). */
+    signal?: AbortSignal;
   },
 ): Promise<HTMLImageElement> {
+  // Suite-wide RPM throttle, from Settings → Image model (lib/rate.ts). No-op when unset.
+  await acquireRpmSlot(opts.signal);
   const res = await fetch('/api/generate', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+    signal: opts.signal,
     body: JSON.stringify({
       endpoint: opts.endpoint,
       apiKey: opts.apiKey,
       prompt: opts.prompt,
       images: images.map(preprocess),
       background: 'auto',
-      // 'low' follows composition instructions noticeably worse; callers doing prompt-driven
-      // recomposition (BG Remover AI edits) pass 'medium'. The compositor's default is unchanged.
-      quality: opts.quality ?? 'low',
+      // Suite-wide, from Settings → Quality (lib/quality.ts). Products no longer pass this.
+      quality: opts.quality ?? readImageQuality(),
       size: opts.size ?? 'auto',
     }),
   });
@@ -123,19 +130,26 @@ export async function callAzureGenerate(
   opts: {
     endpoint: string;
     apiKey: string;
-    quality?: 'low' | 'medium' | 'high';
+    /** Omit — the suite-wide Settings value applies. Only pass to pin one call site. */
+    quality?: ImageQuality;
     size?: 'auto' | '1024x1024' | '1536x1024' | '1024x1536';
+    /** Stop button support: aborts the proxy request (the route forwards the abort to Azure). */
+    signal?: AbortSignal;
   },
 ): Promise<HTMLImageElement> {
+  // Suite-wide RPM throttle, from Settings → Image model (lib/rate.ts). No-op when unset.
+  await acquireRpmSlot(opts.signal);
   const res = await fetch('/api/generate', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+    signal: opts.signal,
     body: JSON.stringify({
       mode: 'generations',
       endpoint: opts.endpoint,
       apiKey: opts.apiKey,
       prompt,
-      quality: opts.quality ?? 'low',
+      // Suite-wide, from Settings → Quality (lib/quality.ts).
+      quality: opts.quality ?? readImageQuality(),
       size: opts.size ?? '1024x1024',
     }),
   });
@@ -150,7 +164,20 @@ export async function callAzureGenerate(
  * canvas, so a mock run still proves the RIGHT prompt reached the call — a blank placeholder
  * would pass whether or not the brief and row were assembled correctly.
  */
-export function mockGenerate(prompt: string, size = 1024): Promise<HTMLImageElement> {
+export async function mockGenerate(
+  prompt: string,
+  size = 1024,
+  signal?: AbortSignal,
+): Promise<HTMLImageElement> {
+  // A short abortable delay so mock runs exercise the Stop button the way real Azure calls
+  // do — an instant mock made cancellation untestable without spending money.
+  await new Promise<void>((resolve, reject) => {
+    const t = setTimeout(resolve, 350);
+    signal?.addEventListener('abort', () => {
+      clearTimeout(t);
+      reject(new DOMException('Aborted', 'AbortError'));
+    }, { once: true });
+  });
   const c = document.createElement('canvas');
   c.width = size;
   c.height = size;

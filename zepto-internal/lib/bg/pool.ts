@@ -36,6 +36,8 @@ export interface PoolCutout {
   removedRegions: number;
   /** Per-region measurements behind that decision. */
   regionReport: RegionReport[];
+  /** Share of canvas covered by faint sub-threshold pixels outside the subject bbox. */
+  residueFraction: number;
   /** Flat edge strips masked from the source. */
   bands: DetectedBand[];
   width: number;
@@ -162,6 +164,7 @@ function handleMessage(slot: Slot, msg: WorkerResponse) {
         bounds: msg.bounds,
         removedRegions: msg.removedRegions,
         regionReport: msg.regionReport,
+        residueFraction: msg.residueFraction,
         bands: msg.bands,
         width: msg.width,
         height: msg.height,

@@ -11,7 +11,7 @@
 import * as React from 'react';
 import { toast } from 'sonner';
 import {
-  DownloadIcon, ImagePlusIcon, SparklesIcon, UploadCloudIcon,
+  CircleStopIcon, DownloadIcon, ImagePlusIcon, SparklesIcon, UploadCloudIcon,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
@@ -23,7 +23,6 @@ import { MdFileIcon, MdFileTile } from '@/components/md-file-tile';
 import { SessionHeader, type SessionChip } from '@/components/session-header';
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty';
 import { Field, FieldContent, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field';
-import { Input } from '@/components/ui/input';
 import { Progress } from '@/components/ui/progress';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Spinner } from '@/components/ui/spinner';
@@ -38,6 +37,7 @@ import {
   type GenItem,
 } from '@/lib/gen';
 import { callAzureGenerate, mockGenerate } from '@/lib/pipeline';
+import { readParallel } from '@/lib/rate';
 import { canvasToPngBlob, mapWithLimit, pickSave, releaseCanvas, saveTo } from '@/lib/bg/batch';
 import { processImage } from '@/lib/process';
 import { useProcessing } from '@/components/process-panel';
@@ -47,17 +47,13 @@ import { usePersistedState } from '@/hooks/use-persisted-state';
 
 const NONE = '__none__';
 const SIZES = ['1024x1024', '1536x1024', '1024x1536', 'auto'] as const;
-const QUALITIES = ['low', 'medium', 'high'] as const;
 type GenSize = (typeof SIZES)[number];
-type GenQuality = (typeof QUALITIES)[number];
 
 export default function ImageGenerator() {
   // Azure credentials are the suite's shared pair — set them once in any product.
   const [endpoint] = usePersistedState('skuc_azureEndpoint', '');
   const [azureKey] = usePersistedState('skuc_azureKey', '');
   const [size, setSize] = usePersistedState<GenSize>('skuc_genSize', '1024x1024');
-  const [quality, setQuality] = usePersistedState<GenQuality>('skuc_genQuality', 'low');
-  const [parallel, setParallel] = usePersistedState('skuc_genParallel', 3);
   const [numberFiles, setNumberFiles] = usePersistedState('skuc_genNumberFiles', true);
 
   // Brief: session-only on purpose. It is document-sized and specific to one batch, so
@@ -89,6 +85,9 @@ export default function ImageGenerator() {
   const inputRef = React.useRef<HTMLInputElement>(null);
   const resultScrollRef = React.useRef<HTMLDivElement>(null);
 
+  // Stop button: one controller per run (batch or single regenerate); aborting skips every
+  // row not yet started and cancels the in-flight request (the proxy forwards it to Azure).
+  const genAbortRef = React.useRef<AbortController | null>(null);
   const itemsRef = React.useRef<GenItem[]>(items);
   React.useEffect(() => { itemsRef.current = items; }, [items]);
 
@@ -181,7 +180,7 @@ export default function ImageGenerator() {
     return true;
   }
 
-  async function generateOne(item: GenItem): Promise<boolean> {
+  async function generateOne(item: GenItem, signal?: AbortSignal): Promise<boolean> {
     const prompt = buildRowPrompt(brief, headers, item.record, excludedSet);
     if (isPromptEmpty(prompt)) {
       patchItem(item.id, { status: 'error', errorMsg: 'Nothing to send — no brief and no included columns' });
@@ -191,8 +190,8 @@ export default function ImageGenerator() {
     const started = performance.now();
     try {
       const image = mock
-        ? await mockGenerate(prompt)
-        : await callAzureGenerate(prompt, { endpoint, apiKey: azureKey, size, quality });
+        ? await mockGenerate(prompt, 1024, signal)
+        : await callAzureGenerate(prompt, { endpoint, apiKey: azureKey, size, signal });
       patchItem(item.id, {
         status: 'done',
         image,
@@ -202,6 +201,11 @@ export default function ImageGenerator() {
       });
       return true;
     } catch (e) {
+      if ((e as Error).name === 'AbortError') {
+        // Stopped, not failed: the row goes back exactly where it was before this run.
+        patchItem(item.id, { status: item.status, errorMsg: undefined });
+        return false;
+      }
       patchItem(item.id, { status: 'error', errorMsg: (e as Error).message });
       return false;
     }
@@ -210,35 +214,63 @@ export default function ImageGenerator() {
   async function handleGenerateAll() {
     if (busy || !guards()) return;
     const todo = itemsRef.current;
+    const controller = new AbortController();
+    genAbortRef.current = controller;
     setRunning(true);
-    // Groups of `parallel` in flight: the Azure round trip dominates each row's wall-clock, so
-    // overlapping the waits is where a batch gets its speed. The ceiling is the deployment's
-    // rate limit, which is what the setting expresses.
-    const limit = Math.max(1, Math.min(8, parallel));
+    // Rows in flight at once: the Azure round trip dominates each row's wall-clock, so
+    // overlapping the waits is where a batch gets its speed. Suite-wide, from Settings →
+    // Image model (lib/rate.ts); read at run start, so it holds for the whole batch.
+    const limit = readParallel();
     let finished = 0;
     let ok = 0;
     setProgress({ pct: 0, text: `0 of ${todo.length} — ${limit} at a time with ${mock ? 'mock' : 'azure'}…` });
-    await mapWithLimit(todo, limit, async (item) => {
-      if (await generateOne(item)) ok++;
-      finished++;
-      setProgress({
-        pct: (finished / todo.length) * 100,
-        text: `${finished} of ${todo.length} — ${limit} at a time with ${mock ? 'mock' : 'azure'}…`,
+    try {
+      await mapWithLimit(todo, limit, async (item) => {
+        // Stop skips everything not yet started; rows already in flight abort via the signal.
+        if (controller.signal.aborted) {
+          finished++;
+          return;
+        }
+        if (await generateOne(item, controller.signal)) ok++;
+        finished++;
+        setProgress({
+          pct: (finished / todo.length) * 100,
+          text: `${finished} of ${todo.length} — ${limit} at a time with ${mock ? 'mock' : 'azure'}…`,
+        });
       });
-    });
-    setProgress({ pct: 100, text: `Done — ${ok} of ${todo.length} images generated.` });
-    setRunning(false);
+    } finally {
+      setProgress(
+        controller.signal.aborted
+          ? { pct: 100, text: `Stopped — ${ok} of ${todo.length} generated; the rest are untouched.` }
+          : { pct: 100, text: `Done — ${ok} of ${todo.length} images generated.` },
+      );
+      genAbortRef.current = null;
+      setRunning(false);
+    }
   }
 
   async function handleRegenerate(id: number) {
     if (busy || !guards()) return;
     const item = itemsRef.current.find((it) => it.id === id);
     if (!item) return;
+    const controller = new AbortController();
+    genAbortRef.current = controller;
     setRunning(true);
     setProgress({ pct: 50, text: `Regenerating ${item.name}…` });
-    const ok = await generateOne(item);
-    setProgress({ pct: 100, text: ok ? `${item.name} regenerated.` : `${item.name} failed.` });
-    setRunning(false);
+    try {
+      const ok = await generateOne(item, controller.signal);
+      setProgress({
+        pct: 100,
+        text: controller.signal.aborted
+          ? `${item.name} — stopped.`
+          : ok
+            ? `${item.name} regenerated.`
+            : `${item.name} failed.`,
+      });
+    } finally {
+      genAbortRef.current = null;
+      setRunning(false);
+    }
   }
 
   function handleRemove(id: number) {
@@ -326,10 +358,18 @@ export default function ImageGenerator() {
   );
 
   const runFooter = (
-    <Button className="w-full" disabled={busy || !items.length} onClick={handleGenerateAll}>
-      {running ? <Spinner data-icon="inline-start" /> : <SparklesIcon data-icon="inline-start" />}
-      {items.length ? `Generate ${items.length} image${items.length > 1 ? 's' : ''}` : 'Generate'}
-    </Button>
+    <div className="flex gap-2">
+      <Button className="flex-1" disabled={busy || !items.length} onClick={handleGenerateAll}>
+        {running ? <Spinner data-icon="inline-start" /> : <SparklesIcon data-icon="inline-start" />}
+        {items.length ? `Generate ${items.length} image${items.length > 1 ? 's' : ''}` : 'Generate'}
+      </Button>
+      {running && (
+        <Button variant="outline" onClick={() => genAbortRef.current?.abort()}>
+          <CircleStopIcon data-icon="inline-start" />
+          Stop
+        </Button>
+      )}
+    </div>
   );
 
   const exportFooter = (
@@ -455,34 +495,8 @@ export default function ImageGenerator() {
                     shape — pick a size for a consistent set.
                   </FieldDescription>
                 </Field>
-                <Field>
-                  <FieldLabel htmlFor="gen-quality">Quality</FieldLabel>
-                  <Select value={quality} onValueChange={(v) => setQuality(String(v ?? 'low') as GenQuality)} disabled={busy}>
-                    <SelectTrigger id="gen-quality">
-                      <SelectValue>{(v) => String(v ?? 'low')}</SelectValue>
-                    </SelectTrigger>
-                    <SelectContent>
-                      {QUALITIES.map((q) => <SelectItem key={q} value={q}>{q}</SelectItem>)}
-                    </SelectContent>
-                  </Select>
-                </Field>
-                <Field>
-                  <FieldLabel htmlFor="gen-parallel">Parallel requests</FieldLabel>
-                  <Input
-                    id="gen-parallel"
-                    type="number"
-                    min={1}
-                    max={8}
-                    className="w-24"
-                    value={parallel}
-                    disabled={busy}
-                    onChange={(e) => setParallel(Math.max(1, Math.min(8, Number(e.target.value) || 1)))}
-                  />
-                  <FieldDescription>
-                    Rows generated at once. Raise it until the deployment&rsquo;s rate limit
-                    pushes back (429s), then step down one.
-                  </FieldDescription>
-                </Field>
+                {/* Quality and parallel requests moved to Settings → Image model — both are
+                    suite-wide knobs now (lib/quality.ts, lib/rate.ts). */}
               </FieldGroup>
             </PanelSection>
         </LeftPanel>
