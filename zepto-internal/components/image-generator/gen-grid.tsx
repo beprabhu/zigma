@@ -67,22 +67,31 @@ const GenCell = React.memo(function GenCell({
   item,
   prompt,
   running,
+  checked,
+  selectionActive,
   onOpen,
   onRemove,
+  onToggleSelect,
 }: {
   item: GenItem;
   /** Live preview of what this row would send; the sent prompt wins once it exists. */
   prompt: string;
   running: boolean;
+  checked: boolean;
+  selectionActive: boolean;
   onOpen: (id: number) => void;
   onRemove: (id: number) => void;
+  onToggleSelect: (id: number, shiftKey: boolean) => void;
 }) {
   const src = item.image?.src;
   return (
     <ResultCell
       label={item.name}
       status={genStatusLine(item)}
+      checked={checked}
+      selectionActive={selectionActive}
       onSelect={() => onOpen(item.id)}
+      onToggleSelect={(shiftKey) => onToggleSelect(item.id, shiftKey)}
       onRemove={() => onRemove(item.id)}
       removeDisabled={running}
     >
@@ -109,14 +118,18 @@ export function GenGrid({
   items,
   promptFor,
   running,
+  selected,
   onOpen,
   onRemove,
+  onToggleSelect,
 }: {
   items: GenItem[];
   promptFor: (item: GenItem) => string;
   running: boolean;
+  selected: ReadonlySet<number>;
   onOpen: (id: number) => void;
   onRemove: (id: number) => void;
+  onToggleSelect: (id: number, shiftKey: boolean) => void;
 }) {
   return (
     <div className="grid grid-cols-2 gap-3.5 md:grid-cols-3 xl:grid-cols-4">
@@ -126,8 +139,11 @@ export function GenGrid({
           item={item}
           prompt={promptFor(item)}
           running={running}
+          checked={selected.has(item.id)}
+          selectionActive={selected.size > 0}
           onOpen={onOpen}
           onRemove={onRemove}
+          onToggleSelect={onToggleSelect}
         />
       ))}
     </div>

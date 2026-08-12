@@ -2,7 +2,7 @@
 
 import * as React from 'react';
 import { toast } from 'sonner';
-import { ChevronDownIcon, DownloadIcon, ImageIcon } from 'lucide-react';
+import { ChevronDownIcon, DownloadIcon, ImageIcon, RefreshCwIcon } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Hint } from '@/components/hint';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -27,6 +27,7 @@ import { TemplateEditor } from '@/components/template-editor';
 import { CsvDropzone } from '@/components/csv-dropzone';
 import { SessionHeader, type SessionChip } from '@/components/session-header';
 import { TileGrid, TileDialog } from '@/components/tile-grid';
+import { ClearAllButton, SelectionBar, useGridSelection } from '@/components/selection';
 import { Canvas, LeftPanel, PanelSection, RightPanel, StudioShell } from '@/components/pane-layout';
 import { useProcessing } from '@/components/process-panel';
 
@@ -123,6 +124,9 @@ export default function Compositor() {
   // resolving the id at render time is what lets the open dialog update live mid-regenerate.
   const [openId, setOpenId] = React.useState<number | null>(null);
   const openItem = items.find((it) => it.id === openId) ?? null;
+
+  const itemIds = React.useMemo(() => items.map((it) => it.id), [items]);
+  const sel = useGridSelection(itemIds, openId !== null);
 
   const canvases = React.useRef(new Map<number, HTMLCanvasElement>());
   const registerCanvas = React.useCallback((id: number, canvas: HTMLCanvasElement | null) => {
@@ -237,15 +241,23 @@ export default function Compositor() {
     patchItem(item.id, { status: 'done', resultImage, compressed: null });
   }
 
-  async function handleGenerateAll() {
-    if (running) return;
+  function guards(): boolean {
+    if (running) return false;
     if (!mock && (!endpoint.trim() || !azureKey.trim())) {
       toast.error('Set the Azure endpoint and API key in Settings (gear at the bottom of the rail), or use ?mock=1.');
-      return;
+      return false;
     }
-    const todo = items.filter((it) => it.urls.length);
-    if (!todo.length) return;
+    return true;
+  }
 
+  async function handleGenerateAll() {
+    if (!guards()) return;
+    await runTiles(items.filter((it) => it.urls.length), 'generated');
+  }
+
+  /** One run over `todo` — Generate-all and Regenerate-selected share everything but the verb. */
+  async function runTiles(todo: QueueItem[], verb: string) {
+    if (!todo.length) return;
     setRunning(true);
     // Requests in flight at once: the Azure round trip dominates a tile's wall-clock, so
     // overlapping the waits is where a batch gets its speed. Suite-wide, from Settings →
@@ -267,8 +279,35 @@ export default function Compositor() {
         text: `${finished} of ${todo.length} tiles — ${limit} at a time with ${mock ? 'mock' : 'azure'}…`,
       });
     });
-    setProgress({ pct: 100, text: `Done — ${done} of ${todo.length} tiles generated.` });
+    setProgress({ pct: 100, text: `Done — ${done} of ${todo.length} tiles ${verb}.` });
     setRunning(false);
+  }
+
+  async function handleRegenerateSelected() {
+    if (!guards()) return;
+    // Rows without image URLs can't generate; quietly skip them like Generate-all does.
+    await runTiles(items.filter((it) => sel.checked.has(it.id) && it.urls.length), 'regenerated');
+  }
+
+  function deleteSelected() {
+    setItems((prev) => prev.filter((it) => !sel.checked.has(it.id)));
+    setOpenId((prev) => (prev !== null && sel.checked.has(prev) ? null : prev));
+    sel.clear();
+  }
+
+  /** Full reset back to the drop zone. Session name survives, like Generate's clear. */
+  function clearAll() {
+    setItems([]);
+    sel.clear();
+    setOpenId(null);
+    setFileName(null);
+    setHeaders([]);
+    setRecords([]);
+    setImageCols([]);
+    setTitleCol('');
+    setOfferCol('');
+    setProgress(null);
+    setCompressSummary('');
   }
 
   async function handleRegenerate(item: QueueItem) {
@@ -658,21 +697,68 @@ export default function Compositor() {
                 </EmptyHeader>
               </Empty>
             ) : (
-              <TileGrid
-                items={items}
-                template={template}
-                fallbackTitle={tplTitle}
-                fallbackOffer={tplOffer}
-                offerToggle={offerVisible}
-                hasOfferCol={!!offerCol}
-                running={running}
-                registerCanvas={registerCanvas}
-                onOpen={(item) => setOpenId(item.id)}
-                onRemove={(item) => {
-                  setItems((prev) => prev.filter((it) => it.id !== item.id));
-                  setOpenId((prev) => (prev === item.id ? null : prev));
-                }}
-              />
+              <>
+                {/* Grid toolbar: count on the left, whole-run reset on the right. */}
+                <div className="mb-2 flex items-center justify-between gap-2">
+                  <span className="text-xs text-muted-foreground">
+                    {sel.active
+                      ? `${sel.checked.size} of ${items.length} selected`
+                      : `${items.length} row${items.length === 1 ? '' : 's'}${doneCount ? ` · ${doneCount} generated` : ''}`}
+                  </span>
+                  <ClearAllButton
+                    title="Clear this run?"
+                    disabled={running}
+                    onConfirm={clearAll}
+                    description={
+                      <>
+                        Removes all {items.length} row{items.length === 1 ? '' : 's'}
+                        {doneCount > 0 && <> and the {doneCount} generated tile{doneCount === 1 ? '' : 's'} (not exported anywhere yet)</>}
+                        . Your CSV file on disk is untouched — drop it again to rebuild the
+                        queue.
+                      </>
+                    }
+                  />
+                </div>
+                <TileGrid
+                  items={items}
+                  template={template}
+                  fallbackTitle={tplTitle}
+                  fallbackOffer={tplOffer}
+                  offerToggle={offerVisible}
+                  hasOfferCol={!!offerCol}
+                  running={running}
+                  selected={sel.checked}
+                  registerCanvas={registerCanvas}
+                  onOpen={(item) => setOpenId(item.id)}
+                  onRemove={(item) => {
+                    setItems((prev) => prev.filter((it) => it.id !== item.id));
+                    setOpenId((prev) => (prev === item.id ? null : prev));
+                  }}
+                  onToggleSelect={sel.toggle}
+                />
+                {sel.active && (
+                  <SelectionBar
+                    count={sel.checked.size}
+                    total={items.length}
+                    allSelected={sel.allSelected}
+                    busy={running}
+                    actions={[
+                      {
+                        key: 'regenerate',
+                        label: 'Regenerate selected — composes each tile again',
+                        icon: RefreshCwIcon,
+                        accent: true,
+                        onRun: () => void handleRegenerateSelected(),
+                      },
+                    ]}
+                    deleteTitle={`Delete ${sel.checked.size} row${sel.checked.size === 1 ? '' : 's'}?`}
+                    deleteDescription="Removes them from this run, along with any tiles they generated. Rows still in the CSV file come back if you drop it again."
+                    onDelete={deleteSelected}
+                    onSelectAll={sel.selectAll}
+                    onClear={sel.clear}
+                  />
+                )}
+              </>
             )}
         </Canvas>
 

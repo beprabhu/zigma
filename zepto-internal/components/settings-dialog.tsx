@@ -222,7 +222,9 @@ function ImageModelPane() {
           <SelectTrigger id="settings-quality" className="w-40 capitalize">
             <SelectValue>{(v) => String(v ?? quality)}</SelectValue>
           </SelectTrigger>
-          <SelectContent>
+          {/* Drop below the trigger like a menu — the default item-aligned mode opens the
+              list OVER the field, hiding the label whenever medium/high is selected. */}
+          <SelectContent alignItemWithTrigger={false} sideOffset={4}>
             {QUALITIES.map((q) => (
               <SelectItem key={q} value={q} className="capitalize">{q}</SelectItem>
             ))}

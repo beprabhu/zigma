@@ -8,6 +8,7 @@ import {
   CloudDownloadIcon,
   DownloadIcon,
   ImagesIcon,
+  RefreshCwIcon,
   SaveIcon,
   TriangleAlertIcon,
   WandSparklesIcon,
@@ -39,6 +40,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 
 import { ResultCell } from '@/components/result-cell';
+import { ClearAllButton, SelectionBar, useGridSelection } from '@/components/selection';
 import { Canvas, LeftPanel, PanelSection, RightPanel, StudioShell } from '@/components/pane-layout';
 import { useProcessing } from '@/components/process-panel';
 import {
@@ -486,6 +488,11 @@ export default function BgRemover() {
   const compareIndex = items.findIndex((it) => it.id === compareId);
   const compareItem = compareIndex < 0 ? null : items[compareIndex];
   const compareById = React.useCallback((id: number) => setCompareId(id), []);
+
+  // Multi-select over the results grid. Ranges follow DISPLAY order, so shift-click matches
+  // what the user sees even under quality sort.
+  const displayIds = React.useMemo(() => displayItems.map((it) => it.id), [displayItems]);
+  const gridSel = useGridSelection(displayIds, compareId !== null);
 
   const patchItem = React.useCallback((id: number, patch: Partial<BgItem>) => {
     setItems((prev) => prev.map((item) => (item.id === id ? { ...item, ...patch } : item)));
@@ -975,32 +982,43 @@ export default function BgRemover() {
    * stop the rest; the re-removal only sees the successes.
    */
   async function handleAiEditFlagged() {
-    if (busy || !flaggedItems.length) return;
+    await aiEditMany(flaggedItems);
+  }
+
+  async function handleAiEditSelected() {
+    // Archived sources have no pixels to re-reference; skip them like the per-item edit does.
+    const targets = itemsRef.current.filter((it) => gridSel.checked.has(it.id) && canRetry(it));
+    gridSel.clear();
+    await aiEditMany(targets);
+  }
+
+  async function aiEditMany(targets: BgItem[]) {
+    if (busy || !targets.length) return;
     const guards = aiEditGuards();
     if (!guards) return;
     const controller = new AbortController();
     aiAbortRef.current = controller;
     setAiFixing(true);
     let finished = 0;
-    setProgress({ pct: 0, text: `AI edit 1 of ${flaggedItems.length}` });
+    setProgress({ pct: 0, text: `AI edit 1 of ${targets.length}` });
     try {
-      const results = await mapWithLimit(flaggedItems, readParallel(), async (item) => {
+      const results = await mapWithLimit(targets, readParallel(), async (item) => {
         if (controller.signal.aborted) return null; // stopped: leave the rest untouched
         const updated = await aiEditOne(item, guards.prompt, guards.mock, controller.signal);
         finished++;
         setProgress({
-          pct: (finished / flaggedItems.length) * 100,
-          text: `AI edit ${Math.min(finished + 1, flaggedItems.length)} of ${flaggedItems.length}`,
+          pct: (finished / targets.length) * 100,
+          text: `AI edit ${Math.min(finished + 1, targets.length)} of ${targets.length}`,
         });
         return updated;
       });
       const updated = results.filter((r): r is BgItem => r !== null);
       if (controller.signal.aborted) {
         toast.info(
-          `AI fix stopped — ${updated.length} of ${flaggedItems.length} regenerated${updated.length ? '; re-removing those' : ''}.`,
+          `AI fix stopped — ${updated.length} of ${targets.length} regenerated${updated.length ? '; re-removing those' : ''}.`,
         );
       } else {
-        const failed = flaggedItems.length - updated.length;
+        const failed = targets.length - updated.length;
         if (failed) {
           toast.error(`${failed} AI edit${failed === 1 ? '' : 's'} failed — their tiles show the error.`);
         }
@@ -1029,6 +1047,50 @@ export default function BgRemover() {
     };
     patchItem(item.id, reset);
     void runBatch([reset], 'Redoing', overrides);
+  }
+
+  // ---- Selection bulk actions --------------------------------------------
+
+  function handleRetrySelected() {
+    if (busy) return;
+    // Archived sources have no pixels to re-run; skip them like the per-item Redo does.
+    const targets = itemsRef.current.filter((it) => gridSel.checked.has(it.id) && canRetry(it));
+    if (!targets.length) return;
+    const resets = targets.map((it) => ({
+      ...it,
+      cutout: null,
+      status: 'ready' as const,
+      error: undefined,
+      durationMs: undefined,
+    }));
+    for (const r of resets) dropPreview(r.id);
+    setItems((prev) => prev.map((it) => resets.find((r) => r.id === it.id) ?? it));
+    gridSel.clear();
+    void runBatch(resets, 'Redoing');
+  }
+
+  function deleteSelected() {
+    const doomed = itemsRef.current.filter((it) => gridSel.checked.has(it.id));
+    for (const it of doomed) {
+      releaseItem(it);
+      dropPreview(it.id);
+    }
+    setItems((prev) => prev.filter((it) => !gridSel.checked.has(it.id)));
+    setSelectedId((prev) => (prev !== null && gridSel.checked.has(prev) ? null : prev));
+    setCompareId((prev) => (prev !== null && gridSel.checked.has(prev) ? null : prev));
+    gridSel.clear();
+  }
+
+  /** Empties the queue and frees every decoded original and cached preview. */
+  function clearAllItems() {
+    for (const it of itemsRef.current) {
+      releaseItem(it);
+      dropPreview(it.id);
+    }
+    setItems([]);
+    setSelectedId(null);
+    setCompareId(null);
+    gridSel.clear();
   }
 
   function handleCancel() {
@@ -1755,6 +1817,26 @@ export default function BgRemover() {
                 emptyState
               ) : (
                 <>
+                  {/* Grid toolbar: count on the left, whole-queue reset on the right. */}
+                  <div className="mb-2 flex items-center justify-between gap-2">
+                    <span className="text-xs text-muted-foreground">
+                      {gridSel.active
+                        ? `${gridSel.checked.size} of ${items.length} selected`
+                        : `${items.length} image${items.length === 1 ? '' : 's'}`}
+                    </span>
+                    <ClearAllButton
+                      title="Clear the queue?"
+                      disabled={busy}
+                      onConfirm={clearAllItems}
+                      description={
+                        <>
+                          Removes all {items.length} image{items.length === 1 ? '' : 's'},
+                          including finished cutouts that haven&rsquo;t been exported. Your
+                          source files on disk are untouched.
+                        </>
+                      }
+                    />
+                  </div>
                   {flaggedCount > 0 && (
                     <div className="mb-3 flex items-center justify-between gap-2">
                       <Button
@@ -1809,15 +1891,49 @@ export default function BgRemover() {
                         item={item}
                         label={item.name || `Image ${index + 1}`}
                         selected={item.id === highlightId}
+                        checked={gridSel.checked.has(item.id)}
+                        selectionActive={gridSel.active}
                         background={outputBg}
                         running={busy}
                         tileConfig={tileFitOn ? safeArea : null}
                         onSelect={selectById}
                         onCompare={compareById}
                         onRemove={removeById}
+                        onToggleSelect={gridSel.toggle}
                       />
                     )}
                   />
+                  {gridSel.active && (
+                    <SelectionBar
+                      count={gridSel.checked.size}
+                      total={items.length}
+                      allSelected={gridSel.allSelected}
+                      busy={busy}
+                      actions={[
+                        {
+                          key: 'ai-edit',
+                          label: aiReady
+                            ? 'AI edit selected — regenerate with the AI edit prompt, then re-remove backgrounds'
+                            : 'AI edit needs the Azure endpoint + key (Settings, gear in the rail)',
+                          icon: WandSparklesIcon,
+                          accent: true,
+                          disabled: !aiReady,
+                          onRun: () => void handleAiEditSelected(),
+                        },
+                        {
+                          key: 'redo',
+                          label: 'Redo selected — re-remove backgrounds with the current model settings',
+                          icon: RefreshCwIcon,
+                          onRun: handleRetrySelected,
+                        },
+                      ]}
+                      deleteTitle={`Delete ${gridSel.checked.size} image${gridSel.checked.size === 1 ? '' : 's'}?`}
+                      deleteDescription="Removes them from the queue, including any finished cutouts. Your source files on disk are untouched."
+                      onDelete={deleteSelected}
+                      onSelectAll={gridSel.selectAll}
+                      onClear={gridSel.clear}
+                    />
+                  )}
                 </>
               )}
             </Canvas>
@@ -1943,16 +2059,21 @@ const CutoutCell = React.memo(function CutoutCell({
   item,
   label,
   selected,
+  checked,
+  selectionActive,
   background,
   running,
   tileConfig,
   onSelect,
   onCompare,
   onRemove,
+  onToggleSelect,
 }: {
   item: BgItem;
   label: string;
   selected: boolean;
+  checked: boolean;
+  selectionActive: boolean;
   background: string;
   running: boolean;
   /** Set when Tile fit is on: the SAME cell then shows the cutout composited on its tile. */
@@ -1961,6 +2082,7 @@ const CutoutCell = React.memo(function CutoutCell({
   /** Clicking a finished result opens the same before/after view as a queue row. */
   onCompare: (id: number) => void;
   onRemove: (id: number) => void;
+  onToggleSelect: (id: number, shiftKey: boolean) => void;
 }) {
   const working =
     item.status === 'removing' || item.status === 'loading-model' || item.status === 'editing';
@@ -1970,10 +2092,13 @@ const CutoutCell = React.memo(function CutoutCell({
       label={label}
       status={statusLine(item)}
       selected={selected}
+      checked={checked}
+      selectionActive={selectionActive}
       onSelect={() => {
         onSelect(item.id);
         if (item.cutout) onCompare(item.id);
       }}
+      onToggleSelect={(shiftKey) => onToggleSelect(item.id, shiftKey)}
       onRemove={() => onRemove(item.id)}
       removeDisabled={running}
     >

@@ -11,10 +11,11 @@
 import * as React from 'react';
 import { toast } from 'sonner';
 import {
-  CircleStopIcon, DownloadIcon, ImagePlusIcon, SparklesIcon, UploadCloudIcon,
+  CircleStopIcon, DownloadIcon, ImagePlusIcon, RefreshCwIcon, SparklesIcon, UploadCloudIcon,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
+import { ClearAllButton, SelectionBar, useGridSelection } from '@/components/selection';
 import { Checkbox } from '@/components/ui/checkbox';
 import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
@@ -90,6 +91,9 @@ export default function ImageGenerator() {
   const genAbortRef = React.useRef<AbortController | null>(null);
   const itemsRef = React.useRef<GenItem[]>(items);
   React.useEffect(() => { itemsRef.current = items; }, [items]);
+
+  const itemIds = React.useMemo(() => items.map((it) => it.id), [items]);
+  const sel = useGridSelection(itemIds, openId !== null);
 
   const mock = typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('mock');
   const busy = running || exporting;
@@ -213,7 +217,11 @@ export default function ImageGenerator() {
 
   async function handleGenerateAll() {
     if (busy || !guards()) return;
-    const todo = itemsRef.current;
+    await runBatch(itemsRef.current, 'generated');
+  }
+
+  /** One run over `todo` — Generate-all and Regenerate-selected share everything but the verb. */
+  async function runBatch(todo: GenItem[], verb: string) {
     const controller = new AbortController();
     genAbortRef.current = controller;
     setRunning(true);
@@ -241,8 +249,8 @@ export default function ImageGenerator() {
     } finally {
       setProgress(
         controller.signal.aborted
-          ? { pct: 100, text: `Stopped — ${ok} of ${todo.length} generated; the rest are untouched.` }
-          : { pct: 100, text: `Done — ${ok} of ${todo.length} images generated.` },
+          ? { pct: 100, text: `Stopped — ${ok} of ${todo.length} ${verb}; the rest are untouched.` }
+          : { pct: 100, text: `Done — ${ok} of ${todo.length} images ${verb}.` },
       );
       genAbortRef.current = null;
       setRunning(false);
@@ -276,6 +284,35 @@ export default function ImageGenerator() {
   function handleRemove(id: number) {
     setItems((prev) => prev.filter((it) => it.id !== id));
     setOpenId((prev) => (prev === id ? null : prev));
+  }
+
+  // ---- Selection ---------------------------------------------------------
+
+  function deleteSelected() {
+    setItems((prev) => prev.filter((it) => !sel.checked.has(it.id)));
+    setOpenId((prev) => (prev !== null && sel.checked.has(prev) ? null : prev));
+    sel.clear();
+  }
+
+  async function handleRegenerateSelected() {
+    if (busy || !guards()) return;
+    const todo = itemsRef.current.filter((it) => sel.checked.has(it.id));
+    if (!todo.length) return;
+    await runBatch(todo, 'regenerated');
+  }
+
+  /** Full reset back to the drop zone. The brief survives — it is its own input document. */
+  function clearAll() {
+    genAbortRef.current?.abort();
+    setItems([]);
+    sel.clear();
+    setOpenId(null);
+    setCsvName(null);
+    setHeaders([]);
+    setRecords([]);
+    setNameCol('');
+    setExcluded([]);
+    setProgress(null);
   }
 
   // ---- Export ------------------------------------------------------------
@@ -522,13 +559,60 @@ export default function ImageGenerator() {
               </EmptyHeader>
             </Empty>
           ) : (
-            <GenGrid
-              items={items}
-              promptFor={promptFor}
-              running={busy}
-              onOpen={setOpenId}
-              onRemove={handleRemove}
-            />
+            <>
+              {/* Grid toolbar: count on the left, whole-run reset on the right. */}
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <span className="text-xs text-muted-foreground">
+                  {sel.active
+                    ? `${sel.checked.size} of ${items.length} selected`
+                    : `${items.length} row${items.length === 1 ? '' : 's'}${doneCount ? ` · ${doneCount} generated` : ''}`}
+                </span>
+                <ClearAllButton
+                  title="Clear this run?"
+                  disabled={busy}
+                  onConfirm={clearAll}
+                  description={
+                    <>
+                      Removes all {items.length} row{items.length === 1 ? '' : 's'}
+                      {doneCount > 0 && <> and the {doneCount} generated image{doneCount === 1 ? '' : 's'} (not exported anywhere yet)</>}
+                      . The brief stays loaded; your CSV file on disk is untouched — drop it
+                      again to rebuild the rows.
+                    </>
+                  }
+                />
+              </div>
+              <GenGrid
+                items={items}
+                promptFor={promptFor}
+                running={busy}
+                selected={sel.checked}
+                onOpen={setOpenId}
+                onRemove={handleRemove}
+                onToggleSelect={sel.toggle}
+              />
+              {sel.active && (
+                <SelectionBar
+                  count={sel.checked.size}
+                  total={items.length}
+                  allSelected={sel.allSelected}
+                  busy={busy}
+                  actions={[
+                    {
+                      key: 'regenerate',
+                      label: 'Regenerate selected — sends each row to Azure again',
+                      icon: RefreshCwIcon,
+                      accent: true,
+                      onRun: () => void handleRegenerateSelected(),
+                    },
+                  ]}
+                  deleteTitle={`Delete ${sel.checked.size} row${sel.checked.size === 1 ? '' : 's'}?`}
+                  deleteDescription="Removes them from this run, along with any images they generated. Rows still in the CSV file come back if you drop it again."
+                  onDelete={deleteSelected}
+                  onSelectAll={sel.selectAll}
+                  onClear={sel.clear}
+                />
+              )}
+            </>
           )}
         </Canvas>
 

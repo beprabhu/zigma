@@ -108,9 +108,12 @@ function TileCell({
   offerText,
   offerVisible,
   running,
+  checked,
+  selectionActive,
   registerCanvas,
   onOpen,
   onRemove,
+  onToggleSelect,
 }: {
   item: QueueItem;
   template: TileTemplate;
@@ -118,9 +121,12 @@ function TileCell({
   offerText: string;
   offerVisible: boolean;
   running: boolean;
+  checked: boolean;
+  selectionActive: boolean;
   registerCanvas: (id: number, canvas: HTMLCanvasElement | null) => void;
   onOpen: (item: QueueItem) => void;
   onRemove: (item: QueueItem) => void;
+  onToggleSelect: (id: number, shiftKey: boolean) => void;
 }) {
   const working =
     item.status === 'fetching' || item.status === 'generating' || item.status === 'removing-bg';
@@ -129,7 +135,10 @@ function TileCell({
     <ResultCell
       label={item.title || `Row ${item.id + 1}`}
       status={statusLine(item)}
+      checked={checked}
+      selectionActive={selectionActive}
       onSelect={() => onOpen(item)}
+      onToggleSelect={(shiftKey) => onToggleSelect(item.id, shiftKey)}
       onRemove={() => onRemove(item)}
       removeDisabled={running}
     >
@@ -182,14 +191,16 @@ interface TileGridProps {
   offerToggle: boolean;
   hasOfferCol: boolean;
   running: boolean;
+  selected: ReadonlySet<number>;
   registerCanvas: (id: number, canvas: HTMLCanvasElement | null) => void;
   onOpen: (item: QueueItem) => void;
   onRemove: (item: QueueItem) => void;
+  onToggleSelect: (id: number, shiftKey: boolean) => void;
 }
 
 export function TileGrid({
   items, template, fallbackTitle, fallbackOffer, offerToggle, hasOfferCol,
-  running, registerCanvas, onOpen, onRemove,
+  running, selected, registerCanvas, onOpen, onRemove, onToggleSelect,
 }: TileGridProps) {
   return (
     <div className="grid grid-cols-3 gap-3.5 xl:grid-cols-4">
@@ -202,9 +213,12 @@ export function TileGrid({
           offerText={item.offer || fallbackOffer}
           offerVisible={offerToggle && (!!item.offer.trim() || !hasOfferCol)}
           running={running}
+          checked={selected.has(item.id)}
+          selectionActive={selected.size > 0}
           registerCanvas={registerCanvas}
           onOpen={onOpen}
           onRemove={onRemove}
+          onToggleSelect={onToggleSelect}
         />
       ))}
     </div>
