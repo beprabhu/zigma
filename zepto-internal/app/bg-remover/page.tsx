@@ -12,6 +12,7 @@ import {
   RefreshCwIcon,
   SaveIcon,
   TriangleAlertIcon,
+  SparklesIcon,
   WandSparklesIcon,
 } from 'lucide-react';
 import {
@@ -82,7 +83,12 @@ import {
   type PoolCutout,
 } from '@/lib/bg/pool';
 import { PROJECT_EXTENSION, loadProject, saveProject, type ProjectCsv } from '@/lib/bg/project';
-import { assessQuality, countFlagged, sortByQuality } from '@/lib/bg/quality';
+import {
+  assessQuality, assessQueue, countQueueFilters, filterQueue, isAiGenerated, sortByQualityWith,
+  verdictLookup,
+  type QueueFilter, type QueueSort,
+} from '@/lib/bg/quality';
+import { QueueFilters } from '@/components/bg-remover/queue-filters';
 import { readParallel } from '@/lib/rate';
 import { createEta } from '@/lib/eta';
 import { DEFAULT_AI_PROMPT, matchSkill, useSkills } from '@/lib/skills';
@@ -202,7 +208,8 @@ interface BgSession {
   items: BgItem[];
   sessionName: string;
   selectedId: number | null;
-  qualitySort: boolean;
+  queueFilter: QueueFilter;
+  queueSort: QueueSort;
   csvInfo: CsvInfo | null;
   /** Ids already sent to Azure, so returning cannot re-buy an AI fix this session paid for. */
   aiAttempted: number[];
@@ -395,20 +402,36 @@ export default function BgRemover() {
   const [selectedId, setSelectedId] = React.useState<number | null>(
     () => readSession(BG_SESSION)?.selectedId ?? null,
   );
-  // Display-only reordering for the results grid — never touches `items`, so export naming and
-  // retry-by-id are unaffected. Worst-first; ties keep queue order (Array#sort is stable).
-  const [qualitySort, setQualitySort] = React.useState(() => readSession(BG_SESSION)?.qualitySort ?? false);
-  const flaggedCount = React.useMemo(() => countFlagged(items), [items]);
-  // What "AI-fix flagged" operates on. Archived items are excluded — they have no original
-  // image left to send to the model.
+  // Display-only view of the queue — filtering and sorting never touch `items`, so export
+  // naming, retry-by-id and batch membership are all unaffected by what is on screen.
+  const [queueFilter, setQueueFilter] = React.useState<QueueFilter>(
+    () => readSession(BG_SESSION)?.queueFilter ?? 'all',
+  );
+  const [queueSort, setQueueSort] = React.useState<QueueSort>(
+    () => readSession(BG_SESSION)?.queueSort ?? 'queue',
+  );
+  // Assessed once per queue change. The verdict is pure arithmetic, but it was being recomputed
+  // in two memos plus once per visible cell per render; the filter needs it for every item, so
+  // one pass feeds all of them.
+  const verdicts = React.useMemo(() => assessQueue(items), [items]);
+  const verdictOf = React.useMemo(() => verdictLookup(verdicts), [verdicts]);
+  const filterCounts = React.useMemo(
+    () => countQueueFilters(items, verdictOf),
+    [items, verdictOf],
+  );
+  const flaggedCount = filterCounts.flagged;
+  // What "AI-fix flagged" operates on — a WORKLIST, not the view. Archived items are excluded
+  // because they have no original left to send to the model, which is why this count can sit
+  // below the flagged chip's: the chip shows every flagged tile, including the unfixable ones.
+  // Deriving one from the other would either hide tiles or promise fixes that cannot happen.
   const flaggedItems = React.useMemo(
-    () => items.filter((item) => canRetry(item) && assessQuality(item).level !== 'ok'),
-    [items],
+    () => items.filter((item) => canRetry(item) && verdictOf(item).level !== 'ok'),
+    [items, verdictOf],
   );
-  const displayItems = React.useMemo(
-    () => (qualitySort ? sortByQuality(items) : items),
-    [items, qualitySort],
-  );
+  const displayItems = React.useMemo(() => {
+    const shown = filterQueue(items, queueFilter, verdictOf);
+    return queueSort === 'quality' ? sortByQualityWith(shown, verdictOf) : shown;
+  }, [items, queueFilter, queueSort, verdictOf]);
 
   // ---- Run state ----
   const [running, setRunning] = React.useState(false);
@@ -468,7 +491,8 @@ export default function BgRemover() {
     items,
     sessionName,
     selectedId,
-    qualitySort,
+    queueFilter,
+    queueSort,
     csvInfo: null,
     aiAttempted: [],
   });
@@ -609,6 +633,19 @@ export default function BgRemover() {
   // what the user sees even under quality sort.
   const displayIds = React.useMemo(() => displayItems.map((it) => it.id), [displayItems]);
   const gridSel = useGridSelection(displayIds, compareId !== null);
+
+  // Selection is dropped whenever the view changes. useGridSelection prunes its checked set
+  // against the visible order, so switching filters otherwise produces three different
+  // surprises: ids checked while hidden reappear when the filter clears, a toggle while
+  // filtered silently drops them for good, and select-all replaces them wholesale. Clearing is
+  // the one behaviour that reads the same in all three.
+  const changeQueueFilter = React.useCallback(
+    (next: QueueFilter) => {
+      setQueueFilter(next);
+      gridSel.clear();
+    },
+    [gridSel],
+  );
 
   const patchItem = React.useCallback((id: number, patch: Partial<BgItem>) => {
     setItems((prev) => prev.map((item) => (item.id === id ? { ...item, ...patch } : item)));
@@ -765,7 +802,8 @@ export default function BgRemover() {
       items,
       sessionName,
       selectedId,
-      qualitySort,
+      queueFilter,
+      queueSort,
       csvInfo,
       aiAttempted: [...aiAttemptedRef.current],
     };
@@ -2230,9 +2268,14 @@ export default function BgRemover() {
                   {/* Grid toolbar: count on the left, whole-queue reset on the right. */}
                   <div className="mb-2 flex items-center justify-between gap-2">
                     <span className="text-xs text-muted-foreground">
+                      {/* Scoped to what is on screen: under a filter, "select all" only ever
+                          reaches the visible rows, so counting the whole queue here would
+                          promise a selection the button cannot make. */}
                       {gridSel.active
-                        ? `${gridSel.checked.size} of ${items.length} selected`
-                        : `${items.length} image${items.length === 1 ? '' : 's'}`}
+                        ? `${gridSel.checked.size} of ${displayItems.length} selected`
+                        : displayItems.length === items.length
+                          ? `${items.length} image${items.length === 1 ? '' : 's'}`
+                          : `${displayItems.length} of ${items.length} images`}
                     </span>
                     <ClearAllButton
                       title="Clear the queue?"
@@ -2247,56 +2290,56 @@ export default function BgRemover() {
                       }
                     />
                   </div>
-                  {flaggedCount > 0 && (
-                    <div className="mb-3 flex items-center justify-between gap-2">
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        // `running` is deliberately absent: flagged items can start their Azure
-                        // phase while the rest of the batch is still removing; only their
-                        // re-removal waits for the workers to free up.
-                        disabled={aiFixing || exporting || warming || !aiReady || !flaggedItems.length}
-                        title={
-                          aiReady
-                            ? 'Regenerate every flagged image with the AI edit prompt, then re-remove their backgrounds (after the current batch, if one is running). Parallelism comes from Settings → Image model.'
-                            : 'AI edit needs the Azure endpoint + key (Settings, gear in the rail)'
-                        }
-                        onClick={() => void handleAiEditFlagged()}
-                      >
-                        {aiFixing ? (
-                          <Spinner data-icon="inline-start" />
-                        ) : (
-                          <WandSparklesIcon data-icon="inline-start" />
-                        )}
-                        AI-fix flagged ({flaggedItems.length})
-                      </Button>
-                      <label
-                        className="flex items-center gap-1.5 text-xs text-muted-foreground"
-                        title="Keep watching the queue and send every newly flagged image to the AI edit automatically — each image is sent at most once."
-                      >
-                        <Switch
-                          checked={autoAiFix}
-                          onCheckedChange={setAutoAiFix}
-                          disabled={!aiReady}
-                        />
-                        Auto
-                      </label>
-                      <ToggleGroup
-                        size="sm"
-                        variant="outline"
-                        value={[qualitySort ? 'quality' : 'queue']}
-                        onValueChange={(next) => setQualitySort(next[0] === 'quality')}
-                      >
-                        <ToggleGroupItem value="queue" aria-label="Queue order">
-                          Queue order
-                        </ToggleGroupItem>
-                        <ToggleGroupItem value="quality" aria-label="Flagged first">
-                          <CircleAlertIcon data-icon="inline-start" />
-                          Flagged
-                        </ToggleGroupItem>
-                      </ToggleGroup>
-                    </div>
-                  )}
+                  {/* Mounted whenever the queue is non-empty, never behind a count: the old
+                      toolbar disappeared the moment nothing was flagged, which would strand
+                      anyone sitting inside the flagged filter on an empty grid with no way out. */}
+                  <QueueFilters
+                    className="mb-3"
+                    filter={queueFilter}
+                    onFilterChange={changeQueueFilter}
+                    counts={filterCounts}
+                    visible={displayItems.length}
+                    sort={queueSort}
+                    onSortChange={setQueueSort}
+                    actions={
+                      flaggedItems.length > 0 && (
+                        <>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            // `running` is deliberately absent: flagged items can start their
+                            // Azure phase while the rest of the batch is still removing; only
+                            // their re-removal waits for the workers to free up.
+                            disabled={aiFixing || exporting || warming || !aiReady}
+                            title={
+                              aiReady
+                                ? 'Regenerate every flagged image with the AI edit prompt, then re-remove their backgrounds (after the current batch, if one is running). Parallelism comes from Settings → Image model.'
+                                : 'AI edit needs the Azure endpoint + key (Settings, gear in the rail)'
+                            }
+                            onClick={() => void handleAiEditFlagged()}
+                          >
+                            {aiFixing ? (
+                              <Spinner data-icon="inline-start" />
+                            ) : (
+                              <WandSparklesIcon data-icon="inline-start" />
+                            )}
+                            AI-fix flagged ({flaggedItems.length})
+                          </Button>
+                          <label
+                            className="flex items-center gap-1.5 text-xs text-muted-foreground"
+                            title="Keep watching the queue and send every newly flagged image to the AI edit automatically — each image is sent at most once."
+                          >
+                            <Switch
+                              checked={autoAiFix}
+                              onCheckedChange={setAutoAiFix}
+                              disabled={!aiReady}
+                            />
+                            Auto
+                          </label>
+                        </>
+                      )
+                    }
+                  />
                   <VirtualGrid
                     items={displayItems}
                     scrollRef={removeScrollRef}
@@ -2614,6 +2657,14 @@ const CutoutCell = React.memo(function CutoutCell({
             <CircleAlertIcon
               className={cn('size-4', quality.level === 'bad' ? 'text-destructive' : 'text-amber-500')}
             />
+          </Hint>
+        )}
+        {isAiGenerated(item) && (
+          <Hint
+            hint="Regenerated with the AI edit — the imported image is still available in the details view."
+            className="absolute top-2 left-2"
+          >
+            <SparklesIcon className="size-4 text-primary" />
           </Hint>
         )}
         {tileOverride !== undefined && (
