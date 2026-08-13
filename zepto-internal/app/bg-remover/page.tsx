@@ -87,6 +87,7 @@ import { readParallel } from '@/lib/rate';
 import { createEta } from '@/lib/eta';
 import { DEFAULT_AI_PROMPT, matchSkill, useSkills } from '@/lib/skills';
 import { clearPreviews, dropPreview, usePreview } from '@/lib/bg/preview-store';
+import { readSession, restingStatus, saveSession, sessionKey } from '@/lib/bg/session-store';
 import { STORE_TYPE } from '@/lib/bg/constants';
 import { callAzure, loadImageFromUrl, mockComposite } from '@/lib/pipeline';
 import { buildZipStream, type ZipStreamEntry } from '@/lib/zip';
@@ -191,6 +192,32 @@ async function cropToHero(item: BgItem, source: HTMLImageElement): Promise<HTMLI
 // Rebuilds a queue item from a crash-recovery record — the same shape project restore uses.
 // URL sources come back as URLs (redo works); AI-regenerated files come back as files (their
 // bytes were saved because they cost an Azure call); everything else is provenance-only.
+/**
+ * What survives a hop to another product. Not persistence — see lib/bg/session-store.ts; this
+ * only covers the route change the rail makes one click away, which used to take a half-finished
+ * batch with it. Run flags are deliberately absent: leaving aborts the batch, so coming back to
+ * a queue that claims to be running would be a lie.
+ */
+interface BgSession {
+  items: BgItem[];
+  sessionName: string;
+  selectedId: number | null;
+  qualitySort: boolean;
+  csvInfo: CsvInfo | null;
+  /** Ids already sent to Azure, so returning cannot re-buy an AI fix this session paid for. */
+  aiAttempted: number[];
+}
+
+const BG_SESSION = sessionKey<BgSession>('bg-remover');
+
+interface CsvInfo {
+  fileName: string;
+  text: string;
+  headers: string[];
+  imageColumns: string[];
+  nameColumn: string;
+}
+
 function itemFromAutosave(record: AutosaveRecord, id: number): BgItem {
   const source: BgItemSource = record.sourceUrl
     ? { kind: 'url', url: record.sourceUrl }
@@ -299,7 +326,13 @@ export default function BgRemover() {
     : BUDGET_KB_DEFAULT;
 
   // ---- Queue ----
-  const [items, setItems] = React.useState<BgItem[]>([]);
+  // Seeded from the session store so a hop to another product and back returns the queue
+  // rather than an empty grid. readSession is a plain read, so StrictMode's second pass in dev
+  // gets the same snapshot instead of an emptied one.
+  const [items, setItems] = React.useState<BgItem[]>(() => readSession(BG_SESSION)?.items ?? []);
+  // Whether this mount inherited a live session rather than starting empty. Read once, before
+  // anything can add to the queue, because it decides how autosave treats the records on disk.
+  const adoptedSessionRef = React.useRef(items.length > 0);
   // Crash recovery: mirrors finished work into IndexedDB and offers the previous session back
   // after a crash. Declared against `items` so every mutation path syncs through one place.
   const {
@@ -309,7 +342,10 @@ export default function BgRemover() {
     lastSavedAt: autosavedAt,
     failing: autosaveFailing,
     saveCsv: autosaveCsv,
-  } = useAutosave(items);
+  } = useAutosave(items, {
+    // A queue carried across a product switch is not a crash to recover from.
+    adopt: adoptedSessionRef.current,
+  });
 
   /**
    * Rebuilds the panel's CSV state from a saved sheet. `headers` is not stored — re-parsing the
@@ -333,7 +369,7 @@ export default function BgRemover() {
   // Figma-style "file name" for the session, shown in the panel header. Working state, not
   // decoration: it seeds the .zesku and export ZIP filenames. Auto-seeded from the first
   // CSV/project file dropped, but never over a name the user already typed.
-  const [sessionName, setSessionName] = React.useState('');
+  const [sessionName, setSessionName] = React.useState(() => readSession(BG_SESSION)?.sessionName ?? '');
   const sessionSlug = sessionName.trim().replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '');
   const seedSessionName = React.useCallback((fileName: string) => {
     setSessionName((prev) => (prev.trim() ? prev : fileName.replace(/\.[^.]+$/, '')));
@@ -356,10 +392,12 @@ export default function BgRemover() {
       toast.success(`Restored ${records.length} image${records.length === 1 ? '' : 's'}.`);
     });
   }, [restoreAutosave, csvInfoFromSheet]);
-  const [selectedId, setSelectedId] = React.useState<number | null>(null);
+  const [selectedId, setSelectedId] = React.useState<number | null>(
+    () => readSession(BG_SESSION)?.selectedId ?? null,
+  );
   // Display-only reordering for the results grid — never touches `items`, so export naming and
   // retry-by-id are unaffected. Worst-first; ties keep queue order (Array#sort is stable).
-  const [qualitySort, setQualitySort] = React.useState(false);
+  const [qualitySort, setQualitySort] = React.useState(() => readSession(BG_SESSION)?.qualitySort ?? false);
   const flaggedCount = React.useMemo(() => countFlagged(items), [items]);
   // What "AI-fix flagged" operates on. Archived items are excluded — they have no original
   // image left to send to the model.
@@ -419,10 +457,21 @@ export default function BgRemover() {
   // Every id that has been through an AI edit once, manual or auto. The auto-fix watcher never
   // resends one: an image that comes back still flagged after its regeneration would otherwise
   // cycle through Azure forever, spending money on an image the model cannot fix.
-  const aiAttemptedRef = React.useRef<Set<number>>(new Set());
+  const aiAttemptedRef = React.useRef<Set<number>>(new Set(readSession(BG_SESSION)?.aiAttempted));
   // The run loop reads the queue across awaits, so it needs the committed value, not a closure.
   const itemsRef = React.useRef<BgItem[]>(items);
   React.useEffect(() => { itemsRef.current = items; }, [items]);
+
+  // The unmount cleanup runs once, so its closure is the FIRST render's — it would snapshot an
+  // empty session. Everything it needs is mirrored here on every commit instead.
+  const sessionRef = React.useRef<BgSession>({
+    items,
+    sessionName,
+    selectedId,
+    qualitySort,
+    csvInfo: null,
+    aiAttempted: [],
+  });
 
   // Leaving the product must stop inference (the models hold the main thread otherwise) and hand
   // back every object URL the decoded originals are holding — a client-side route change keeps
@@ -433,6 +482,24 @@ export default function BgRemover() {
       // The AI phase can outlive the page too — without this, in-flight Azure requests keep
       // running (and spending) after navigation, then respawn the disposed worker pool.
       aiAbortRef.current?.abort();
+      // Snapshot BEFORE the teardown below, then hand back every decoded original: releaseItem
+      // revokes those blob: URLs and clearPreviews closes the cached bitmaps, so a snapshot that
+      // kept them would revive a queue of broken images. `original` re-decodes from `source` on
+      // demand, so dropping it costs one read and nothing else.
+      //
+      // Statuses have to come to rest as well. The aborts above resolve their cancellation
+      // patches after this component is gone, so those writes never commit — without this, rows
+      // caught mid-run come back as permanent spinners, and one stuck in 'editing' refuses any
+      // further AI edit.
+      saveSession(BG_SESSION, {
+        ...sessionRef.current,
+        items: itemsRef.current.map((item) => ({
+          ...item,
+          original: null,
+          status: restingStatus(item.status, item.cutout !== null),
+        })),
+        aiAttempted: [...aiAttemptedRef.current],
+      });
       itemsRef.current.forEach(releaseItem);
       // Decoded previews are cache-owned; nothing else would ever close them.
       clearPreviews();
@@ -577,13 +644,9 @@ export default function BgRemover() {
   // The page owns CSV imports (not the dropzone) so the user can remap which column names the
   // images and which columns hold URLs. One CSV batch at a time: remapping — or dropping a new
   // CSV — replaces the previous CSV's items while file/paste items stay untouched.
-  const [csvInfo, setCsvInfo] = React.useState<{
-    fileName: string;
-    text: string;
-    headers: string[];
-    imageColumns: string[];
-    nameColumn: string;
-  } | null>(null);
+  const [csvInfo, setCsvInfo] = React.useState<CsvInfo | null>(
+    () => readSession(BG_SESSION)?.csvInfo ?? null,
+  );
   /**
    * A name-column change is a pure rename, so it must never go through replaceCsvItems: that
    * path keys membership off the source kind, and an AI edit has already swapped the source to
@@ -695,6 +758,18 @@ export default function BgRemover() {
     }
     setItems([...kept, ...fresh]);
   }, []);
+
+  // Feeds the once-only unmount snapshot with current values instead of first-render ones.
+  React.useEffect(() => {
+    sessionRef.current = {
+      items,
+      sessionName,
+      selectedId,
+      qualitySort,
+      csvInfo,
+      aiAttempted: [...aiAttemptedRef.current],
+    };
+  });
 
   // Mirrors the sheet into the crash net alongside the items. The ref is what stops a fresh
   // mount from writing a null: that would delete a crashed session's CSV before its restore

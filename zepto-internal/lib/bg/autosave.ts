@@ -318,7 +318,20 @@ export interface Autosave {
  * otherwise the initial empty `items` array would read as "everything was deleted" and wipe the
  * crashed session before the user could restore it.
  */
-export function useAutosave(items: BgItem[]): Autosave {
+export interface AutosaveOptions {
+  /**
+   * True when the queue on screen was carried across a client-side navigation rather than
+   * rebuilt from scratch (lib/bg/session-store.ts). The records on disk then describe THESE
+   * rows, so there is nothing to recover: prompting would ask the user to restore work they
+   * are already looking at, and the blocking dialog would hold writes for a session that never
+   * crashed. Ignored when the store turns out to be empty.
+   */
+  adopt?: boolean;
+}
+
+export function useAutosave(items: BgItem[], opts: AutosaveOptions = {}): Autosave {
+  // Read once: a re-render after the queue is adopted must not change what boot decided.
+  const adoptRef = React.useRef(opts.adopt ?? false);
   const [pending, setPending] = React.useState<PendingRestore | null>(null);
   const [lastSavedAt, setLastSavedAt] = React.useState<number | null>(null);
   const [failing, setFailing] = React.useState(false);
@@ -396,7 +409,17 @@ export function useAutosave(items: BgItem[]): Autosave {
     Promise.all([listAutosaved(), readAutosaveCsv().catch(() => null)])
       .then(([records, csv]) => {
         if (cancelled) return;
-        if (records?.length) {
+        if (records?.length && adoptRef.current) {
+          // Same session, new mount. Seeding `known` from the live rows is what keeps this from
+          // re-writing the whole queue on every product switch: nothing can have changed while
+          // the page was unmounted, so what is on disk already matches what is in memory, and a
+          // 3,000-row queue would otherwise re-put a gigabyte of blobs per hop.
+          for (const item of latestItemsRef.current) {
+            knownRef.current.set(item.id, signatureOf(item));
+          }
+          phaseRef.current = 'active';
+          flushCsv();
+        } else if (records?.length) {
           recordsRef.current = records;
           heldCsvRef.current = csv;
           phaseRef.current = 'held';
