@@ -36,6 +36,29 @@ export function canRetry(item: BgItem): boolean {
 }
 
 /**
+ * Which CSV cell an item was imported from. Kept on the ITEM rather than inside its source:
+ * an AI edit replaces the source with the regenerated file, and a row that has been through
+ * Azure must still answer "which CSV row are you?" — otherwise remapping the name column
+ * cannot reach it, and remapping the image columns mints a duplicate for a row already queued.
+ */
+export interface CsvOrigin {
+  /** Record index, header row excluded — the row number draftsFromCsv iterated. */
+  row: number;
+  /** Header of the image column the URL was read out of. */
+  column: string;
+}
+
+/** Map key for a CSV cell. The row is numeric, so the first space splits it unambiguously. */
+export function csvCellKey(origin: CsvOrigin): string {
+  return `${origin.row} ${origin.column}`;
+}
+
+export function sameCsvOrigin(a: CsvOrigin | undefined, b: CsvOrigin | undefined): boolean {
+  if (!a || !b) return a === b;
+  return a.row === b.row && a.column === b.column;
+}
+
+/**
  * A finished cutout, stored compressed. Holding a full-resolution canvas per item is what
  * exhausted memory on real batches: a 3000px photo is 36 MB as RGBA and under 2 MB as lossless
  * WebP. The preview is everything the UI draws; the blob is decoded on demand at export.
@@ -83,6 +106,8 @@ export interface BgItem {
    * Overwritten by the next redo, cleared by undo itself.
    */
   prev?: { source: BgItemSource; cutout: BgCutout | null };
+  /** Set for items imported from a CSV; absent for dropped files and pasted images. */
+  csv?: CsvOrigin;
 }
 
 /** preview px per full-resolution px, for mapping bounds onto a decoded preview. */
@@ -99,6 +124,7 @@ export function decodeCutout(cutout: BgCutout): Promise<ImageBitmap> {
 export interface BgItemDraft {
   name: string;
   source: BgItemSource;
+  csv?: CsvOrigin;
 }
 
 // Ids must survive removals, so they count up from the highest live id rather than the length.
@@ -114,6 +140,7 @@ export function createItems(drafts: BgItemDraft[], startId: number): BgItem[] {
     original: null,
     cutout: null,
     status: 'ready',
+    ...(draft.csv ? { csv: draft.csv } : null),
   }));
 }
 
@@ -248,6 +275,7 @@ export function draftsFromCsv(text: string, overrides: CsvColumnOverrides = {}):
       drafts.push({
         name: title || nameFromUrl(url) || `row-${row + 1}`,
         source: { kind: 'url', url },
+        csv: { row, column },
       });
     }
   });
