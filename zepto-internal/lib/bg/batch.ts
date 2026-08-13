@@ -71,6 +71,18 @@ export interface BgItem {
   removedRegions?: number;
   /** Per-region measurements, shown in the compare dialog so decisions can be inspected. */
   regionReport?: RegionReport[];
+  /**
+   * Per-item tile-fit override, set from the selection bar. undefined follows the global
+   * toggle; true/false pin this image regardless of it. Everything that renders or exports a
+   * tile must go through the page's effectiveTileFit(), never read the global directly.
+   */
+  tileFit?: boolean;
+  /**
+   * One-slot undo: what the last Redo / AI edit replaced. AI edit swaps the SOURCE too (the
+   * regenerated file becomes the new input), so undo must restore both halves together.
+   * Overwritten by the next redo, cleared by undo itself.
+   */
+  prev?: { source: BgItemSource; cutout: BgCutout | null };
 }
 
 /** preview px per full-resolution px, for mapping bounds onto a decoded preview. */

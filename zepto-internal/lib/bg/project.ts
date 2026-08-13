@@ -2,21 +2,26 @@
 // and go straight to tile fitting without re-running inference.
 //
 // A project is a STORE-method ZIP (our own writer/reader in lib/zip.ts):
-//   manifest.json      version, safe-area config, per-item metadata (name, bounds, provenance)
-//   cutouts/NNN.webp   the lossless WebP masters, byte-identical to what the workers produced
+//   manifest.json       version, safe-area config, per-item metadata (name, bounds, provenance)
+//   cutouts/NNN.webp    the lossless WebP masters, byte-identical to what the workers produced
+//   originals/NNN.*     (v2, optional) the input files, so a reopened project keeps its inputs
 //
 // The cutouts are ordinary images on purpose: rename .zesku to .zip and the file opens anywhere.
-// Originals are NOT saved — they can be huge, and everything downstream (tile fit, export)
-// needs only the cutout. Restored items therefore carry source kind 'archived'.
+//
+// v1 saved only finished cutouts and dropped every input (restored sources were 'archived'
+// labels) — which read as data loss on reopen: no originals to view, no Redo, no AI edit, and
+// unprocessed queue rows simply gone. v2 saves EVERY item; URL sources cost only their string,
+// file sources embed their bytes under originals/ (skippable via includeOriginals for huge
+// batches). v1 files still load exactly as before.
 
 import { buildZip, readZipIndex, type ZipFileEntry } from '../zip';
-import type { BgCutout, BgItemSource, CutoutItem } from './batch';
+import type { BgCutout, BgItem, BgItemSource } from './batch';
 import { ANCHORS, DEFAULT_SAFE_AREA, type SafeAreaConfig, type SubjectBounds } from './safe-area';
 
 export const PROJECT_EXTENSION = '.zesku';
 const MANIFEST = 'manifest.json';
 const FORMAT = 'zesku-bg-remover-project';
-const VERSION = 1;
+const VERSION = 2;
 
 export function isProjectFile(file: File): boolean {
   return file.name.toLowerCase().endsWith(PROJECT_EXTENSION);
@@ -24,12 +29,22 @@ export function isProjectFile(file: File): boolean {
 
 interface ManifestItem {
   name: string;
+  /** Cutout entry path. v2: '' for items saved before they were processed. */
   path: string;
+  /** Cutout dimensions; 0×0 when there is no cutout (v2 unprocessed items). */
   width: number;
   height: number;
   bounds: SubjectBounds | null;
-  /** Where the image originally came from — display-only after a restore. */
+  /** Where the image originally came from — display fallback when nothing richer survives. */
   origin: string;
+  /** v2: restores a real URL source (view original, Redo and AI edit keep working). */
+  sourceUrl?: string;
+  /** v2: zip path of the embedded input file, when the save included originals. */
+  originalPath?: string;
+  /** v2: the input's original filename, so the reconstructed File keeps it. */
+  originalName?: string;
+  /** v2: per-item tile-fit override (absent = follows the global switch). */
+  tileFit?: boolean;
 }
 
 interface Manifest {
@@ -47,26 +62,56 @@ function originOf(source: BgItemSource): string {
   return source.label;
 }
 
-/** Packs every finished cutout plus the current settings into a downloadable project blob. */
+/** Keeps the reconstructed File's type honest without trusting the manifest. */
+function mimeFromName(name: string): string {
+  const ext = name.slice(name.lastIndexOf('.') + 1).toLowerCase();
+  return (
+    { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', heic: 'image/heic', heif: 'image/heif', avif: 'image/avif', gif: 'image/gif' }[ext]
+    ?? 'application/octet-stream'
+  );
+}
+
+/** Packs EVERY item (finished or not) plus the current settings into a project blob. */
 export async function saveProject(
-  items: CutoutItem[],
+  items: BgItem[],
   safeArea: SafeAreaConfig,
   outputBg: string,
+  opts: { includeOriginals?: boolean } = {},
 ): Promise<Blob> {
+  const includeOriginals = opts.includeOriginals ?? true;
   const entries: ZipFileEntry[] = [];
   const manifestItems: ManifestItem[] = [];
 
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
-    const path = `cutouts/${String(i + 1).padStart(3, '0')}.webp`;
-    entries.push({ name: path, data: new Uint8Array(await item.cutout.blob.arrayBuffer()) });
+    const n = String(i + 1).padStart(3, '0');
+
+    let path = '';
+    if (item.cutout) {
+      path = `cutouts/${n}.webp`;
+      entries.push({ name: path, data: new Uint8Array(await item.cutout.blob.arrayBuffer()) });
+    }
+
+    let originalPath: string | undefined;
+    let originalName: string | undefined;
+    if (includeOriginals && item.source.kind === 'file') {
+      const file = item.source.file;
+      const ext = file.name.includes('.') ? file.name.slice(file.name.lastIndexOf('.')) : '.png';
+      originalPath = `originals/${n}${ext.toLowerCase()}`;
+      originalName = file.name;
+      entries.push({ name: originalPath, data: new Uint8Array(await file.arrayBuffer()) });
+    }
+
     manifestItems.push({
       name: item.name,
       path,
-      width: item.cutout.width,
-      height: item.cutout.height,
-      bounds: item.cutout.bounds,
+      width: item.cutout?.width ?? 0,
+      height: item.cutout?.height ?? 0,
+      bounds: item.cutout?.bounds ?? null,
       origin: originOf(item.source),
+      ...(item.source.kind === 'url' ? { sourceUrl: item.source.url } : null),
+      ...(originalPath ? { originalPath, originalName } : null),
+      ...(item.tileFit !== undefined ? { tileFit: item.tileFit } : null),
     });
   }
 
@@ -86,7 +131,10 @@ export async function saveProject(
 export interface RestoredItem {
   name: string;
   source: BgItemSource;
-  cutout: BgCutout;
+  /** null for v2 items that were saved before they were processed. */
+  cutout: BgCutout | null;
+  /** Per-item tile-fit override, round-tripped from the manifest. */
+  tileFit?: boolean;
 }
 
 export interface RestoredProject {
@@ -129,11 +177,12 @@ export async function loadProject(file: File): Promise<RestoredProject> {
   if (!manifest || typeof manifest !== 'object' || manifest.format !== FORMAT) {
     throw new Error(`${file.name} is not a BG Remover project`);
   }
-  if (manifest.version !== VERSION) {
+  if (manifest.version !== 1 && manifest.version !== VERSION) {
     throw new Error(
       `${file.name} was saved by a newer version of Zigma (format v${manifest.version}) — update the app to open it`,
     );
   }
+  const v1 = manifest.version === 1;
   if (!Array.isArray(manifest.items)) throw new Error(`${file.name} has no items`);
 
   const items: RestoredItem[] = [];
@@ -144,26 +193,56 @@ export async function loadProject(file: File): Promise<RestoredProject> {
       const rec = (meta && typeof meta === 'object' ? meta : {}) as Partial<ManifestItem>;
       const path = typeof rec.path === 'string' ? rec.path : '';
       const slice = path ? byName.get(path) : undefined;
-      if (!slice) throw new Error(`${file.name} is missing ${path || 'a cutout entry'}`);
-      // A typed Blob view over the same lazy slice — still no bytes read.
-      const blob = slice.slice(0, slice.size, 'image/webp');
+      // v1 items always carry a cutout; a v2 item saved unprocessed legitimately has none.
+      if (!slice && (v1 || path)) {
+        throw new Error(`${file.name} is missing ${path || 'a cutout entry'}`);
+      }
 
-      // Dimensions come from the manifest rather than by decoding: probing every image would
-      // mean thousands of decodes and gigabytes of bitmaps just to open a project. Previews are
-      // decoded on demand for whatever is on screen (lib/bg/preview-store.ts).
-      const width = Math.round(num(rec.width, 0));
-      const height = Math.round(num(rec.height, 0));
-      if (width <= 0 || height <= 0) {
-        throw new Error(`${file.name}: ${path || 'an entry'} has no recorded dimensions`);
+      let cutout: BgCutout | null = null;
+      if (slice) {
+        // A typed Blob view over the same lazy slice — still no bytes read.
+        const blob = slice.slice(0, slice.size, 'image/webp');
+        // Dimensions come from the manifest rather than by decoding: probing every image would
+        // mean thousands of decodes and gigabytes of bitmaps just to open a project. Previews
+        // are decoded on demand for whatever is on screen (lib/bg/preview-store.ts).
+        const width = Math.round(num(rec.width, 0));
+        const height = Math.round(num(rec.height, 0));
+        if (width <= 0 || height <= 0) {
+          throw new Error(`${file.name}: ${path || 'an entry'} has no recorded dimensions`);
+        }
+        cutout = { blob, bounds: parseBounds(rec.bounds), width, height };
+      }
+
+      // Source, richest first: embedded original file → URL → archived label (v1, or a file
+      // source saved with originals off). File/URL sources restore the full workflow — view
+      // original, Redo, AI edit — which is the point of v2.
+      let source: BgItemSource = {
+        kind: 'archived',
+        label: typeof rec.origin === 'string' && rec.origin ? rec.origin : file.name,
+      };
+      const originalPath = typeof rec.originalPath === 'string' ? rec.originalPath : '';
+      const originalSlice = originalPath ? byName.get(originalPath) : undefined;
+      if (originalSlice) {
+        const fileName =
+          typeof rec.originalName === 'string' && rec.originalName
+            ? rec.originalName
+            : originalPath.slice(originalPath.lastIndexOf('/') + 1);
+        // File over the lazy slice — bytes are only read when the input is actually used.
+        source = { kind: 'file', file: new File([originalSlice], fileName, { type: mimeFromName(fileName) }) };
+      } else if (typeof rec.sourceUrl === 'string' && /^https?:\/\//i.test(rec.sourceUrl)) {
+        source = { kind: 'url', url: rec.sourceUrl };
+      }
+
+      if (!cutout && source.kind === 'archived') {
+        // Nothing restorable at all (no cutout, no input) — a dead row would only confuse.
+        continue;
       }
 
       items.push({
         name: typeof rec.name === 'string' && rec.name ? rec.name : 'restored',
-        source: {
-          kind: 'archived',
-          label: typeof rec.origin === 'string' && rec.origin ? rec.origin : file.name,
-        },
-        cutout: { blob, bounds: parseBounds(rec.bounds), width, height },
+        source,
+        cutout,
+        ...(typeof rec.tileFit === 'boolean' ? { tileFit: rec.tileFit } : null),
       });
     }
   }

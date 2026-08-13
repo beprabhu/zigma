@@ -12,6 +12,11 @@ export interface QueueItem {
   errorMsg?: string;
   resultImage: HTMLImageElement | null;
   compressed: { data: Uint8Array; inputSize: number } | null;
+  /**
+   * One-slot undo: the tile the last regenerate replaced. Only set when there WAS a previous
+   * result; overwritten by the next regenerate, cleared by undo.
+   */
+  prev?: { resultImage: HTMLImageElement };
 }
 
 export interface Keys {

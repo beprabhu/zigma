@@ -24,6 +24,11 @@ export interface GenItem {
    */
   sentPrompt?: string;
   durationMs?: number;
+  /**
+   * One-slot undo: the result the last regenerate replaced. Only set when there WAS a previous
+   * image; overwritten by the next regenerate, cleared by undo.
+   */
+  prev?: { image: HTMLImageElement; sentPrompt?: string; durationMs?: number };
 }
 
 /** Separates the brief from the row block. Visible in the preview, so it is part of the API. */
