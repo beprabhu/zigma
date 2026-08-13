@@ -522,7 +522,18 @@ function CompareView({
             className="grid h-64 place-items-center overflow-hidden rounded-lg border p-2"
             style={backdropStyle(background)}
           >
-            <CutoutImage itemId={item.id} cutout={item.cutout} max={560} className="max-h-full max-w-full" />
+            {item.cutout ? (
+              <CutoutImage itemId={item.id} cutout={item.cutout} max={560} className="max-h-full max-w-full" />
+            ) : (
+              // The dialog opens for unfinished items too, so this pane is legitimately empty
+              // for anything queued, cancelled, failed, or waiting for an AI edit's re-removal.
+              // Saying so beats a blank box that reads as a broken preview.
+              <p className="max-w-56 text-center text-xs text-balance text-muted-foreground">
+                {item.status === 'error'
+                  ? 'Background removal failed — Redo below to try again.'
+                  : 'No cutout yet — run Remove backgrounds to create one.'}
+              </p>
+            )}
           </div>
         </figure>
       </div>

@@ -2314,7 +2314,7 @@ const CutoutCell = React.memo(function CutoutCell({
   /** The item's own override (undefined = follows the global switch) — shown as a badge. */
   tileOverride: boolean | undefined;
   onSelect: (id: number) => void;
-  /** Clicking a finished result opens the same before/after view as a queue row. */
+  /** Clicking any result opens the same before/after view as a queue row, finished or not. */
   onCompare: (id: number) => void;
   onRemove: (id: number) => void;
   onToggleSelect: (id: number, shiftKey: boolean) => void;
@@ -2331,7 +2331,12 @@ const CutoutCell = React.memo(function CutoutCell({
       selectionActive={selectionActive}
       onSelect={() => {
         onSelect(item.id);
-        if (item.cutout) onCompare(item.id);
+        // Deliberately ungated on `cutout`: an AI edit clears the cutout until its re-removal
+        // lands, and that window can last indefinitely (deferred behind a batch, stopped,
+        // errored, or restored mid-flow). Gating here stranded exactly those images — the
+        // dialog is the only place Undo, the per-image prompt and Redo live, so the item
+        // people most need to inspect was the one they could not open.
+        onCompare(item.id);
       }}
       onToggleSelect={(shiftKey) => onToggleSelect(item.id, shiftKey)}
       onRemove={() => onRemove(item.id)}

@@ -69,6 +69,12 @@ interface ManifestItem {
   originalName?: string;
   /** v2: per-item tile-fit override (absent = follows the global switch). */
   tileFit?: boolean;
+  /**
+   * v2: the embedded original is an AI edit's output, not a dropped input. Autosave decides
+   * which file sources are worth persisting from this flag (lib/bg/autosave.ts recordOf), so
+   * losing it on a reopen quietly drops paid Azure bytes out of crash recovery.
+   */
+  regenerated?: boolean;
 }
 
 interface Manifest {
@@ -175,6 +181,12 @@ export async function saveProject(
       origin: originOf(item.source),
       ...(item.source.kind === 'url' ? { sourceUrl: item.source.url } : null),
       ...(originalPath ? { originalPath, originalName } : null),
+      // Only meaningful next to the bytes it describes: with originals off (or an unreadable
+      // blob skipped above) the source restores as 'archived', and a marker on a row the
+      // loader can never rebuild into a file source would just be a lie in the manifest.
+      ...(originalPath && item.source.kind === 'file' && item.source.regenerated
+        ? { regenerated: true }
+        : null),
       ...(item.tileFit !== undefined ? { tileFit: item.tileFit } : null),
     });
   }
@@ -297,7 +309,13 @@ export async function loadProject(file: File): Promise<RestoredProject> {
             ? rec.originalName
             : originalPath.slice(originalPath.lastIndexOf('/') + 1);
         // File over the lazy slice — bytes are only read when the input is actually used.
-        source = { kind: 'file', file: new File([originalSlice], fileName, { type: mimeFromName(fileName) }) };
+        source = {
+          kind: 'file',
+          file: new File([originalSlice], fileName, { type: mimeFromName(fileName) }),
+          // Carried back so a reopened AI edit keeps autosaving its bytes, and so anything
+          // that asks "is this AI output?" still gets the truth after a round trip.
+          ...(rec.regenerated === true ? { regenerated: true } : null),
+        };
       } else if (typeof rec.sourceUrl === 'string' && /^https?:\/\//i.test(rec.sourceUrl)) {
         source = { kind: 'url', url: rec.sourceUrl };
       }
