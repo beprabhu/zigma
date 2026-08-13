@@ -26,10 +26,14 @@ export function AppSidebar() {
   // Served in a browser there are no lights, so it keeps its normal size. The shell stamps
   // ZigmaShell into its UA for this; a bare 'Electron' check would also match Electron-based
   // browsers, which have an ordinary title bar and must not get the desktop treatment.
-  const [desktopShell, setDesktopShell] = React.useState(false);
-  React.useEffect(() => {
-    setDesktopShell(navigator.userAgent.includes('ZigmaShell'));
-  }, []);
+  // useSyncExternalStore, not state-in-effect: the UA never changes after load, and the
+  // server snapshot (false) keeps hydration clean — browser markup matches server markup
+  // until React takes over.
+  const desktopShell = React.useSyncExternalStore(
+    React.useCallback(() => () => {}, []),
+    () => navigator.userAgent.includes('ZigmaShell'),
+    () => false,
+  );
 
   return (
     <aside

@@ -2,13 +2,13 @@
 
 import * as React from 'react';
 import { toast } from 'sonner';
-import { ChevronDownIcon, DownloadIcon, ImageIcon, RefreshCwIcon } from 'lucide-react';
+import { CircleStopIcon, DownloadIcon, ImageIcon, RefreshCwIcon, SparklesIcon } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Hint } from '@/components/hint';
 import { Checkbox } from '@/components/ui/checkbox';
 import {
-  Collapsible, CollapsibleContent, CollapsibleTrigger,
-} from '@/components/ui/collapsible';
+  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
+} from '@/components/ui/dialog';
 import {
   Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle,
 } from '@/components/ui/empty';
@@ -20,7 +20,6 @@ import {
 } from '@/components/ui/select';
 import { Spinner } from '@/components/ui/spinner';
 import { Switch } from '@/components/ui/switch';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
 
 import { TemplateEditor } from '@/components/template-editor';
@@ -30,15 +29,21 @@ import { TileGrid, TileDialog } from '@/components/tile-grid';
 import { ClearAllButton, SelectionBar, useGridSelection } from '@/components/selection';
 import { Canvas, LeftPanel, PanelSection, RightPanel, StudioShell } from '@/components/pane-layout';
 import { useProcessing } from '@/components/process-panel';
+import { BudgetControls } from '@/components/budget-controls';
+import { MdFileIcon, MdFileTile } from '@/components/md-file-tile';
 
 import { DEFAULT_TEMPLATE, TileTemplate, tileToPngBlob } from '@/lib/tile';
+import {
+  CUSTOM_PRESET_ID, PRESET_TYPES, TILE_PRESETS as TEMPLATE_PRESETS, matchPreset,
+} from '@/lib/tile-presets';
 import { parseCSV, detectImageColumns, detectTitleColumn, detectOfferColumn, CsvRecord } from '@/lib/csv';
 import { buildZip, ZipFileEntry } from '@/lib/zip';
+import { CUSTOM_SKILL_ID, matchSkill, useSkills } from '@/lib/skills';
 import { loadImageFromUrl, callAzure, mockComposite } from '@/lib/pipeline';
 import {
   BG_MODELS, BG_MODEL_ORDER, DEFAULT_MODEL_ID, probeServerModel, removeBackground, type BgModelId,
 } from '@/lib/bg/engine';
-import { mapWithLimit, pickSave, saveTo } from '@/lib/bg/batch';
+import { isAbortError, mapWithLimit, pickSave, saveTo } from '@/lib/bg/batch';
 import { readParallel } from '@/lib/rate';
 import { describeBudget, fitToBudget, type BudgetResult } from '@/lib/bg/budget';
 import { isPng8Supported } from '@/lib/bg/png8';
@@ -65,6 +70,22 @@ function canvasToImage(canvas: HTMLCanvasElement): Promise<HTMLImageElement> {
 export default function Compositor() {
   // Template + defaults
   const [template, setTemplate] = usePersistedState<TileTemplate>('skuc_template', DEFAULT_TEMPLATE);
+  // Derived, never stored: the dropdown shows whichever preset the template currently equals,
+  // and flips to "Custom" the moment an edit diverges from all of them.
+  const presetId = React.useMemo(() => matchPreset(template), [template]);
+  const activePreset = TEMPLATE_PRESETS.find((p) => p.id === presetId);
+  // Ratio presets pin the Azure size so the returned image fills the container 1:1; anything
+  // else keeps 'auto' (the edits endpoint follows the input's aspect, cover-fit crops the rest).
+  const presetSize = activePreset?.azureSize;
+  function applyPreset(id: string) {
+    const preset = TEMPLATE_PRESETS.find((p) => p.id === id);
+    if (preset) setTemplate(structuredClone(preset.template));
+  }
+  // Type picks the family (first ratio applies); Ratio picks within it.
+  function applyType(type: string) {
+    const first = TEMPLATE_PRESETS.find((p) => p.type === type);
+    if (first) applyPreset(first.id);
+  }
   const [tplTitle, setTplTitle] = React.useState('Tile name');
   const [tplOffer, setTplOffer] = React.useState('20% OFF');
   const [offerVisible, setOfferVisible] = React.useState(true);
@@ -78,7 +99,12 @@ export default function Compositor() {
   const [budgetShrink, setBudgetShrink] = usePersistedState('skuc_bgBudgetShrink', true);
   const [numberFiles, setNumberFiles] = usePersistedState('skuc_coNumberFiles', true);
   const [prompt, setPrompt] = usePersistedState('skuc_prompt', DEFAULT_PROMPT);
-  const [promptOpen, setPromptOpen] = React.useState(false);
+  const [promptEditorOpen, setPromptEditorOpen] = React.useState(false);
+  // Prompt is skill-driven, preset-style: the dropdown derives which skill the current text
+  // equals; editing the text flips it to Custom without losing anything.
+  const { skills } = useSkills();
+  const skillId = matchSkill(prompt, skills);
+  const activeSkill = skills.find((sk) => sk.id === skillId);
 
   // Background removal
   const [removeBg, setRemoveBg] = usePersistedState('skuc_removeBg', false);
@@ -131,6 +157,10 @@ export default function Compositor() {
   // Post-await reads (undo eligibility, toast actions) need the LIVE queue, not the closure.
   const itemsRef = React.useRef<QueueItem[]>(items);
   React.useEffect(() => { itemsRef.current = items; }, [items]);
+
+  // Stop button: one controller per run; aborting skips rows not yet started and cancels the
+  // in-flight fetches (the proxy forwards the abort to Azure).
+  const genAbortRef = React.useRef<AbortController | null>(null);
 
   const canvases = React.useRef(new Map<number, HTMLCanvasElement>());
   const registerCanvas = React.useCallback((id: number, canvas: HTMLCanvasElement | null) => {
@@ -207,17 +237,17 @@ export default function Compositor() {
     setItems((prev) => prev.map((it) => (it.id === id ? { ...it, ...patch } : it)));
   }
 
-  async function generateItem(item: QueueItem) {
+  async function generateItem(item: QueueItem, signal?: AbortSignal) {
     patchItem(item.id, { status: 'fetching', errorMsg: undefined });
     const images: HTMLImageElement[] = [];
-    for (const u of item.urls) images.push(await loadImageFromUrl(u));
+    for (const u of item.urls) images.push(await loadImageFromUrl(u, signal));
     patchItem(item.id, { status: 'generating' });
     let resultImage: HTMLImageElement;
     if (mock) {
       await new Promise((r) => setTimeout(r, 600));
       resultImage = await mockComposite(images);
     } else {
-      resultImage = await callAzure(images, { endpoint, apiKey: azureKey, prompt });
+      resultImage = await callAzure(images, { endpoint, apiKey: azureKey, prompt, size: presetSize, signal });
     }
     if (removeBg) {
       patchItem(item.id, { status: 'removing-bg' });
@@ -268,6 +298,8 @@ export default function Compositor() {
   /** One run over `todo` — Generate-all and Regenerate-selected share everything but the verb. */
   async function runTiles(todo: QueueItem[], verb: string) {
     if (!todo.length) return;
+    const controller = new AbortController();
+    genAbortRef.current = controller;
     setRunning(true);
     // Requests in flight at once: the Azure round trip dominates a tile's wall-clock, so
     // overlapping the waits is where a batch gets its speed. Suite-wide, from Settings →
@@ -277,11 +309,21 @@ export default function Compositor() {
     let finished = 0;
     setProgress({ pct: 0, text: `0 of ${todo.length} tiles — ${limit} at a time with ${mock ? 'mock' : 'azure'}…` });
     await mapWithLimit(todo, limit, async (item) => {
+      // Stop skips everything not yet started; rows already in flight abort via the signal.
+      if (controller.signal.aborted) {
+        finished++;
+        return;
+      }
       try {
-        await generateItem(item);
+        await generateItem(item, controller.signal);
         done++;
       } catch (e) {
-        patchItem(item.id, { status: 'error', errorMsg: (e as Error).message });
+        if (isAbortError(e)) {
+          // Stopped, not failed: the row goes back exactly where it was before this run.
+          patchItem(item.id, { status: item.status, errorMsg: undefined });
+        } else {
+          patchItem(item.id, { status: 'error', errorMsg: (e as Error).message });
+        }
       }
       finished++;
       setProgress({
@@ -289,7 +331,12 @@ export default function Compositor() {
         text: `${finished} of ${todo.length} tiles — ${limit} at a time with ${mock ? 'mock' : 'azure'}…`,
       });
     });
-    setProgress({ pct: 100, text: `Done — ${done} of ${todo.length} tiles ${verb}.` });
+    setProgress(
+      controller.signal.aborted
+        ? { pct: 100, text: `Stopped — ${done} of ${todo.length} tiles ${verb}; the rest are untouched.` }
+        : { pct: 100, text: `Done — ${done} of ${todo.length} tiles ${verb}.` },
+    );
+    genAbortRef.current = null;
     setRunning(false);
   }
 
@@ -344,15 +391,23 @@ export default function Compositor() {
 
   async function handleRegenerate(item: QueueItem) {
     if (running) return;
+    const controller = new AbortController();
+    genAbortRef.current = controller;
     setRunning(true);
     setProgress({ pct: 50, text: `Regenerating row ${item.id + 1}…` });
     try {
-      await generateItem(item);
+      await generateItem(item, controller.signal);
       setProgress({ pct: 100, text: `Row ${item.id + 1} regenerated.` });
     } catch (e) {
-      patchItem(item.id, { status: 'error', errorMsg: (e as Error).message });
-      setProgress({ pct: 100, text: `Row ${item.id + 1} failed: ${(e as Error).message}` });
+      if (isAbortError(e)) {
+        patchItem(item.id, { status: item.status, errorMsg: undefined });
+        setProgress({ pct: 100, text: `Row ${item.id + 1} — stopped.` });
+      } else {
+        patchItem(item.id, { status: 'error', errorMsg: (e as Error).message });
+        setProgress({ pct: 100, text: `Row ${item.id + 1} failed: ${(e as Error).message}` });
+      }
     }
+    genAbortRef.current = null;
     setRunning(false);
   }
 
@@ -515,7 +570,7 @@ export default function Compositor() {
               name={sessionName}
               onNameChange={setSessionName}
               placeholder="Untitled batch"
-              product="Banners"
+              product="Compose"
               chips={
                 [
                   records.length > 0 && { label: `${records.length} row${records.length === 1 ? '' : 's'}` },
@@ -525,21 +580,74 @@ export default function Compositor() {
             />
           }
           footer={
-            <Button className="w-full" disabled={!canGenerate || running} onClick={handleGenerateAll}>
-              {running && <Spinner data-icon="inline-start" />}
-              Generate &amp; Populate
-            </Button>
+            <div className="flex gap-2">
+              <Button className="flex-1" disabled={!canGenerate || running} onClick={handleGenerateAll}>
+                {running ? <Spinner data-icon="inline-start" /> : <SparklesIcon data-icon="inline-start" />}
+                Generate &amp; Populate
+              </Button>
+              {running && (
+                <Button variant="outline" onClick={() => genAbortRef.current?.abort()}>
+                  <CircleStopIcon data-icon="inline-start" />
+                  Stop
+                </Button>
+              )}
+            </div>
           }
         >
           <PanelSection title="Template" hint="Click a layer in the preview to edit it." className="space-y-4">
+              <FieldGroup className="grid grid-cols-2 gap-3">
+                <Field>
+                  <FieldLabel htmlFor="tpl-preset-type">Preset</FieldLabel>
+                  <Select
+                    value={activePreset?.type ?? CUSTOM_PRESET_ID}
+                    onValueChange={(v) => applyType(String(v ?? ''))}
+                  >
+                    <SelectTrigger id="tpl-preset-type">
+                      <SelectValue>
+                        {(v) =>
+                          PRESET_TYPES.find((t) => t.id === v)?.label ??
+                          (v === CUSTOM_PRESET_ID ? 'Custom' : 'Type')
+                        }
+                      </SelectValue>
+                    </SelectTrigger>
+                    <SelectContent alignItemWithTrigger={false} sideOffset={4}>
+                      {PRESET_TYPES.map((t) => (
+                        <SelectItem key={t.id} value={t.id}>{t.label}</SelectItem>
+                      ))}
+                      {/* Indicator, not an action: it becomes selected by editing, not by picking. */}
+                      <SelectItem value={CUSTOM_PRESET_ID} disabled={presetId !== CUSTOM_PRESET_ID}>
+                        Custom
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                </Field>
+                {activePreset && (
+                  <Field>
+                    <FieldLabel htmlFor="tpl-preset-ratio">Ratio</FieldLabel>
+                    <Select value={presetId} onValueChange={(v) => applyPreset(String(v ?? ''))}>
+                      <SelectTrigger id="tpl-preset-ratio">
+                        <SelectValue>
+                          {(v) => TEMPLATE_PRESETS.find((p) => p.id === v)?.ratio ?? 'Ratio'}
+                        </SelectValue>
+                      </SelectTrigger>
+                      <SelectContent alignItemWithTrigger={false} sideOffset={4}>
+                        {TEMPLATE_PRESETS.filter((p) => p.type === activePreset.type).map((p) => (
+                          <SelectItem key={p.id} value={p.id}>{p.ratio}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                )}
+              </FieldGroup>
               <TemplateEditor
                 template={template}
                 onChange={handleTemplateChange}
-                onReset={() => handleTemplateChange(structuredClone(DEFAULT_TEMPLATE))}
                 previewTitle={tplTitle}
                 previewOffer={tplOffer}
                 previewOfferVisible={offerVisible}
+                minimal={presetSize !== undefined}
               >
+                {presetSize !== undefined ? null : (
                 <FieldGroup className="grid grid-cols-2 gap-3">
                   <Field>
                     <FieldLabel htmlFor="tpl-title">Tile name</FieldLabel>
@@ -566,6 +674,7 @@ export default function Compositor() {
                     />
                   </Field>
                 </FieldGroup>
+                )}
               </TemplateEditor>
             </PanelSection>
           <PanelSection title="CSV file">
@@ -573,142 +682,99 @@ export default function Compositor() {
             </PanelSection>
 
           {headers.length > 0 && (
-            <PanelSection title="Settings">
-                <Tabs defaultValue="auto">
-                  <TabsList>
-                    <TabsTrigger value="auto">Auto</TabsTrigger>
-                    <TabsTrigger value="custom">Custom</TabsTrigger>
-                  </TabsList>
-                  <TabsContent value="auto" className="text-xs text-muted-foreground">
-                    Image columns: <strong className="text-foreground">{imageCols.join(', ') || 'none detected'}</strong>
-                    <br />
-                    Title column: <strong className="text-foreground">{titleCol || 'none'}</strong>
-                    {' · '}
-                    Offer column: <strong className="text-foreground">{offerCol || 'none'}</strong>
-                  </TabsContent>
-                  <TabsContent value="custom">
-                    <FieldGroup className="gap-4">
-                      <Field>
-                        <FieldLabel>Image URL columns</FieldLabel>
-                        {headers.map((h) => (
-                          <Field key={h} orientation="horizontal">
-                            <Checkbox
-                              id={`col-${h}`}
-                              checked={imageCols.includes(h)}
-                              onCheckedChange={(c) => updateMapping({
-                                imageCols: c === true
-                                  ? [...imageCols, h]
-                                  : imageCols.filter((x) => x !== h),
-                              })}
-                            />
-                            <FieldLabel htmlFor={`col-${h}`} className="font-normal">{h}</FieldLabel>
-                          </Field>
-                        ))}
+            <PanelSection title={`Columns — ${fileName ?? ''}`}>
+                <FieldGroup className="gap-4">
+                  <Field>
+                    <FieldLabel>Image URL columns</FieldLabel>
+                    {headers.map((h) => (
+                      <Field key={h} orientation="horizontal">
+                        <Checkbox
+                          id={`col-${h}`}
+                          checked={imageCols.includes(h)}
+                          onCheckedChange={(c) => updateMapping({
+                            imageCols: c === true
+                              ? [...imageCols, h]
+                              : imageCols.filter((x) => x !== h),
+                          })}
+                        />
+                        <FieldLabel htmlFor={`col-${h}`} className="font-normal">{h}</FieldLabel>
                       </Field>
-                      <Field>
-                        <FieldLabel htmlFor="title-col">Title column</FieldLabel>
-                        <Select
-                          value={titleCol || NONE}
-                          onValueChange={(v) => updateMapping({ titleCol: v === NONE ? '' : String(v ?? '') })}
-                        >
-                          {/* Select.Value renders the raw value, so the sentinel needs a label. */}
-                          <SelectTrigger id="title-col" className="w-full">
-                            <SelectValue>{(v) => (v && v !== NONE ? String(v) : '(none)')}</SelectValue>
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value={NONE}>(none)</SelectItem>
-                            {headers.map((h) => <SelectItem key={h} value={h}>{h}</SelectItem>)}
-                          </SelectContent>
-                        </Select>
-                      </Field>
-                      <Field>
-                        <FieldLabel htmlFor="offer-col">Offer / discount column</FieldLabel>
-                        <Select
-                          value={offerCol || NONE}
-                          onValueChange={(v) => updateMapping({ offerCol: v === NONE ? '' : String(v ?? '') })}
-                        >
-                          <SelectTrigger id="offer-col" className="w-full">
-                            <SelectValue>{(v) => (v && v !== NONE ? String(v) : '(none)')}</SelectValue>
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value={NONE}>(none)</SelectItem>
-                            {headers.map((h) => <SelectItem key={h} value={h}>{h}</SelectItem>)}
-                          </SelectContent>
-                        </Select>
-                      </Field>
-                    </FieldGroup>
-                  </TabsContent>
-                </Tabs>
+                    ))}
+                    <FieldDescription>
+                      Auto-detected on drop; each ticked column contributes one product image
+                      per row.
+                    </FieldDescription>
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor="title-col">Title column</FieldLabel>
+                    <Select
+                      value={titleCol || NONE}
+                      onValueChange={(v) => updateMapping({ titleCol: v === NONE ? '' : String(v ?? '') })}
+                    >
+                      {/* Select.Value renders the raw value, so the sentinel needs a label. */}
+                      <SelectTrigger id="title-col" className="w-full">
+                        <SelectValue>{(v) => (v && v !== NONE ? String(v) : '(none)')}</SelectValue>
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value={NONE}>(none)</SelectItem>
+                        {headers.map((h) => <SelectItem key={h} value={h}>{h}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor="offer-col">Offer / discount column</FieldLabel>
+                    <Select
+                      value={offerCol || NONE}
+                      onValueChange={(v) => updateMapping({ offerCol: v === NONE ? '' : String(v ?? '') })}
+                    >
+                      <SelectTrigger id="offer-col" className="w-full">
+                        <SelectValue>{(v) => (v && v !== NONE ? String(v) : '(none)')}</SelectValue>
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value={NONE}>(none)</SelectItem>
+                        {headers.map((h) => <SelectItem key={h} value={h}>{h}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                </FieldGroup>
               </PanelSection>
           )}
 
-          {/* Prompt is tuned rarely — collapsed by default. */}
-          <PanelSection>
-              <Collapsible open={promptOpen} onOpenChange={setPromptOpen}>
-                <CollapsibleTrigger className="group flex w-full items-center justify-between text-left">
-                  <span className="text-sm font-medium">Prompt</span>
-                  <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                    {promptOpen ? 'Hide' : 'Edit'}
-                    <ChevronDownIcon className="size-4 transition-transform group-aria-expanded:rotate-180" />
-                  </span>
-                </CollapsibleTrigger>
-                <CollapsibleContent>
-                  <Textarea
-                    className="mt-3"
-                    rows={7}
-                    value={prompt}
-                    onChange={(e) => setPrompt(e.target.value)}
-                  />
-                </CollapsibleContent>
-              </Collapsible>
-            </PanelSection>
-
-          <PanelSection title="Background">
-              <FieldGroup className="gap-4">
-                <Field orientation="horizontal">
-                  <Checkbox
-                    id="remove-bg"
-                    checked={removeBg}
-                    onCheckedChange={(c) => setRemoveBg(c === true)}
-                  />
-                  <FieldLabel htmlFor="remove-bg" className="font-normal">
-                    Remove background from generated tiles
-                  </FieldLabel>
-                </Field>
-                <Field>
-                  <FieldLabel htmlFor="bg-model">Model</FieldLabel>
-                  <Select
-                    value={activeModel}
-                    onValueChange={(v) => {
-                      const id = String(v ?? '') as BgModelId;
-                      if (BG_MODELS[id]) setBgModel(id);
-                    }}
-                  >
-                    {/* Select.Value renders the raw value unless it is told how to label it. */}
-                    <SelectTrigger id="bg-model" className="w-full" disabled={!removeBg}>
-                      <SelectValue>
-                        {(value) => BG_MODELS[value as BgModelId]?.label ?? 'Choose a model'}
-                      </SelectValue>
-                    </SelectTrigger>
-                    <SelectContent>
-                      {BG_MODEL_ORDER.map((id) => {
-                        const offline = BG_MODELS[id].server === true && bgServerUp !== true;
-                        return (
-                          <SelectItem key={id} value={id} disabled={offline}>
-                            {BG_MODELS[id].label}{offline ? ' — server offline' : ''}
-                          </SelectItem>
-                        );
-                      })}
-                    </SelectContent>
-                  </Select>
-                  <FieldDescription>
-                    {serverBlocked
-                      ? `${BG_MODELS[knownModel].label} needs its local sidecar — using ${BG_MODELS[activeModel].label} until it answers.`
-                      : BG_MODELS[activeModel].description}
-                  </FieldDescription>
-                </Field>
+          <PanelSection title="Prompt" hint="What the composite model is told to do. Skills are managed in Settings.">
+              <FieldGroup className="gap-3">
+                <Select
+                  value={skillId}
+                  onValueChange={(v) => {
+                    const skill = skills.find((sk) => sk.id === v);
+                    if (skill) setPrompt(skill.content);
+                  }}
+                >
+                  <SelectTrigger aria-label="Prompt skill">
+                    <SelectValue>
+                      {(v) => skills.find((sk) => sk.id === v)?.name ?? 'Custom'}
+                    </SelectValue>
+                  </SelectTrigger>
+                  <SelectContent alignItemWithTrigger={false} sideOffset={4}>
+                    {skills.map((sk) => (
+                      <SelectItem key={sk.id} value={sk.id}>{sk.name}</SelectItem>
+                    ))}
+                    {/* Indicator, not an action: it becomes selected by editing the prompt. */}
+                    <SelectItem value={CUSTOM_SKILL_ID} disabled={skillId !== CUSTOM_SKILL_ID}>
+                      Custom
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+                <MdFileTile
+                  name={activeSkill?.name ?? 'custom-prompt.md'}
+                  text={prompt}
+                  badge={activeSkill ? (activeSkill.builtin ? 'Skill' : 'Custom skill') : 'Edited'}
+                  onClick={() => setPromptEditorOpen(true)}
+                  disabled={running}
+                />
               </FieldGroup>
             </PanelSection>
+
+          {/* Background removal moved to the right pane, with the other processing steps. */}
 
           {/* Parallel requests moved to Settings → Image model — suite-wide (lib/rate.ts). */}
 
@@ -813,6 +879,53 @@ export default function Compositor() {
             </div>
           }
         >
+          <PanelSection
+            title="Remove background"
+            hint="Runs Cleanup's model on each tile right after Azure returns it. Weights download once and are shared with that product."
+            action={
+              <Switch
+                aria-label="Remove background"
+                checked={removeBg}
+                disabled={running}
+                onCheckedChange={(checked) => setRemoveBg(checked === true)}
+              />
+            }
+          >
+            {removeBg ? (
+              <Field>
+                <FieldLabel htmlFor="bg-model">Model</FieldLabel>
+                <Select
+                  value={activeModel}
+                  onValueChange={(v) => {
+                    const id = String(v ?? '') as BgModelId;
+                    if (BG_MODELS[id]) setBgModel(id);
+                  }}
+                >
+                  {/* Select.Value renders the raw value unless it is told how to label it. */}
+                  <SelectTrigger id="bg-model" className="w-full" disabled={running}>
+                    <SelectValue>
+                      {(value) => BG_MODELS[value as BgModelId]?.label ?? 'Choose a model'}
+                    </SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {BG_MODEL_ORDER.map((id) => {
+                      const offline = BG_MODELS[id].server === true && bgServerUp !== true;
+                      return (
+                        <SelectItem key={id} value={id} disabled={offline}>
+                          {BG_MODELS[id].label}{offline ? ' — server offline' : ''}
+                        </SelectItem>
+                      );
+                    })}
+                  </SelectContent>
+                </Select>
+                <FieldDescription>
+                  {serverBlocked
+                    ? `${BG_MODELS[knownModel].label} needs its local sidecar — using ${BG_MODELS[activeModel].label} until it answers.`
+                    : BG_MODELS[activeModel].description}
+                </FieldDescription>
+              </Field>
+            ) : undefined}
+          </PanelSection>
           {proc.panel}
           <PanelSection>
           <FieldGroup className="gap-4">
@@ -844,56 +957,19 @@ export default function Compositor() {
                       </div>
                     </Field>
 
-                    <Field orientation="horizontal">
-                      <Switch
-                        id="co-budget-on"
-                        checked={budgetOn}
-                        disabled={running || !png8Ready}
-                        onCheckedChange={(checked) => setBudgetOn(checked === true)}
-                        className="mt-0.5"
-                      />
-                      <FieldContent>
-                        <FieldLabel htmlFor="co-budget-on" className="font-normal">
-                          <Hint hint="Colours go first — full colour, then a 256 · 128 · 64 · 32 palette — and the export stops at the first step that fits. Shared setting with Cleanup.">Limit file size</Hint>
-                        </FieldLabel>
-                        {!png8Ready && (
-                          <FieldDescription>
-                            Not available: this browser lacks CompressionStream.
-                          </FieldDescription>
-                        )}
-                      </FieldContent>
-                    </Field>
-                    {budgetActive && (
-                      <>
-                        <Field>
-                          <FieldLabel htmlFor="co-budget-kb">Max KB per file</FieldLabel>
-                          <Input
-                            id="co-budget-kb"
-                            type="number"
-                            min={50}
-                            step={50}
-                            className="w-28"
-                            value={budgetKb}
-                            disabled={running}
-                            onChange={(e) => setBudgetKb(Number(e.target.value))}
-                            onBlur={() => setBudgetKb(budgetKbSafe)}
-                          />
-                        </Field>
-                        <Field orientation="horizontal">
-                          <Checkbox
-                            id="co-budget-shrink"
-                            checked={budgetShrink}
-                            disabled={running}
-                            onCheckedChange={(checked) => setBudgetShrink(checked === true)}
-                          />
-                          <FieldContent>
-                            <FieldLabel htmlFor="co-budget-shrink" className="font-normal">
-                              <Hint hint="Last resort, only when no palette fits — the export report names every tile this touches.">Shrink dimensions if needed</Hint>
-                            </FieldLabel>
-                          </FieldContent>
-                        </Field>
-                      </>
-                    )}
+                    <BudgetControls
+                      idPrefix="co"
+                      on={budgetOn}
+                      onOnChange={setBudgetOn}
+                      kb={budgetKb}
+                      onKbChange={setBudgetKb}
+                      kbSafe={budgetKbSafe}
+                      shrink={budgetShrink}
+                      onShrinkChange={setBudgetShrink}
+                      disabled={running}
+                      available={png8Ready}
+                      limitHintSuffix="Shared setting with Cleanup."
+                    />
 
                     <Field orientation="horizontal">
                       <Checkbox
@@ -918,6 +994,38 @@ export default function Compositor() {
           </PanelSection>
         </RightPanel>
       </StudioShell>
+
+      {/* Prompt editor — same .md-tile-opens-modal pattern as Cleanup's AI-edit prompt. */}
+      <Dialog open={promptEditorOpen} onOpenChange={setPromptEditorOpen}>
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <MdFileIcon className="size-4 text-muted-foreground" />
+              {activeSkill?.name ?? 'custom-prompt.md'}
+            </DialogTitle>
+            <DialogDescription>
+              The instruction sent with every composite. Editing detaches it from the selected
+              skill; save reusable versions from Settings → Skills.
+            </DialogDescription>
+          </DialogHeader>
+          <Textarea
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            rows={16}
+            disabled={running}
+            aria-label="Composite prompt"
+            className="max-h-[55dvh] min-h-40 overflow-y-auto text-xs"
+          />
+          <DialogFooter>
+            {prompt.trim() !== DEFAULT_PROMPT.trim() && (
+              <Button variant="ghost" disabled={running} onClick={() => setPrompt(DEFAULT_PROMPT)}>
+                Reset to default
+              </Button>
+            )}
+            <Button onClick={() => setPromptEditorOpen(false)}>Done</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <TileDialog
         item={openItem}

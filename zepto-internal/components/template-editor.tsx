@@ -13,11 +13,6 @@ import { Separator } from '@/components/ui/separator';
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
-import {
-  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
-  AlertDialogDescription, AlertDialogFooter, AlertDialogHeader,
-  AlertDialogTitle, AlertDialogTrigger,
-} from '@/components/ui/alert-dialog';
 import { cn } from '@/lib/utils';
 import {
   TileTemplate, LayerName, ContentLayerName,
@@ -85,16 +80,20 @@ const LAYER_PROPS: Record<LayerName, PropDef[]> = {
 interface TemplateEditorProps {
   template: TileTemplate;
   onChange: (tpl: TileTemplate) => void;
-  onReset: () => void;
   previewTitle: string;
   previewOffer: string;
   previewOfferVisible: boolean;
+  /**
+   * Preview-only: no layers panel, no inspector, no layer picking. For the image-container
+   * presets, where the whole template IS one full-bleed image and there is nothing to edit.
+   */
+  minimal?: boolean;
   /** Rendered between the preview and the layers panel (tile text fields). */
   children?: React.ReactNode;
 }
 
 export function TemplateEditor({
-  template, onChange, onReset, previewTitle, previewOffer, previewOfferVisible, children,
+  template, onChange, previewTitle, previewOffer, previewOfferVisible, minimal = false, children,
 }: TemplateEditorProps) {
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
   const [selected, setSelected] = React.useState<LayerName>('frame');
@@ -107,8 +106,8 @@ export function TemplateEditor({
       title: previewTitle, offerText: previewOffer,
       offerVisible: previewOfferVisible, image: null,
     }, template);
-    drawSelectionOutline(canvas, template, selected);
-  }, [template, selected, previewTitle, previewOffer, previewOfferVisible, fontsReady]);
+    if (!minimal) drawSelectionOutline(canvas, template, selected);
+  }, [template, selected, previewTitle, previewOffer, previewOfferVisible, fontsReady, minimal]);
 
   function handleCanvasClick(e: React.MouseEvent<HTMLCanvasElement>) {
     const rect = e.currentTarget.getBoundingClientRect();
@@ -140,36 +139,14 @@ export function TemplateEditor({
 
   return (
     <div className="space-y-3">
-      {/* Live preview gets the full pane width — this pane's job is seeing the tile. */}
+      {/* Live preview gets the full pane width — this pane's job is seeing the tile.
+          No Reset control: the preset dropdown above supersedes it (pick "SKU tile"). */}
       <div className="relative flex justify-center rounded-lg bg-muted/50 p-4">
-        <AlertDialog>
-          <AlertDialogTrigger
-            render={
-              <Button variant="ghost" size="sm" className="absolute top-1.5 right-1.5 text-muted-foreground">
-                Reset
-              </Button>
-            }
-          />
-          <AlertDialogContent>
-            <AlertDialogHeader>
-              <AlertDialogTitle>Reset template?</AlertDialogTitle>
-              <AlertDialogDescription>
-                This restores the default design. Your template edits will be lost.
-              </AlertDialogDescription>
-            </AlertDialogHeader>
-            <AlertDialogFooter>
-              <AlertDialogCancel>Cancel</AlertDialogCancel>
-              <AlertDialogAction onClick={() => { onReset(); setSelected('frame'); }}>
-                Reset
-              </AlertDialogAction>
-            </AlertDialogFooter>
-          </AlertDialogContent>
-        </AlertDialog>
         {/* No CSS corner rounding — the frame's own radius must be the only rounding visible. */}
         <canvas
           ref={canvasRef}
-          onClick={handleCanvasClick}
-          className="w-[240px] max-w-full cursor-pointer"
+          onClick={minimal ? undefined : handleCanvasClick}
+          className={cn('w-[240px] max-w-full', !minimal && 'cursor-pointer')}
           style={{
             background: 'repeating-conic-gradient(oklch(0.96 0 0) 0% 25%, #fff 0% 50%) 0 0 / 16px 16px',
             height: Math.round((240 * template.frame.height) / template.frame.width),
@@ -181,6 +158,7 @@ export function TemplateEditor({
       {children}
 
       {/* Two columns like Figma: layers panel left, inspector right. */}
+      {!minimal && (
       <div className="flex gap-4">
         {/* Layers panel — flat rows, controls surface on hover. */}
         <div className="h-fit w-[148px] shrink-0 overflow-hidden rounded-lg border">
@@ -304,6 +282,7 @@ export function TemplateEditor({
           </div>
         </div>
       </div>
+      )}
     </div>
   );
 }

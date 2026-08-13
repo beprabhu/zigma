@@ -13,14 +13,14 @@ export interface Product {
 export const PRODUCTS: Product[] = [
   {
     slug: 'compositor',
-    name: 'Banners',
+    name: 'Compose',
     description: 'Turn a CSV of product image URLs into branded composite tiles.',
     icon: LayersIcon,
   },
   {
     slug: 'bg-remover',
     name: 'Cleanup',
-    description: 'Strip backgrounds from product shots, entirely in the browser.',
+    description: 'Strip backgrounds from product shots.',
     icon: EraserIcon,
   },
   {

@@ -6,7 +6,7 @@
 // Products already cap CONCURRENCY (parallel lanes via mapWithLimit), but lanes say nothing
 // about rate: 6 lanes of fast edits can still trip a deployment's RPM limit. This gate sits in
 // lib/pipeline's callAzure/callAzureGenerate — the choke point every Azure image call goes
-// through — so one number covers Banners, Cleanup, BG Remover AI fixes and Generate together.
+// through — so one number covers Compose, Cleanup, BG Remover AI fixes and Generate together.
 //
 // Sliding window over request-start times. 0 (the default) means no throttle, which is the
 // pre-setting behavior. The value is re-read on every acquire, so changing it in Settings

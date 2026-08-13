@@ -7,7 +7,7 @@
 import * as React from 'react';
 import { toast } from 'sonner';
 import {
-  DownloadIcon, FileArchiveIcon, ImagesIcon, RotateCcwIcon, ShrinkIcon, Trash2Icon,
+  CircleStopIcon, DownloadIcon, ImagesIcon, RotateCcwIcon, ShrinkIcon, Trash2Icon,
   TriangleAlertIcon, UploadCloudIcon,
 } from 'lucide-react';
 
@@ -28,8 +28,9 @@ import { Spinner } from '@/components/ui/spinner';
 import { Switch } from '@/components/ui/switch';
 
 import { Canvas, PanelSection, RightPanel, StudioShell } from '@/components/pane-layout';
+import { ClearAllButton } from '@/components/selection';
+import { DropzoneShell } from '@/components/dropzone';
 import { SessionHeader, type SessionChip } from '@/components/session-header';
-import { cn } from '@/lib/utils';
 import { buildZip, type ZipFileEntry } from '@/lib/zip';
 import { canvasToPngBlob, formatKb, loadImageFromFile, mapWithLimit, releaseCanvas } from '@/lib/bg/batch';
 import { compressPng } from '@/lib/compress';
@@ -74,8 +75,7 @@ export default function PngCompressorPage() {
   const [colors, setColors] = React.useState<number>(256);
   const [lossless, setLossless] = React.useState(false);
   const [running, setRunning] = React.useState(false);
-  const [dragOver, setDragOver] = React.useState(false);
-  const fileInputRef = React.useRef<HTMLInputElement>(null);
+  const [progress, setProgress] = React.useState<{ pct: number; text: string } | null>(null);
   const abortRef = React.useRef<AbortController | null>(null);
 
   const proc = useProcessing({ prefix: 'skuc_png', removeBg: true, tileFit: true, compress: false, busy: running });
@@ -157,9 +157,23 @@ export default function PngCompressorPage() {
     const controller = new AbortController();
     abortRef.current = controller;
     setRunning(true);
+    let finished = 0;
+    setProgress({ pct: 0, text: `0 of ${pending.length} compressed…` });
     try {
-      await mapWithLimit(pending, 3, (item) => compressOne(item, controller.signal));
+      await mapWithLimit(pending, 3, async (item) => {
+        await compressOne(item, controller.signal);
+        finished++;
+        setProgress({
+          pct: (finished / pending.length) * 100,
+          text: `${finished} of ${pending.length} compressed…`,
+        });
+      });
     } finally {
+      setProgress(
+        controller.signal.aborted
+          ? { pct: 100, text: `Stopped — ${finished} of ${pending.length} compressed; the rest are untouched.` }
+          : { pct: 100, text: `Done — ${finished} of ${pending.length} files compressed.` },
+      );
       setRunning(false);
       abortRef.current = null;
     }
@@ -193,36 +207,15 @@ export default function PngCompressorPage() {
       <StudioShell>
         <Canvas>
           <div className="mx-auto flex max-w-4xl flex-col gap-4">
-          <div
-            role="button"
-            tabIndex={0}
-            onClick={() => fileInputRef.current?.click()}
-            onKeyDown={(e) => e.key === 'Enter' && fileInputRef.current?.click()}
-            onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-            onDragLeave={() => setDragOver(false)}
-            onDrop={(e) => { e.preventDefault(); setDragOver(false); addFiles(e.dataTransfer.files); }}
-            className={cn(
-              'flex cursor-pointer flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed p-8 text-center transition-colors',
-              dragOver ? 'border-primary bg-primary/5' : 'border-muted-foreground/25 hover:border-muted-foreground/50',
-            )}
-          >
-            <UploadCloudIcon className="size-8 text-muted-foreground" />
-            <p className="text-sm font-medium">Drop PNGs here, click to browse, or paste</p>
-            <p className="text-xs text-muted-foreground">
+          <DropzoneShell accept="image/png" multiple onFiles={(files) => addFiles(files)}>
+            <UploadCloudIcon className="size-6" />
+            <span className="font-medium text-foreground">
+              Drop PNGs here, <u className="font-normal text-primary">browse</u>, or paste
+            </span>
+            <span className="text-xs">
               {items.length ? `${items.length} file${items.length === 1 ? '' : 's'} in queue` : 'PNG files only'}
-            </p>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="image/png"
-              multiple
-              className="hidden"
-              onChange={(e) => {
-                if (e.target.files) addFiles(e.target.files);
-                e.target.value = '';
-              }}
-            />
-          </div>
+            </span>
+          </DropzoneShell>
 
           {!items.length ? (
             <Empty className="flex-1">
@@ -232,11 +225,32 @@ export default function PngCompressorPage() {
                 </EmptyMedia>
                 <EmptyTitle>No PNGs yet</EmptyTitle>
                 <EmptyDescription>
-                  Add files above — compression runs entirely on this machine.
+                  Add files above — every PNG becomes a queue row.
                 </EmptyDescription>
               </EmptyHeader>
             </Empty>
           ) : (
+            <>
+              {/* Grid toolbar: count on the left, whole-queue reset on the right — the same
+                  confirm-guarded idiom as Compose, Cleanup and Generate. */}
+              <div className="-mb-2 flex items-center justify-between gap-2">
+                <span className="text-xs text-muted-foreground">
+                  {items.length} file{items.length === 1 ? '' : 's'}
+                  {doneCount ? ` · ${doneCount} compressed` : ''}
+                </span>
+                <ClearAllButton
+                  title="Clear the queue?"
+                  disabled={running}
+                  onConfirm={() => setItems([])}
+                  description={
+                    <>
+                      Removes all {items.length} file{items.length === 1 ? '' : 's'}, including
+                      compressed results that haven&rsquo;t been exported. Your source files on
+                      disk are untouched.
+                    </>
+                  }
+                />
+              </div>
             <ul className="flex flex-col gap-2">
               {items.map((it) => (
                 <li
@@ -306,6 +320,7 @@ export default function PngCompressorPage() {
                 </li>
               ))}
             </ul>
+            </>
           )}
           </div>
         </Canvas>
@@ -329,22 +344,27 @@ export default function PngCompressorPage() {
           }
           footer={
             <div className="flex flex-col gap-2">
-              {items.length > 0 && (
-                <Button variant="ghost" size="sm" onClick={() => setItems([])} disabled={running}>
-                  <Trash2Icon /> Clear queue
-                </Button>
-              )}
+              {/* No children: the Progress root renders its own track+indicator. */}
+              {progress && <Progress value={progress.pct} />}
+              <p className="text-xs break-words text-muted-foreground">
+                {progress?.text || 'Compressed PNGs export as a ZIP.'}
+              </p>
               <Button onClick={compressAll} disabled={running || !items.length}>
-                {running ? <Spinner /> : <ShrinkIcon />}
+                {running ? <Spinner data-icon="inline-start" /> : <ShrinkIcon data-icon="inline-start" />}
                 {running ? 'Compressing…' : 'Compress all'}
               </Button>
               {running && (
                 <Button variant="outline" onClick={() => abortRef.current?.abort()}>
+                  <CircleStopIcon data-icon="inline-start" />
                   Stop
                 </Button>
               )}
+              {/* Secondary, not primary: unlike the other products this footer also holds the
+                  run button, and two stacked primaries would fight for the eye. Label and icon
+                  match the suite's Export ZIP everywhere else. */}
               <Button variant="secondary" onClick={downloadZip} disabled={!doneCount}>
-                <FileArchiveIcon /> Download ZIP ({doneCount})
+                <DownloadIcon data-icon="inline-start" />
+                Export ZIP{doneCount ? ` (${doneCount})` : ''}
               </Button>
             </div>
           }
@@ -356,27 +376,30 @@ export default function PngCompressorPage() {
                   <FieldContent>
                     <FieldLabel htmlFor="lossless"><Hint hint="Skip quantization; oxipng squeeze only.">Lossless only</Hint></FieldLabel>
                   </FieldContent>
-                  <Switch id="lossless" checked={lossless} onCheckedChange={setLossless} />
+                  <Switch id="lossless" checked={lossless} disabled={running} onCheckedChange={setLossless} />
                 </Field>
-                <Field data-disabled={lossless || undefined}>
-                  <FieldLabel htmlFor="colors"><Hint hint="Fewer colors → smaller files, more banding.">Palette colors</Hint></FieldLabel>
-                  <Select
-                    value={String(colors)}
-                    onValueChange={(v) => setColors(Number(v))}
-                    disabled={lossless}
-                  >
-                    <SelectTrigger id="colors" className="w-full">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {COLOR_CHOICES.map((c) => (
-                        <SelectItem key={c} value={String(c)}>
-                          {c} colors{c === 256 ? ' (best quality)' : ''}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </Field>
+                {/* Hidden, not greyed, while lossless — matching the shared Compress PNGs step. */}
+                {!lossless && (
+                  <Field>
+                    <FieldLabel htmlFor="colors"><Hint hint="Fewer colors → smaller files, more banding.">Palette colors</Hint></FieldLabel>
+                    <Select
+                      value={String(colors)}
+                      onValueChange={(v) => setColors(Number(v))}
+                      disabled={running}
+                    >
+                      <SelectTrigger id="colors" className="w-full">
+                        <SelectValue>{(v) => `${v} colors`}</SelectValue>
+                      </SelectTrigger>
+                      <SelectContent>
+                        {COLOR_CHOICES.map((c) => (
+                          <SelectItem key={c} value={String(c)}>
+                            {c} colors{c === 256 ? ' (best quality)' : ''}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                )}
               </FieldGroup>
             </PanelSection>
 

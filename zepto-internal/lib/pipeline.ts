@@ -4,8 +4,8 @@ import { readImageQuality, type ImageQuality } from '@/lib/quality';
 import { acquireRpmSlot } from '@/lib/rate';
 import { recordUsage } from '@/lib/usage';
 
-export async function loadImageFromUrl(url: string): Promise<HTMLImageElement> {
-  const res = await fetch('/api/fetch-image?url=' + encodeURIComponent(url));
+export async function loadImageFromUrl(url: string, signal?: AbortSignal): Promise<HTMLImageElement> {
+  const res = await fetch('/api/fetch-image?url=' + encodeURIComponent(url), { signal });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.error || `Failed to fetch ${url}`);

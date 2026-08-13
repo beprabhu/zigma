@@ -9,20 +9,31 @@
 // this pane is a live subscriber, so totals tick up while runs are in flight.
 
 import * as React from 'react';
-import { ChartColumnIcon, KeyRoundIcon, PlugZapIcon, SlidersHorizontalIcon } from 'lucide-react';
+import {
+  ChartColumnIcon, CopyIcon, KeyRoundIcon, PencilIcon, PlugZapIcon, PlusIcon, Settings2Icon,
+  SlidersHorizontalIcon, SparklesIcon, Trash2Icon, UploadIcon,
+} from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { Hint } from '@/components/hint';
 import {
-  Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle,
+  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog';
-import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field';
+import { Textarea } from '@/components/ui/textarea';
+import { MdFileIcon } from '@/components/md-file-tile';
+import { Field, FieldContent, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
 import { Spinner } from '@/components/ui/spinner';
+import { Switch } from '@/components/ui/switch';
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
+import {
+  Sidebar, SidebarContent, SidebarGroup, SidebarGroupContent, SidebarMenu, SidebarMenuButton,
+  SidebarMenuItem, SidebarProvider,
+} from '@/components/ui/sidebar';
 import { usePersistedState } from '@/hooks/use-persisted-state';
+import { newSkillId, useSkills, type PromptSkill } from '@/lib/skills';
 import { azureImageUrl } from '@/lib/pipeline';
 import { QUALITIES, QUALITY_BLURB, useImageQuality, type ImageQuality } from '@/lib/quality';
 import { clampParallel, clampRpm, useParallel, useRpm } from '@/lib/rate';
@@ -32,11 +43,13 @@ import {
 } from '@/lib/usage';
 import { cn } from '@/lib/utils';
 
-type SettingsTab = 'api-keys' | 'image-model' | 'usage';
+type SettingsTab = 'api-keys' | 'image-model' | 'skills' | 'defaults' | 'usage';
 
 const TABS: { id: SettingsTab; label: string; icon: typeof KeyRoundIcon }[] = [
   { id: 'api-keys', label: 'API keys', icon: KeyRoundIcon },
   { id: 'image-model', label: 'Image model', icon: SlidersHorizontalIcon },
+  { id: 'skills', label: 'Skills', icon: SparklesIcon },
+  { id: 'defaults', label: 'Defaults', icon: Settings2Icon },
   { id: 'usage', label: 'Usage', icon: ChartColumnIcon },
 ];
 
@@ -50,38 +63,44 @@ export function SettingsDialog({
   const [tab, setTab] = React.useState<SettingsTab>('api-keys');
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="gap-0 p-0 sm:max-w-2xl">
+      <DialogContent className="max-h-[calc(100dvh-3rem)] grid-rows-[auto_minmax(0,1fr)] gap-0 overflow-hidden p-0 sm:max-w-3xl">
         <DialogHeader className="border-b px-5 py-3.5">
           <DialogTitle>Settings</DialogTitle>
           <DialogDescription className="sr-only">
             Suite-wide settings: API keys and token usage.
           </DialogDescription>
         </DialogHeader>
-        <div className="flex min-h-[380px]">
-          <nav className="flex w-44 shrink-0 flex-col gap-1 border-r p-2" aria-label="Settings sections">
-            {TABS.map(({ id, label, icon: Icon }) => (
-              <Button
-                key={id}
-                variant="ghost"
-                size="sm"
-                onClick={() => setTab(id)}
-                aria-current={tab === id ? 'page' : undefined}
-                className={cn(
-                  'w-full justify-start gap-2 px-2.5',
-                  tab === id ? 'bg-accent font-medium' : 'font-normal text-muted-foreground',
-                )}
-              >
-                <Icon className="size-3.5" />
-                {label}
-              </Button>
-            ))}
-          </nav>
-          <div className="min-w-0 flex-1 overflow-y-auto p-5">
+        {/* min-w-0: DialogContent lays children on a grid whose track sizes to max-content;
+            without this, one long unwrappable line (a skill's preview) widens the whole pane.
+            The nav is the real shadcn Sidebar embedded non-collapsible, per its settings-dialog
+            pattern — same component as an app shell, so hover/active states match the suite. */}
+        <SidebarProvider className="h-[500px] max-h-full min-h-0 min-w-0 items-start" style={{ '--sidebar-width': '13rem' } as React.CSSProperties}>
+          <Sidebar collapsible="none" className="h-auto self-stretch border-r">
+            <SidebarContent>
+              <SidebarGroup>
+                <SidebarGroupContent>
+                  <SidebarMenu>
+                    {TABS.map(({ id, label, icon: Icon }) => (
+                      <SidebarMenuItem key={id}>
+                        <SidebarMenuButton isActive={tab === id} onClick={() => setTab(id)}>
+                          <Icon />
+                          {label}
+                        </SidebarMenuButton>
+                      </SidebarMenuItem>
+                    ))}
+                  </SidebarMenu>
+                </SidebarGroupContent>
+              </SidebarGroup>
+            </SidebarContent>
+          </Sidebar>
+          <div className="min-w-0 flex-1 self-stretch overflow-y-auto p-6">
             {tab === 'api-keys' && <ApiKeysPane />}
             {tab === 'image-model' && <ImageModelPane />}
+            {tab === 'skills' && <SkillsPane />}
+            {tab === 'defaults' && <DefaultsPane />}
             {tab === 'usage' && <UsagePane />}
           </div>
-        </div>
+        </SidebarProvider>
       </DialogContent>
     </Dialog>
   );
@@ -148,7 +167,7 @@ function ApiKeysPane() {
       </Field>
       <Field>
         <FieldLabel htmlFor="settings-key">
-          <Hint hint="Shared by every product — AI edit, AI-fix flagged and Generate. Stored in this browser only; nothing leaves this machine except the calls themselves.">
+          <Hint hint="Shared by every product — AI edit, AI-fix flagged and Generate.">
             Azure API key
           </Hint>
         </FieldLabel>
@@ -211,7 +230,7 @@ function ImageModelPane() {
     <FieldGroup className="gap-4">
       <Field>
         <FieldLabel htmlFor="settings-quality">
-          <Hint hint="One knob for the whole suite — Compositor tiles, BG Remover AI fixes and Generate all send this on every Azure call.">
+          <Hint hint="One knob for the whole suite — Compose tiles, Cleanup AI fixes and Generate all send this on every Azure call.">
             Image quality
           </Hint>
         </FieldLabel>
@@ -234,7 +253,7 @@ function ImageModelPane() {
       </Field>
       <Field>
         <FieldLabel htmlFor="settings-parallel">
-          <Hint hint="How many Azure calls run at once — Banners tiles, Generate rows and BG Remover AI fixes all fan out this wide. Applies from the next run.">
+          <Hint hint="How many Azure calls run at once — Compose tiles, Generate rows and Cleanup AI fixes all fan out this wide. Applies from the next run.">
             Parallel requests
           </Hint>
         </FieldLabel>
@@ -254,7 +273,7 @@ function ImageModelPane() {
       </Field>
       <Field>
         <FieldLabel htmlFor="settings-rpm">
-          <Hint hint="One budget shared by every product in this tab — a run in Banners and a run in Generate draw from the same window. Counted per tab, like the usage ledger.">
+          <Hint hint="One budget shared by every product in this tab — a run in Compose and a run in Generate draw from the same window. Counted per tab, like the usage ledger.">
             Requests per minute
           </Hint>
         </FieldLabel>
@@ -282,8 +301,200 @@ function ImageModelPane() {
   );
 }
 
+function DefaultsPane() {
+  // Same persisted key Cleanup's save flow reads — the setting moved here from its footer.
+  const [saveOriginals, setSaveOriginals] = usePersistedState('skuc_bgSaveOriginals', true);
+  return (
+    <div className="space-y-5">
+      <div className="space-y-3">
+        <h3 className="text-xs font-semibold text-muted-foreground uppercase">Projects (.zesku)</h3>
+        <Field orientation="horizontal">
+          <FieldContent>
+            <FieldLabel htmlFor="settings-save-originals" className="font-normal">
+              <Hint hint="Embeds the dropped input files in saved projects so reopening restores them — original view, Redo and AI edit keep working. Off keeps only cutouts and URLs for a smaller file.">
+                Include original images
+              </Hint>
+            </FieldLabel>
+          </FieldContent>
+          <Switch
+            id="settings-save-originals"
+            checked={saveOriginals}
+            onCheckedChange={(checked) => setSaveOriginals(checked === true)}
+          />
+        </Field>
+      </div>
+    </div>
+  );
+}
+
+function SkillsPane() {
+  const { skills, setCustom } = useSkills();
+  const fileRef = React.useRef<HTMLInputElement>(null);
+  // The editor dialog's draft. `fresh` = not yet in the list, so Cancel leaves no trace.
+  const [draft, setDraft] = React.useState<{ skill: PromptSkill; fresh: boolean } | null>(null);
+
+  function saveDraft() {
+    if (!draft) return;
+    const skill = { ...draft.skill, name: draft.skill.name.trim() || 'untitled.md' };
+    setCustom((prev) => {
+      const list = Array.isArray(prev) ? prev : [];
+      const at = list.findIndex((s) => s.id === skill.id);
+      if (at === -1) return [...list, skill];
+      const next = [...list];
+      next[at] = skill;
+      return next;
+    });
+    setDraft(null);
+  }
+
+  function removeSkill(id: string) {
+    setCustom((prev) => (Array.isArray(prev) ? prev.filter((s) => s.id !== id) : []));
+  }
+
+  return (
+    <div className="space-y-4">
+      <p className="text-xs text-muted-foreground">
+        Reusable prompts for the whole suite — pick them from any product&rsquo;s prompt
+        dropdown. Built-ins are read-only; duplicate one to make your own version.
+      </p>
+      <div className="space-y-1.5">
+        {skills.map((skill) => (
+          <div key={skill.id} className="flex items-center gap-2.5 rounded-lg border px-3 py-2">
+            <MdFileIcon className="size-4 shrink-0 text-muted-foreground" />
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-sm">{skill.name}</div>
+              <div className="truncate text-xs text-muted-foreground">
+                {skill.content.split('\n').find((l) => l.trim()) || 'Empty'}
+              </div>
+            </div>
+            {skill.builtin ? (
+              <>
+                <span className="shrink-0 text-[10px] text-muted-foreground uppercase">Built-in</span>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  title="Duplicate into an editable copy"
+                  onClick={() =>
+                    setDraft({
+                      fresh: true,
+                      skill: {
+                        id: newSkillId(),
+                        name: skill.name.replace(/\.md$/, '') + '-copy.md',
+                        content: skill.content,
+                      },
+                    })
+                  }
+                >
+                  <CopyIcon />
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  title="Edit"
+                  onClick={() => setDraft({ fresh: false, skill })}
+                >
+                  <PencilIcon />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  title="Delete"
+                  className="text-muted-foreground hover:text-destructive"
+                  onClick={() => removeSkill(skill.id)}
+                >
+                  <Trash2Icon />
+                </Button>
+              </>
+            )}
+          </div>
+        ))}
+      </div>
+      <div className="flex items-center gap-2">
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() =>
+            setDraft({ fresh: true, skill: { id: newSkillId(), name: 'new-skill.md', content: '' } })
+          }
+        >
+          <PlusIcon data-icon="inline-start" />
+          New skill
+        </Button>
+        {/* Upload lands in the editor for review, not straight into the list — a wrong file
+            should be caught before it becomes a selectable skill. */}
+        <Button variant="outline" size="sm" onClick={() => fileRef.current?.click()}>
+          <UploadIcon data-icon="inline-start" />
+          Upload .md
+        </Button>
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".md,.markdown,.txt,text/markdown,text/plain"
+          className="hidden"
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            e.target.value = '';
+            if (!file) return;
+            void file.text().then((content) => {
+              const name = /\.(md|markdown|txt)$/i.test(file.name)
+                ? file.name.replace(/\.(markdown|txt)$/i, '.md')
+                : `${file.name}.md`;
+              setDraft({ fresh: true, skill: { id: newSkillId(), name, content } });
+            });
+          }}
+        />
+      </div>
+
+
+      {/* Stacked intentionally, like Claude's Upload-skill over Settings: the editor is a
+          focused layer with its own backdrop dim; narrower than Settings so the elevation
+          reads. Base UI nests dialogs cleanly — Escape and the X close only this layer. */}
+      <Dialog open={draft !== null} onOpenChange={(open) => !open && setDraft(null)}>
+        <DialogContent className="sm:max-w-xl" forceOverlay>
+          {draft && (
+            <>
+              <DialogHeader>
+                <DialogTitle className="flex items-center gap-2">
+                  <MdFileIcon className="size-4 text-muted-foreground" />
+                  {draft.fresh ? 'New skill' : 'Edit skill'}
+                </DialogTitle>
+                <DialogDescription>
+                  A reusable prompt, selectable from any product&rsquo;s prompt dropdown.
+                </DialogDescription>
+              </DialogHeader>
+              <Field>
+                <FieldLabel htmlFor="skill-name">Name</FieldLabel>
+                <Input
+                  id="skill-name"
+                  value={draft.skill.name}
+                  onChange={(e) => setDraft({ ...draft, skill: { ...draft.skill, name: e.target.value } })}
+                />
+              </Field>
+              <Textarea
+                value={draft.skill.content}
+                onChange={(e) => setDraft({ ...draft, skill: { ...draft.skill, content: e.target.value } })}
+                rows={12}
+                placeholder="The prompt this skill carries…"
+                aria-label="Skill prompt"
+                className="max-h-[50dvh] min-h-40 overflow-y-auto text-xs"
+              />
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setDraft(null)}>Cancel</Button>
+                <Button onClick={saveDraft} disabled={!draft.skill.content.trim()}>Save</Button>
+              </DialogFooter>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
 const MODE_LABELS: Record<'edits' | 'generations', string> = {
-  edits: 'AI edits (Banners · Cleanup)',
+  edits: 'AI edits (Compose · Cleanup)',
   generations: 'Generations (Generate)',
 };
 
@@ -306,8 +517,8 @@ function UsagePane() {
     <div className="space-y-4">
       <p className="text-xs text-muted-foreground">
         Tokens reported by Azure per call
-        {ledger.since ? <> since {new Date(ledger.since).toLocaleString()}</> : null}. Counted in
-        this browser only — teammates have their own tallies.
+        {ledger.since ? <> since {new Date(ledger.since).toLocaleString()}</> : null}. Counted per
+        person — teammates have their own tallies.
       </p>
       <div className="overflow-x-auto">
         <table className="w-full text-xs tabular-nums">

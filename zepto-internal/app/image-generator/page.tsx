@@ -45,6 +45,7 @@ import { useProcessing } from '@/components/process-panel';
 import { buildZip, type ZipFileEntry } from '@/lib/zip';
 import { cn } from '@/lib/utils';
 import { usePersistedState } from '@/hooks/use-persisted-state';
+import { DropzoneShell } from '@/components/dropzone';
 
 const NONE = '__none__';
 const SIZES = ['1024x1024', '1536x1024', '1024x1536', 'auto'] as const;
@@ -82,8 +83,6 @@ export default function ImageGenerator() {
   const [exporting, setExporting] = React.useState(false);
   const [progress, setProgress] = React.useState<{ pct: number; text: string } | null>(null);
   const [openId, setOpenId] = React.useState<number | null>(null);
-  const [drag, setDrag] = React.useState(false);
-  const inputRef = React.useRef<HTMLInputElement>(null);
   const resultScrollRef = React.useRef<HTMLDivElement>(null);
 
   // Stop button: one controller per run (batch or single regenerate); aborting skips every
@@ -383,29 +382,16 @@ export default function ImageGenerator() {
   // ---- Render ------------------------------------------------------------
 
   const dropzone = (
-    <div
-      role="button"
-      tabIndex={0}
-      onClick={() => inputRef.current?.click()}
-      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); inputRef.current?.click(); } }}
-      onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
-      onDragLeave={() => setDrag(false)}
-      onDrop={(e) => { e.preventDefault(); setDrag(false); handleFiles([...(e.dataTransfer.files ?? [])]); }}
-      className={cn(
-        'flex cursor-pointer flex-col items-center gap-2 rounded-lg border-2 border-dashed border-border px-3 py-6 text-center text-sm text-muted-foreground transition-colors outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50',
-        drag && 'border-primary bg-accent',
-      )}
+    <DropzoneShell
+      accept=".md,.markdown,.txt,.csv,text/csv,text/markdown"
+      multiple
+      onFiles={handleFiles}
     >
-      <input
-        ref={inputRef}
-        type="file"
-        accept=".md,.markdown,.txt,.csv,text/csv,text/markdown"
-        multiple
-        hidden
-        onChange={(e) => handleFiles([...(e.target.files ?? [])])}
-      />
       <UploadCloudIcon className="size-6" />
-      <span>Drop the brief (.md) and the rows (.csv), or click to browse</span>
+      <span>
+        Drop the brief (.md) and the rows (.csv), or{' '}
+        <u className="text-primary">browse</u>
+      </span>
       <span className="flex flex-wrap justify-center gap-2 text-xs">
         <span className={cn('rounded-md border px-2 py-0.5', briefName && 'border-primary text-foreground')}>
           <MdFileIcon className="mr-1 inline size-3" />
@@ -415,7 +401,7 @@ export default function ImageGenerator() {
           {csvName ? `${csvName} — ${records.length} rows` : 'no CSV'}
         </span>
       </span>
-    </div>
+    </DropzoneShell>
   );
 
   const runFooter = (

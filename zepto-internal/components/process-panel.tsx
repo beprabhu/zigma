@@ -142,7 +142,7 @@ export function useProcessing({
       {offerCompress && (
         <PanelSection
           title="Compress PNGs"
-          hint="pngquant + oxipng on this machine — Compress's exact pipeline, no key, nothing uploaded."
+          hint="Compress's exact pipeline — pngquant + oxipng."
           action={
             <Switch
               aria-label="Compress PNGs"

@@ -59,7 +59,7 @@ export const BADGE: Record<BgItemStatus, { variant: BadgeVariant; text: string }
   'editing': { variant: 'outline', text: 'AI editing…' },
   'done': { variant: 'default', text: '✓ done' },
   'error': { variant: 'destructive', text: 'error' },
-  'cancelled': { variant: 'outline', text: 'cancelled' },
+  'cancelled': { variant: 'outline', text: 'stopped' },
 };
 
 /** Transparency backdrop. Uses --muted so it reads correctly in both themes. */
@@ -466,10 +466,15 @@ function CompareView({
       <DialogHeader className="min-w-0">
         <DialogTitle className="truncate">{item.name || `Image ${index + 1}`}</DialogTitle>
         <div className="flex min-w-0 items-center gap-1.5">
-          <DialogDescription className="min-w-0 truncate" title={sourceLabel(item)}>
-            {item.durationMs !== undefined
-              ? `Cut out in ${formatDuration(item.durationMs)} · ${sourceLabel(item)}`
-              : sourceLabel(item)}
+          <DialogDescription
+            className={cn('min-w-0 truncate', item.status === 'error' && item.error && 'text-destructive')}
+            title={item.status === 'error' && item.error ? item.error : sourceLabel(item)}
+          >
+            {item.status === 'error' && item.error
+              ? item.error
+              : item.durationMs !== undefined
+                ? `Cut out in ${formatDuration(item.durationMs)} · ${sourceLabel(item)}`
+                : sourceLabel(item)}
           </DialogDescription>
           {sourceUrl && (
             <Button

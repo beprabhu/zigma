@@ -217,7 +217,7 @@ export function ImageDropzone({ onAdd, onCsv, onProject, itemCount, disabled = f
         }
       }}
       className={cn(
-        'flex cursor-pointer flex-col items-center gap-2 rounded-lg border-2 border-dashed border-border px-3 py-6 text-center text-sm text-muted-foreground transition-colors',
+        'flex cursor-pointer flex-col items-center gap-2 rounded-lg border-2 border-dashed border-border px-3 py-6 text-center text-sm text-muted-foreground transition-colors outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50',
         drag && 'border-primary bg-accent',
         disabled && 'pointer-events-none opacity-50',
       )}

@@ -1,10 +1,11 @@
 'use client';
 
-// CSV file dropzone — custom component (no shadcn equivalent), styled with Luma tokens.
+// CSV file dropzone — the suite's DropzoneShell with CSV-specific copy and states.
 
 import * as React from 'react';
 import { UploadCloudIcon, FileTextIcon } from 'lucide-react';
-import { cn } from '@/lib/utils';
+
+import { DropzoneShell } from '@/components/dropzone';
 
 interface CsvDropzoneProps {
   fileName: string | null;
@@ -13,35 +14,8 @@ interface CsvDropzoneProps {
 }
 
 export function CsvDropzone({ fileName, rowCount, onFile }: CsvDropzoneProps) {
-  const inputRef = React.useRef<HTMLInputElement>(null);
-  const [drag, setDrag] = React.useState(false);
-
   return (
-    <div
-      onClick={() => inputRef.current?.click()}
-      onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
-      onDragLeave={() => setDrag(false)}
-      onDrop={(e) => {
-        e.preventDefault();
-        setDrag(false);
-        const f = e.dataTransfer.files?.[0];
-        if (f) onFile(f);
-      }}
-      className={cn(
-        'flex cursor-pointer flex-col items-center gap-2 rounded-lg border-2 border-dashed border-border px-3 py-6 text-center text-sm text-muted-foreground transition-colors',
-        drag && 'border-primary bg-accent',
-      )}
-    >
-      <input
-        ref={inputRef}
-        type="file"
-        accept=".csv,text/csv"
-        hidden
-        onChange={(e) => {
-          const f = e.target.files?.[0];
-          if (f) onFile(f);
-        }}
-      />
+    <DropzoneShell accept=".csv,text/csv" onFiles={(files) => onFile(files[0])}>
       {fileName ? (
         <>
           <FileTextIcon className="size-6" />
@@ -56,6 +30,6 @@ export function CsvDropzone({ fileName, rowCount, onFile }: CsvDropzoneProps) {
           <span>Drop CSV here or <u className="text-primary">browse</u></span>
         </>
       )}
-    </div>
+    </DropzoneShell>
   );
 }

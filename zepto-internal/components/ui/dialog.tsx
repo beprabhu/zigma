@@ -27,6 +27,7 @@ function DialogOverlay({
   className,
   ...props
 }: DialogPrimitive.Backdrop.Props) {
+  // Note: Base UI skips nested dialogs' backdrops unless forceRender is passed through.
   return (
     <DialogPrimitive.Backdrop
       data-slot="dialog-overlay"
@@ -43,13 +44,16 @@ function DialogContent({
   className,
   children,
   showCloseButton = true,
+  forceOverlay = false,
   ...props
 }: DialogPrimitive.Popup.Props & {
   showCloseButton?: boolean
+  /** Render this dialog's backdrop even when nested inside another dialog. */
+  forceOverlay?: boolean
 }) {
   return (
     <DialogPortal>
-      <DialogOverlay />
+      <DialogOverlay forceRender={forceOverlay} />
       <DialogPrimitive.Popup
         data-slot="dialog-content"
         className={cn(

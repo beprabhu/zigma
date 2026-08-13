@@ -1,6 +1,6 @@
 'use client';
 
-// Grid multi-select, shared by Generate, Banners and Cleanup: the hook owns the checked-id
+// Grid multi-select, shared by Generate, Compose and Cleanup: the hook owns the checked-id
 // set (shift-ranges, prune on item removal, Escape to clear), SelectionBar is the floating
 // pill of bulk actions, and ClearAllButton is the toolbar's confirm-guarded whole-run reset.
 // Products supply only their own verbs — what "regenerate" and "delete" mean is per-product.

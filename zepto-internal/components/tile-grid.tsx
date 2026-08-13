@@ -306,8 +306,10 @@ export function TileDialog({
       <DialogContent className="max-h-[85dvh] w-full overflow-x-hidden overflow-y-auto sm:max-w-3xl">
         {item && (
           <>
-            <DialogHeader>
-              <DialogTitle>{item.title || `Row ${item.id + 1}`}</DialogTitle>
+            <DialogHeader className="min-w-0">
+              <DialogTitle className="truncate" title={item.title || undefined}>
+                {item.title || `Row ${item.id + 1}`}
+              </DialogTitle>
               <DialogDescription className={line?.error ? 'text-destructive' : undefined}>
                 {line?.text}
                 {item.offer ? ` · offer: ${item.offer}` : ''}
@@ -373,7 +375,7 @@ export function TileDialog({
               </div>
             </div>
 
-            <DialogFooter showCloseButton className="flex-wrap gap-2">
+            <DialogFooter className="flex-wrap gap-2">
               <Button
                 variant="outline"
                 className="mr-auto"

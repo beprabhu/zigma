@@ -43,7 +43,7 @@ export const BG_MODELS: Record<BgModelId, BgModelSpec> = {
   rmbg: {
     id: 'rmbg',
     label: 'RMBG-1.4',
-    description: 'Balanced quality, runs in your browser',
+    description: 'Balanced quality, no server needed',
     path: 'briaai/RMBG-1.4',
     inputName: 'input',
     applySigmoid: false,

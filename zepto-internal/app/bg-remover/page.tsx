@@ -41,6 +41,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 
 import { ResultCell } from '@/components/result-cell';
+import { BUDGET_KB_MIN, BudgetControls } from '@/components/budget-controls';
 import { ClearAllButton, SelectionBar, useGridSelection } from '@/components/selection';
 import { Canvas, LeftPanel, PanelSection, RightPanel, StudioShell } from '@/components/pane-layout';
 import { useProcessing } from '@/components/process-panel';
@@ -79,6 +80,7 @@ import {
 import { PROJECT_EXTENSION, loadProject, saveProject } from '@/lib/bg/project';
 import { assessQuality, countFlagged, sortByQuality } from '@/lib/bg/quality';
 import { readParallel } from '@/lib/rate';
+import { DEFAULT_AI_PROMPT } from '@/lib/skills';
 import { clearPreviews, dropPreview, usePreview } from '@/lib/bg/preview-store';
 import { STORE_TYPE } from '@/lib/bg/constants';
 import { callAzure, loadImageFromUrl, mockComposite } from '@/lib/pipeline';
@@ -100,8 +102,7 @@ const COMPRESS_CONCURRENCY = 4;
 // conversation happens at; MIN is a floor the export re-applies, since a number input does not
 // enforce `min` on a typed value.
 const BUDGET_KB_DEFAULT = 150;
-const BUDGET_KB_MIN = 50;
-const BUDGET_KB_STEP = 50;
+
 // Names listed in a budget toast before it collapses into "+N more".
 const BUDGET_TOAST_NAMES = 3;
 // Decode edges for the two tile previews. Both go through the shared preview cache.
@@ -121,32 +122,7 @@ interface RunOverrides {
 // Ships as the AI-edit prompt so the flow works out of the box. The reference image carries the
 // product's identity, so one generic prompt covers every SKU; fidelity comes first and loudest
 // because label drift (garbled pack text) is the model's main failure mode on catalogue work.
-const DEFAULT_AI_PROMPT = `Recreate this exact product as a clean e-commerce studio packshot.
-
-PRODUCT FIDELITY (most important):
-- Show EXACTLY what the reference shows, nothing more. If the product is unpackaged
-  (loose produce, a bare fruit or vegetable), it stays unpackaged — NEVER add any
-  packaging, wrapper, label, sticker, band, tag, or brand text that is not in the
-  reference. Inventing a brand or label is the worst possible failure.
-- If the reference DOES show packaging, keep it IDENTICAL: same shape, proportions,
-  colors, label layout, logos, and all printed text exactly as shown. Do not redesign,
-  restyle, translate, or invent any text or graphics on the pack.
-- If part of the product is cut off in the reference, complete it plausibly and
-  consistently with the visible portion (e.g. the base of a jar or bottle).
-
-SCENE:
-- Pure white seamless background (#FFFFFF), professional studio product photography.
-- Soft, even, diffused lighting; a subtle natural contact shadow under the product only.
-- Product centered, fully visible, front label facing camera, straight-on angle,
-  occupying about 80% of the frame with even margins on all sides.
-
-REMOVE EVERYTHING ELSE:
-- No props, no hands or people, no surfaces or tables, no plates, bowls or serving
-  dishes (unless the dish itself IS the product), no plants, no decorative items.
-- No added text, watermarks, badges, banners, or graphic overlays on the image.
-- Show the product plus at most ONE cut/open piece beside it — never scattered pieces
-  or repeated duplicates. Shrunk to a 40x40 thumbnail, the image must still read
-  instantly as this product.`;
+// DEFAULT_AI_PROMPT moved to lib/skills.ts — it's a shared built-in skill now.
 
 // Parallel Azure requests during "AI-fix flagged": suite-wide, from Settings → Image model
 // (lib/rate.ts) — this was a local constant (6) before the knob moved there.
@@ -258,7 +234,8 @@ export default function BgRemover() {
   const [outputBg, setOutputBg] = usePersistedState('skuc_bgOutput', TRANSPARENT);
   // Save-project scope: embedding dropped files makes a .zesku self-contained (v2); off keeps
   // only cutouts + URLs for huge batches.
-  const [saveOriginals, setSaveOriginals] = usePersistedState('skuc_bgSaveOriginals', true);
+  // Toggled from Settings (the user moved the checkbox there); read-only here.
+  const [saveOriginals] = usePersistedState('skuc_bgSaveOriginals', true);
   const [safeArea, setSafeArea] = usePersistedState<SafeAreaConfig>('skuc_bgSafeArea', DEFAULT_SAFE_AREA);
   // Azure credentials are the compositor's own keys, read from the same storage so the two
   // products never hold different values; only the default prompt is this product's.
@@ -618,7 +595,7 @@ export default function BgRemover() {
       await saveTo(dest, blob, projectName);
       const cutouts = withCutout(all).length;
       toast.success(
-        `Saved ${all.length} image${all.length === 1 ? '' : 's'} (${cutouts} finished) with sources and safe-area settings.`,
+        `Saved ${all.length} image${all.length === 1 ? '' : 's'} (${cutouts} finished) — originals ${saveOriginals ? 'included' : 'skipped'} (Settings → Defaults).`,
       );
     } catch (e) {
       toast.error(`Could not save the project: ${errorMessage(e)}`);
@@ -1558,74 +1535,18 @@ export default function BgRemover() {
             </FieldContent>
           </Field>
 
-          <Field orientation="horizontal">
-            {/* Field only nudges [role=checkbox]/[role=radio] into line with the label; a switch
-                needs the offset spelled out, as in components/bg-remover/safe-area-controls.tsx. */}
-            <Switch
-              id="bg-budget-on"
-              className="mt-0.5"
-              checked={budgetOn}
-              disabled={busy || !png8Ready}
-              onCheckedChange={(checked) => setBudgetOn(checked)}
-            />
-            <FieldContent>
-              <FieldLabel htmlFor="bg-budget-on" className="font-normal">
-                <Hint hint="PNG is lossless, so the same tile can export anywhere from 60 KB to 300 KB. On, every file is held under a ceiling.">
-                  Limit file size
-                </Hint>
-              </FieldLabel>
-              {!png8Ready && (
-                <FieldDescription>
-                  Needs CompressionStream, which this browser does not provide — exports stay
-                  uncapped.
-                </FieldDescription>
-              )}
-            </FieldContent>
-          </Field>
-
-          {budgetActive && (
-            <>
-              <Field>
-                <FieldLabel htmlFor="bg-budget-kb">
-                  <Hint hint="Colours go first — full colour, then a 256 · 128 · 64 · 32 palette — and the export stops at the first step that fits.">
-                    Max KB per file
-                  </Hint>
-                </FieldLabel>
-                <Input
-                  id="bg-budget-kb"
-                  type="number"
-                  inputMode="numeric"
-                  min={BUDGET_KB_MIN}
-                  step={BUDGET_KB_STEP}
-                  value={budgetKb}
-                  disabled={busy}
-                  onChange={(e) => {
-                    const next = Number(e.target.value);
-                    // A cleared or half-typed field must never be persisted as NaN.
-                    if (Number.isFinite(next) && next > 0) setBudgetKb(next);
-                  }}
-                  onBlur={() => setBudgetKb(budgetKbSafe)}
-                />
-              </Field>
-
-              <Field orientation="horizontal">
-                <Switch
-                  id="bg-budget-shrink"
-                  className="mt-0.5"
-                  checked={budgetShrink}
-                  disabled={busy}
-                  onCheckedChange={(checked) => setBudgetShrink(checked)}
-                />
-                <FieldContent>
-                  <FieldLabel htmlFor="bg-budget-shrink" className="font-normal">
-                    <Hint hint="Last resort, only when no palette fits. Off, an unfittable file is exported over budget instead — either way the export report names it.">
-                      Shrink dimensions if needed
-                    </Hint>
-                  </FieldLabel>
-                </FieldContent>
-              </Field>
-            </>
-          )}
+          <BudgetControls
+            idPrefix="bg"
+            on={budgetOn}
+            onOnChange={setBudgetOn}
+            kb={budgetKb}
+            onKbChange={setBudgetKb}
+            kbSafe={budgetKbSafe}
+            shrink={budgetShrink}
+            onShrinkChange={setBudgetShrink}
+            disabled={busy}
+            available={png8Ready}
+          />
 
         </FieldGroup>
       </PanelSection>
@@ -1644,7 +1565,7 @@ export default function BgRemover() {
       {(running || aiFixing) && (
         <Button variant="outline" onClick={handleCancel}>
           <CircleStopIcon data-icon="inline-start" />
-          Cancel
+          Stop
         </Button>
       )}
     </div>
@@ -1655,7 +1576,7 @@ export default function BgRemover() {
   const statusLine =
     (download && describeDownload(download)) ||
     [progress?.text, compressSummary].filter(Boolean).join(' · ') ||
-    'Everything runs locally — nothing leaves this browser.';
+    'Cutouts export as PNGs in a ZIP.';
 
   const exportFooter = (
     <div className="space-y-2">
@@ -1666,19 +1587,6 @@ export default function BgRemover() {
         {stage && stage !== 'done' ? ` · ${stage}` : ''}
       </p>
       <div className="flex flex-col gap-2">
-        <div className="flex items-center gap-2">
-          <Checkbox
-            id="bg-save-originals"
-            checked={saveOriginals}
-            disabled={busy}
-            onCheckedChange={(checked) => setSaveOriginals(checked === true)}
-          />
-          <FieldLabel htmlFor="bg-save-originals" className="font-normal">
-            <Hint hint="Embeds the dropped input files in the project so reopening it restores them — original view, Redo and AI edit all keep working. Untick for a smaller file that keeps only cutouts and URLs.">
-              Include original images
-            </Hint>
-          </FieldLabel>
-        </div>
         <Button
           variant="outline"
           disabled={busy || !items.length}
@@ -1936,7 +1844,7 @@ export default function BgRemover() {
                         title={
                           aiReady
                             ? 'Regenerate every flagged image with the AI edit prompt, then re-remove their backgrounds. Parallelism comes from Settings → Image model.'
-                            : 'Enter the Azure endpoint and API key in the AI edit card first'
+                            : 'AI edit needs the Azure endpoint + key (Settings, gear in the rail)'
                         }
                         onClick={() => void handleAiEditFlagged()}
                       >

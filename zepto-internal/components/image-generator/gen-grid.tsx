@@ -194,8 +194,8 @@ export function GenDialog({
       <DialogContent className="max-h-[85dvh] w-full overflow-x-hidden overflow-y-auto sm:max-w-3xl">
         {item && (
           <>
-            <DialogHeader>
-              <DialogTitle>{item.name}</DialogTitle>
+            <DialogHeader className="min-w-0">
+              <DialogTitle className="truncate" title={item.name}>{item.name}</DialogTitle>
               <DialogDescription className={line?.error ? 'text-destructive' : undefined}>
                 {line?.text}
               </DialogDescription>
@@ -238,7 +238,7 @@ export function GenDialog({
               </div>
             </div>
 
-            <DialogFooter showCloseButton className="flex-wrap gap-2">
+            <DialogFooter className="flex-wrap gap-2">
               <Button
                 variant="outline"
                 className="mr-auto"
