@@ -91,6 +91,12 @@ import {
   type QueueFilter, type QueueSort,
 } from '@/lib/bg/quality';
 import { QueueFilters } from '@/components/bg-remover/queue-filters';
+import { BatchRail } from '@/components/bg-remover/batch-rail';
+import {
+  DEFAULT_SEAL_SIZE, cleanUnexported, nextAllocation, planExport, planReexport, planSeal,
+  recordBatch, remainingUnexported, stampBatch, summarizeLedger,
+  type Allocation, type BatchRecord, type ExportPlan,
+} from '@/lib/bg/ledger';
 import { readParallel } from '@/lib/rate';
 import { createEta } from '@/lib/eta';
 import { DEFAULT_AI_PROMPT, matchSkill, useSkills } from '@/lib/skills';
@@ -212,6 +218,8 @@ interface BgSession {
   selectedId: number | null;
   queueFilter: QueueFilter;
   queueSort: QueueSort;
+  ledger: BatchRecord[];
+  allocFloor: Allocation;
   csvInfo: CsvInfo | null;
   /** Ids already sent to Azure, so returning cannot re-buy an AI fix this session paid for. */
   aiAttempted: number[];
@@ -430,10 +438,74 @@ export default function BgRemover() {
     () => items.filter((item) => canRetry(item) && verdictOf(item).level !== 'ok'),
     [items, verdictOf],
   );
+  // ---- Export ledger ----
+  // A batch is born when it is EXPORTED, never when it is flagged: flagged-ness changes the
+  // moment an AI fix lands, so a cohort defined by it would leak members and those images would
+  // end up in no ZIP at all. "Clean" ships now, "the rest" ships when the user says so, and the
+  // two together are always exactly the queue.
+  const [ledger, setLedger] = React.useState<BatchRecord[]>(() => readSession(BG_SESSION)?.ledger ?? []);
+  /**
+   * Batches whose numbers and file range are allocated but whose ZIP is not on disk yet — sealed
+   * and waiting for the click that a save dialog legally needs, or currently encoding, or failed
+   * and awaiting a retry. They keep their claim the whole time: encoding takes minutes and the
+   * stamp only lands on success, so anything that forgot them would hand the same images and the
+   * same file numbers to a second ZIP.
+   */
+  const [openPlans, setOpenPlans] = React.useState<ExportPlan[]>([]);
+  const claimed = React.useMemo(
+    () => new Set(openPlans.flatMap((plan) => plan.items.map((it) => it.id))),
+    [openPlans],
+  );
+  const [sealSize, setSealSize] = usePersistedState('skuc_bgSealSize', DEFAULT_SEAL_SIZE);
+  const [selectedBatch, setSelectedBatch] = React.useState<number | null>(null);
+  const [exportingBatch, setExportingBatch] = React.useState<number | null>(null);
+  // Files already written cannot be un-written, so numbering may never retreat into names that
+  // exist — not when shipped rows are deleted, and not when a restore brings back stamps without
+  // their records. Moved when a range is handed out, never when it lands.
+  const allocFloorRef = React.useRef<Allocation>(
+    readSession(BG_SESSION)?.allocFloor ?? { batch: 1, offset: 0 },
+  );
+
   const displayItems = React.useMemo(() => {
-    const shown = filterQueue(items, queueFilter, verdictOf);
+    const byBatch =
+      selectedBatch === null ? items : items.filter((it) => it.batch === selectedBatch);
+    const shown = filterQueue(byBatch, queueFilter, verdictOf);
     return queueSort === 'quality' ? sortByQualityWith(shown, verdictOf) : shown;
-  }, [items, queueFilter, queueSort, verdictOf]);
+  }, [items, selectedBatch, queueFilter, queueSort, verdictOf]);
+
+  const cleanCohort = React.useMemo(
+    () => cleanUnexported(items, verdictOf, { claimed }),
+    [items, verdictOf, claimed],
+  );
+  const restCohort = React.useMemo(() => remainingUnexported(items, { claimed }), [items, claimed]);
+  const ledgerSummary = React.useMemo(
+    () => summarizeLedger(items, ledger, { claimed }),
+    [items, ledger, claimed],
+  );
+
+  /**
+   * Chips for both halves of a batch's life: rows already on disk come from the ledger, rows
+   * sealed but not yet downloaded come from the open plans — a sealed batch has its number the
+   * moment it is allocated, so it gets a chip and a Download button straight away instead of
+   * being invisible until its file exists.
+   */
+  const railBatches = React.useMemo(() => {
+    const shipped = ledgerSummary.batches.map((b) => ({
+      batch: b.batch,
+      done: b.present,
+      total: b.shipped ?? b.present,
+      downloaded: true,
+      stale: b.staleness === 'stale',
+    }));
+    const waiting = openPlans.map((plan) => ({
+      batch: plan.batch,
+      label: `Batch ${plan.batch} · ready`,
+      done: plan.items.length,
+      total: plan.items.length,
+      downloaded: false,
+    }));
+    return [...shipped, ...waiting].sort((a, b) => a.batch - b.batch);
+  }, [ledgerSummary, openPlans]);
 
   // ---- Run state ----
   const [running, setRunning] = React.useState(false);
@@ -496,6 +568,8 @@ export default function BgRemover() {
     queueFilter,
     queueSort,
     csvInfo: null,
+    ledger: [],
+    allocFloor: { batch: 1, offset: 0 },
     aiAttempted: [],
   });
 
@@ -798,6 +872,26 @@ export default function BgRemover() {
     setItems([...kept, ...fresh]);
   }, []);
 
+  // Live sealing. Reads the COMMITTED queue, not the run loop's lagging ref: "have enough clean
+  // results accumulated" can only be answered by the array React has actually rendered.
+  //
+  // A seal claims its cohort and stops there — it deliberately does not open a save dialog,
+  // because it fires mid-run with no user gesture behind it and the browser would refuse one.
+  // The rail shows the sealed batch with a Download button and the user's click supplies the
+  // gesture, while the next batch is already filling behind it.
+  React.useEffect(() => {
+    if (!running) return;
+    const plan = planSeal(items, verdictOf, {
+      threshold: sealSize,
+      alloc: nextAllocation(items, ledger, openPlans, allocFloorRef.current),
+      ledger,
+      claimed,
+    });
+    if (!plan) return;
+    openPlan(plan);
+    toast.info(`Batch ${plan.batch} sealed — ${plan.items.length} clean images ready to download.`);
+  }, [items, verdictOf, running, sealSize, ledger, openPlans, claimed]);
+
   // Feeds the once-only unmount snapshot with current values instead of first-render ones.
   React.useEffect(() => {
     sessionRef.current = {
@@ -807,6 +901,8 @@ export default function BgRemover() {
       queueFilter,
       queueSort,
       csvInfo,
+      ledger,
+      allocFloor: allocFloorRef.current,
       aiAttempted: [...aiAttemptedRef.current],
     };
   });
@@ -1589,7 +1685,58 @@ export default function BgRemover() {
   // ---- Export: render, optionally compress, zip ---------------------------
 
   function handleExport() {
-    return exportItems(withCutout(itemsRef.current));
+    exportCohort(withCutout(itemsRef.current));
+  }
+
+  /** The next unused batch number and file range, counting every plan still open. */
+  function allocate(): Allocation {
+    return nextAllocation(itemsRef.current, ledger, openPlans, allocFloorRef.current);
+  }
+
+  /** Reserves a plan's numbers immediately — an allocated range is spent whatever happens next. */
+  function openPlan(plan: ExportPlan) {
+    setOpenPlans((prev) => [...prev, plan]);
+    allocFloorRef.current = {
+      batch: Math.max(allocFloorRef.current.batch, plan.batch + 1),
+      offset: Math.max(allocFloorRef.current.offset, plan.offset + plan.items.length),
+    };
+  }
+
+  /**
+   * Writes one plan out and records it ONLY if the file actually reached disk. The order is the
+   * whole safety property: a stamp is what removes an image from every future cohort, so
+   * stamping a batch whose save failed would drop those pictures out of the remaining work with
+   * no ZIP anywhere containing them. A failed plan stays open, keeps its claim and keeps its
+   * chip, so the same Download button retries it under the same numbers.
+   */
+  async function runPlan(plan: ExportPlan, opts: { reexport?: boolean } = {}) {
+    if (exportingBatch !== null) return;
+    setExportingBatch(plan.batch);
+    try {
+      const saved = await exportItems(plan.items, {
+        suffix: `batch-${String(plan.batch).padStart(2, '0')}`,
+        offset: plan.offset,
+      });
+      if (!saved) return;
+      setItems((prev) => stampBatch(prev, plan));
+      const record = recordBatch(plan, { fileName: saved });
+      setLedger((prev) =>
+        opts.reexport
+          ? prev.map((row) => (row.batch === plan.batch ? record : row))
+          : [...prev, record],
+      );
+      setOpenPlans((prev) => prev.filter((p) => p !== plan));
+    } finally {
+      setExportingBatch(null);
+    }
+  }
+
+  /** Seals nothing — just hands the current cohort a range and a chip the user can download. */
+  function exportCohort(cohort: CutoutItem[]) {
+    const plan = planExport(cohort, allocate());
+    if (!plan) return;
+    openPlan(plan);
+    void runPlan(plan);
   }
 
   /**
@@ -1787,11 +1934,13 @@ export default function BgRemover() {
 
       const blob = await buildZipStream(files);
       await saveTo(dest, blob, zipName);
+      return zipName;
     } catch (e) {
       toast.error(`Export failed: ${errorMessage(e)}`);
     } finally {
       setExporting(false);
     }
+    return undefined;
   }
 
   // ---- Shared panes ------------------------------------------------------
@@ -2000,6 +2149,34 @@ export default function BgRemover() {
                   : 'Files use the name alone; repeats get -2, -3 so nothing is overwritten.'}
               </FieldDescription>
             </FieldContent>
+          </Field>
+
+          <Field orientation="horizontal">
+            <FieldContent>
+              <FieldLabel htmlFor="bg-seal-size" className="font-normal">
+                Seal a batch every
+              </FieldLabel>
+              <FieldDescription>
+                Clean results are grouped into a downloadable ZIP as they land, so a long run
+                delivers throughout instead of one file at the end. Flagged images are never
+                sealed — they wait for the AI fix and ship with the rest.
+              </FieldDescription>
+            </FieldContent>
+            <Input
+              id="bg-seal-size"
+              type="number"
+              min={1}
+              step={50}
+              className="w-24"
+              value={sealSize}
+              disabled={busy}
+              onChange={(e) => {
+                // An empty field parses to NaN, which would silently switch sealing off for the
+                // rest of the run rather than failing where anyone could see it.
+                const next = Number.parseInt(e.target.value, 10);
+                setSealSize(Number.isFinite(next) && next > 0 ? next : DEFAULT_SEAL_SIZE);
+              }}
+            />
           </Field>
 
           <BudgetControls
@@ -2363,6 +2540,41 @@ export default function BgRemover() {
                         </>
                       )
                     }
+                  />
+                  {/* Above the grid, never inside it: the virtual window's arithmetic needs
+                      every row the same height, so a header interleaved with the cells breaks
+                      the scroll maths outright. */}
+                  <BatchRail
+                    className="mb-3"
+                    batches={railBatches}
+                    selected={selectedBatch}
+                    onSelect={setSelectedBatch}
+                    onDownload={(batch) => {
+                      const open = openPlans.find((p) => p.batch === batch);
+                      if (open) return void runPlan(open);
+                      const row = ledger.find((r) => r.batch === batch);
+                      const redo = row && planReexport(itemsRef.current, row);
+                      if (redo) void runPlan(redo, { reexport: true });
+                    }}
+                    downloadingBatch={exportingBatch}
+                    downloadDisabled={exporting}
+                    running={running}
+                    filling={
+                      running
+                        ? { clean: cleanCohort.length, threshold: Math.max(1, sealSize) }
+                        : null
+                    }
+                    tail={
+                      restCohort.length
+                        ? {
+                            count: restCohort.length,
+                            flagged: restCohort.length - cleanCohort.length,
+                            label: cleanCohort.length ? undefined : 'Remaining',
+                          }
+                        : null
+                    }
+                    onExportTail={() => exportCohort(restCohort)}
+                    exportingTail={exportingBatch !== null}
                   />
                   <VirtualGrid
                     items={displayItems}

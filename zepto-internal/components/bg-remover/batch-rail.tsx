@@ -3,8 +3,8 @@
 // One chip per batch of a large CSV import: progress, a spinner while it runs, its own Download
 // once it finishes, and click-to-filter so the grid can be narrowed to a single batch.
 //
-// A batch is born when its images are EXPORTED, so the rail also carries two things that are not
-// batches yet and are drawn as such (dashed, unnumbered, unselectable):
+// A batch is born when its images are EXPORTED, so the rail also carries two cohorts that are
+// not batches yet, drawn so they cannot be taken for one — dashed, unnumbered, unselectable:
 //
 //   Filling    the clean cutouts piling up toward the next automatic seal. It has no number
 //              because nothing has stamped BgItem.batch for it yet, and no ZIP because the run
@@ -87,6 +87,11 @@ export interface TailCohort {
 }
 
 export interface BatchRailProps {
+  /**
+   * Ascending by batch number, and it has to stay that way: a newly sealed batch is then always
+   * an append, which is what lets every chip already on screen keep its position while a run
+   * seals one batch after another.
+   */
   batches: readonly BatchProgress[];
   /** null = no batch filter; the grid shows every batch. */
   selected: number | null;
@@ -137,11 +142,22 @@ export function BatchRail({
     // Chips keep their intrinsic width and the rail scrolls: a 3,000-row CSV is six chips at the
     // default batch size, but the size is a setting and wrapping them into a second row would
     // push the grid down the page every time one appeared.
+    //
+    // Order is what keeps the rail still while a run seals batch after batch. Every chip is a
+    // FIXED width, so a growing count never resizes one; sealed chips are appended in ascending
+    // order, so a new one lands after the last of them and moves nothing already on screen; and
+    // the only two chips a seal can push sideways are the two at the end — Filling, which has
+    // nothing to click, and Remaining, which is pinned (see below). Nothing carrying a button
+    // ever moves under the pointer.
     <div
       role="group"
       aria-label="Batches"
       className={cn('mb-3 flex items-stretch gap-2 overflow-x-auto pb-1', className)}
     >
+      {/* Present from the first render, including while the only chips are the two live cohorts
+          and this one can do nothing. QueueFilters states the rule and the bug behind it: a
+          control that arrives with a count leaves with one, and the way out of a filter has to
+          outlive whatever emptied the grid. */}
       <Toggle
         size="sm"
         variant="outline"
@@ -167,6 +183,18 @@ export function BatchRail({
           downloadDisabled={downloadDisabled}
         />
       ))}
+
+      {filling && <FillingChip entry={filling} running={running} />}
+
+      {tail && (
+        <TailChip
+          entry={tail}
+          running={running}
+          onExport={onExportTail}
+          exporting={exportingTail}
+          exportDisabled={downloadDisabled}
+        />
+      )}
     </div>
   );
 }
@@ -292,6 +320,150 @@ function BatchChip({
         max={Math.max(1, total)}
         aria-label={`${label} progress`}
       />
+    </div>
+  );
+}
+
+/**
+ * The cohort on its way to becoming the next batch.
+ *
+ * NOT selectable, and that is the decision rather than an omission. Two reasons, either alone
+ * sufficient. Mechanically, the rail's selection is a batch NUMBER and this cohort has none —
+ * making it selectable means a sentinel in `onSelect`'s type that every call site has to spell
+ * out for a filter that lasts minutes. Behaviourally it is worse: membership here is recomputed
+ * from live state, so tiles would come and go from under the user as verdicts land, and at the
+ * seal the whole view would empty at once and start refilling from zero — the stranded-on-an-
+ * empty-grid failure QueueFilters exists to prevent, arriving on a timer nobody pressed.
+ *
+ * A batch chip appears the moment it seals, which is the point at which the set stops moving
+ * and is worth filtering to.
+ */
+function FillingChip({ entry, running }: { entry: FillingBatch; running?: boolean }) {
+  const { clean, threshold } = entry;
+  const target = Math.max(1, threshold);
+
+  return (
+    // Dashed and muted: it looks like the outline of a batch rather than one, because it cannot
+    // be downloaded or filtered to and should not invite either. Same fixed width as a sealed
+    // chip, so the count climbing from 99 to 100 moves nothing outside this box.
+    <div
+      className="flex w-48 shrink-0 flex-col overflow-hidden rounded-lg border border-dashed"
+      title={
+        `${clean} clean cutout${clean === 1 ? '' : 's'} of ${threshold} are waiting to be exported. ` +
+        `At ${threshold} they become the next batch and get their own chip — flagged images are ` +
+        `held back for the Remaining export instead.`
+      }
+    >
+      <div className="flex min-w-0 items-center gap-1.5 px-2.5 py-1.5">
+        {running ? (
+          <Spinner className="size-3.5 text-muted-foreground" />
+        ) : (
+          <PackagePlusIcon className="size-3.5 shrink-0 text-muted-foreground" />
+        )}
+        <span className="min-w-0 truncate text-[0.8rem] font-medium text-muted-foreground">
+          Filling
+        </span>
+        {/* "clean" is carried in the visible text rather than left to the tooltip: this number
+            counts a narrower set than every other number in the rail, and a bare count sitting
+            beside batches that show done/total would read as the same measurement. */}
+        <span className="ml-auto text-xs text-muted-foreground tabular-nums">{clean} clean</span>
+      </div>
+
+      <Progress
+        className="mt-auto gap-0"
+        // Clamped because results land in bursts: several can settle between the count crossing
+        // the threshold and the seal committing, and a value past max draws an indicator wider
+        // than its own track.
+        value={Math.min(clean, target)}
+        max={target}
+        aria-label={`${clean} of ${threshold} clean images toward the next batch`}
+      />
+    </div>
+  );
+}
+
+/**
+ * The leftovers, and the button that ships them.
+ *
+ * Unselectable for the same reasons as FillingChip — no batch number, live membership — with one
+ * extra: this cohort is defined so that it always contains the filling one, and a filter showing
+ * both under a single heading would suggest the two chips describe disjoint piles of work.
+ */
+function TailChip({
+  entry,
+  running,
+  onExport,
+  exporting,
+  exportDisabled,
+}: {
+  entry: TailCohort;
+  running?: boolean;
+  onExport?: () => void;
+  exporting?: boolean;
+  exportDisabled?: boolean;
+}) {
+  const { count, flagged = 0 } = entry;
+  const label = entry.label ?? 'Remaining';
+
+  return (
+    // Pinned to the right edge, by both mechanisms it takes to stay there: ml-auto holds it
+    // against the end while the rail still fits, and sticky takes over once it overflows and
+    // auto margins have no free space left to resolve to. Every seal inserts a chip ahead of
+    // this one, and an export button that jumps a chip's width each time a batch completes is
+    // the reflow-under-the-pointer failure the rail is built to avoid — here it would land on
+    // the one button that ships the images nothing else will.
+    //
+    // The wrapper carries the background so sealed chips scroll UNDER this one rather than
+    // through it, and its left padding is the gutter that keeps the seam legible.
+    <div className="sticky right-0 ml-auto flex shrink-0 items-stretch bg-background pl-2">
+      <div className="flex w-48 flex-col overflow-hidden rounded-lg border border-dashed">
+        <div className="flex flex-1 items-stretch">
+          <div className="flex min-w-0 flex-1 flex-col gap-1 px-2.5 py-1.5">
+            <span className="flex min-w-0 items-center gap-1.5">
+              <InboxIcon className="size-3.5 shrink-0 text-muted-foreground" />
+              <span className="min-w-0 truncate text-[0.8rem] font-medium">{label}</span>
+              <span className="ml-auto text-xs text-muted-foreground tabular-nums">{count}</span>
+            </span>
+
+            {flagged > 0 && (
+              <span className="flex flex-wrap items-center gap-1">
+                {/* Why anything is left at all. Without it a tail of 50 beside batches of 500
+                    reads as a run that stopped early rather than as the images held back. */}
+                <Badge variant="chip-warn">{flagged} flagged</Badge>
+              </span>
+            )}
+          </div>
+
+          {onExport && (
+            <div className="flex items-center border-l px-1">
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                // Enabled during a run on purpose. The count is not final then — the tooltip
+                // says so — but the alternative is a button that only works once inference has
+                // stopped, and abandoning a run to ship what already came out is a legitimate
+                // thing to want on a queue this size.
+                disabled={count === 0 || exporting || exportDisabled}
+                title={
+                  count === 0
+                    ? 'Nothing is waiting — every finished image is already in a batch.'
+                    : `Export the ${count} finished image${count === 1 ? '' : 's'} no batch ` +
+                      'has claimed yet — flagged or not, and including the clean ones still ' +
+                      'filling the next batch. File numbering carries on from the last batch, ' +
+                      'so every ZIP can be unpacked into one folder.' +
+                      (running
+                        ? ' The run is still going, so whatever finishes after this will not be in it.'
+                        : '')
+                }
+                onClick={onExport}
+              >
+                {exporting ? <Spinner /> : <DownloadIcon />}
+                <span className="sr-only">{`Export ${label}`}</span>
+              </Button>
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

@@ -53,7 +53,9 @@ export function isInFlight(item: BgItem): boolean {
  *
  * The statuses that fall out here, spelled out so none of them goes missing silently:
  *   - never run / cancelled / errored on a first run — no cutout, nothing to encode;
- *   - 'removing' or 'loading-model' — a redo cleared the cutout first, so also nothing;
+ *   - 'removing' or 'loading-model' — a redo KEEPS the old cutout until the new one lands
+ *     (cutOut only patches status on the way in), so these rows do have pixels; they are held
+ *     back because those pixels are about to be replaced, not because they are missing;
  *   - 'editing', or a re-removal pending after one — held back by isInFlight above;
  *   - 'error' that still carries a cutout — an AI edit that failed AFTER the item already had a
  *     good cutout leaves exactly this, and it DOES ship. Nothing further will change it, the
@@ -147,47 +149,54 @@ export function batchItems(items: readonly BgItem[], batch: number): CutoutItem[
  *
  * The ledger is consulted too, because a batch whose items were ALL deleted survives nowhere else.
  */
-export function nextBatchNumber(
-  items: readonly BgItem[],
-  ledger: readonly BatchRecord[] = [],
-): number {
-  let max = 0;
-  for (const item of items) {
-    if (typeof item.batch === 'number' && item.batch > max) max = item.batch;
-  }
-  for (const record of ledger) {
-    if (record.batch > max) max = record.batch;
-  }
-  return max + 1;
+export interface Allocation {
+  /** The number the next ZIP stamps on its members. */
+  batch: number;
+  /** Files promised to earlier ZIPs, so the next one's first file is `offset + 1`. */
+  offset: number;
 }
 
 /**
- * How many files have already been written across every ZIP so far — the offset the next export's
- * numbering continues from, so batch 2 starts at 501 and unzipping both into one folder cannot
- * overwrite anything.
+ * The next unused batch number and file offset.
  *
- * A HIGH-WATER MARK, not a live count of stamped items, and the difference is a real collision:
- * export 500, delete 3 of them, export again — counting stamps gives 497, the second ZIP starts
- * at 498, and its first three files land on top of files 498-500 from the first. The ledger's
- * records are the memory of files that exist on disk whether or not their items still exist here.
+ * `pending` is the load-bearing argument: a plan is decided minutes before its save lands, and
+ * `batch` is only stamped once it does. Deriving purely from stamps and finished records made
+ * every plan decided inside that window identical to the last — same batch number, same offset —
+ * so two ZIPs claimed the same range and the second overwrote the first file for file. Anything
+ * already promised has to count, whether or not it has been written yet.
  *
- * The stamped count is still the floor, because a queue restored from a .zesku carries stamps
- * with no records behind them; there it is the only evidence of how many files were written.
+ * `floor` is the high-water mark carried over from earlier sessions. Neither number may ever go
+ * backwards: files already sitting in the user's folder cannot be un-written, so an offset that
+ * retreats — because shipped rows were deleted, or because a restore brought back stamps without
+ * their records — renumbers the next ZIP straight into names that already exist on disk.
  */
-export function exportedFileCount(
+export function nextAllocation(
   items: readonly BgItem[],
   ledger: readonly BatchRecord[] = [],
-): number {
+  pending: readonly ExportPlan[] = [],
+  floor: Allocation = { batch: 1, offset: 0 },
+): Allocation {
+  let batch = Math.max(1, Math.floor(floor.batch)) - 1;
+  let offset = Math.max(0, Math.floor(floor.offset));
   let stamped = 0;
   for (const item of items) {
-    if (isExported(item)) stamped++;
+    if (typeof item.batch === 'number') {
+      stamped++;
+      if (item.batch > batch) batch = item.batch;
+    }
   }
-  let high = stamped;
+  if (stamped > offset) offset = stamped;
   for (const record of ledger) {
+    if (record.batch > batch) batch = record.batch;
     const end = record.offset + record.count;
-    if (end > high) high = end;
+    if (end > offset) offset = end;
   }
-  return high;
+  for (const plan of pending) {
+    if (plan.batch > batch) batch = plan.batch;
+    const end = plan.offset + plan.items.length;
+    if (end > offset) offset = end;
+  }
+  return { batch: batch + 1, offset };
 }
 
 // ---- Plans ----------------------------------------------------------------
@@ -212,21 +221,18 @@ export interface ExportPlan {
 /** A cohort turned into a plan. Null for an empty cohort — there is no such thing as an empty ZIP. */
 export function planExport(
   cohort: readonly CutoutItem[],
-  items: readonly BgItem[],
-  ledger: readonly BatchRecord[] = [],
+  alloc: Allocation,
 ): ExportPlan | null {
   if (!cohort.length) return null;
-  return {
-    batch: nextBatchNumber(items, ledger),
-    offset: exportedFileCount(items, ledger),
-    items: [...cohort],
-  };
+  return { batch: alloc.batch, offset: alloc.offset, items: [...cohort] };
 }
 
 export interface SealOptions extends CohortOptions {
   /** Clean-and-unexported images required before a batch seals. Defaults to DEFAULT_SEAL_SIZE. */
   threshold?: number;
   ledger?: readonly BatchRecord[];
+  /** Where this seal's numbers come from. See nextAllocation — never derive them here. */
+  alloc: Allocation;
 }
 
 /**
@@ -250,13 +256,17 @@ export interface SealOptions extends CohortOptions {
 export function planSeal(
   items: readonly BgItem[],
   verdictOf: VerdictLookup,
-  options: SealOptions = {},
+  options: SealOptions,
 ): ExportPlan | null {
   // A threshold under 1 would seal a one-image ZIP on every single commit of a running batch.
-  const threshold = Math.max(1, Math.round(options.threshold ?? DEFAULT_SEAL_SIZE));
+  // The NaN guard is not theoretical: the seal size is a user-typed number, and an empty field
+  // parses to NaN, which passes every comparison below and slices an empty cohort — sealing
+  // would simply never fire again, with nothing thrown and nothing to see.
+  const raw = Math.round(options.threshold ?? DEFAULT_SEAL_SIZE);
+  const threshold = Number.isFinite(raw) ? Math.max(1, raw) : DEFAULT_SEAL_SIZE;
   const clean = cleanUnexported(items, verdictOf, options);
   if (clean.length < threshold) return null;
-  return planExport(clean.slice(0, threshold), items, options.ledger);
+  return planExport(clean.slice(0, threshold), options.alloc);
 }
 
 /**
@@ -379,7 +389,7 @@ export interface LedgerBatch {
   /**
    * How many of them are still in the queue. Lower than `shipped` after a deletion, which is not
    * a problem to fix: the file on disk still contains that image, and its slot in the numbering
-   * stays reserved (see exportedFileCount).
+   * stays reserved (see nextAllocation).
    */
   present: number;
   staleness: BatchStaleness;
