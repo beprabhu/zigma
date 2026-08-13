@@ -217,6 +217,35 @@ export function SourceImage({ item, className }: { item: BgItem; className?: str
  * Why each region survived or was dropped. A heuristic that cannot be inspected cannot be
  * tuned — and these numbers are what a bug report needs to be actionable.
  */
+/**
+ * Stands in for the cutout that is not there yet. The dialog opens for unfinished rows now, so
+ * this pane is legitimately empty across most of the queue's life — and the message has to name
+ * the actual state: telling someone to "run Remove backgrounds" while their batch is halfway
+ * through removing that very image is advice to do the thing already happening, and the modal
+ * covers the tile whose spinner would otherwise have said so.
+ */
+function EmptyCutout({ status }: { status: BgItemStatus }) {
+  const working = status === 'removing' || status === 'loading-model' || status === 'editing';
+  const message =
+    status === 'error'
+      ? 'Background removal failed — Redo below to try again.'
+      : status === 'cancelled'
+        ? 'Stopped before it finished — Redo to run it again.'
+        : status === 'editing'
+          ? 'Regenerating this image with the AI edit…'
+          : status === 'loading-model'
+            ? 'Loading the model…'
+            : status === 'removing'
+              ? 'Removing the background…'
+              : 'No cutout yet — run Remove backgrounds to create one.';
+  return (
+    <div className="flex max-w-56 flex-col items-center gap-2">
+      {working && <Spinner className="size-5 text-primary" />}
+      <p className="text-center text-xs text-balance text-muted-foreground">{message}</p>
+    </div>
+  );
+}
+
 function RegionTable({ regions }: { regions: RegionReport[] }) {
   if (!regions.length) return null;
   const sorted = [...regions].sort((a, b) => b.area - a.area).slice(0, 8);
@@ -616,26 +645,30 @@ function CompareView({
             Background removed{background === TRANSPARENT ? '' : ` · on ${background}`}
           </figcaption>
           <div
-            className="grid h-64 place-items-center overflow-hidden rounded-lg border p-2"
-            style={backdropStyle(background)}
+            className={cn(
+              'grid h-64 place-items-center overflow-hidden rounded-lg border p-2',
+              // The export backdrop is only worth showing under an actual cutout. It is a
+              // user-chosen colour, so the empty-state text below would be painted onto it —
+              // white-on-white for the default light backdrop viewed in a dark theme, and the
+              // mirror of that for a dark custom hex. The pane then reads as blank, which is
+              // the exact failure this message exists to prevent.
+              !item.cutout && 'bg-muted/40',
+            )}
+            style={item.cutout ? backdropStyle(background) : undefined}
           >
             {item.cutout ? (
               <CutoutImage itemId={item.id} cutout={item.cutout} max={560} className="max-h-full max-w-full" />
             ) : (
-              // The dialog opens for unfinished items too, so this pane is legitimately empty
-              // for anything queued, cancelled, failed, or waiting for an AI edit's re-removal.
-              // Saying so beats a blank box that reads as a broken preview.
-              <p className="max-w-56 text-center text-xs text-balance text-muted-foreground">
-                {item.status === 'error'
-                  ? 'Background removal failed — Redo below to try again.'
-                  : 'No cutout yet — run Remove backgrounds to create one.'}
-              </p>
+              <EmptyCutout status={item.status} />
             )}
           </div>
         </figure>
       </div>
 
-      {item.regionReport && item.regionReport.length > 0 && (
+      {/* Tied to the cutout it measures: the report is never cleared, so an AI edit or a failed
+          redo leaves last run's verdicts sitting under a pane that says there is no cutout —
+          two contradictory claims about a matte the user can no longer see or download. */}
+      {item.cutout && item.regionReport && item.regionReport.length > 0 && (
         <RegionTable regions={item.regionReport} />
       )}
 
