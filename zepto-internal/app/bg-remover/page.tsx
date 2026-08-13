@@ -347,9 +347,18 @@ export default function BgRemover() {
   const [warming, setWarming] = React.useState(false);
   /** True while "AI-fix flagged" is mid-flight through Azure (before the re-removal batch). */
   const [aiFixing, setAiFixing] = React.useState(false);
+  /** The removal run's line. Owned by runBatchInner alone — see exportProgress. */
   const [progress, setProgress] = React.useState<{ pct: number; text: string } | null>(null);
   /** The Azure phase's own progress line — it may run concurrently with a removal batch. */
   const [aiProgress, setAiProgress] = React.useState<{ pct: number; text: string } | null>(null);
+  /**
+   * The export's own line. Separate from `progress` because the two phases can be live at the
+   * same time once a finished batch is downloadable while a later one still runs: sharing one
+   * bar meant the encode counter and the run's ETA overwrote each other every tick.
+   */
+  const [exportProgress, setExportProgress] = React.useState<{ pct: number; text: string } | null>(
+    null,
+  );
   const [download, setDownload] = React.useState<LoadProgress | null>(null);
   const [stage, setStage] = React.useState<RemoveStage | null>(null);
   const [setupError, setSetupError] = React.useState<string | null>(null);
@@ -1442,7 +1451,7 @@ export default function BgRemover() {
           // stage owns the whole bar, or it would stall at 50% until the run ended.
           const span = proc.compressOn ? 50 : 100;
           const left = encodeEta.remaining(encoded, ready.length);
-          setProgress({
+          setExportProgress({
             pct: (encoded / ready.length) * span,
             text: `Encoding ${encoded} of ${ready.length}…${left ? ` · ${left}` : ''}`,
           });
@@ -1473,7 +1482,7 @@ export default function BgRemover() {
             } finally {
               compressed++;
               const left = compressEta.remaining(compressed, ready.length);
-              setProgress({
+              setExportProgress({
                 pct: 50 + (compressed / ready.length) * 50,
                 text: `Compressing ${compressed} of ${ready.length}…${left ? ` · ${left}` : ''}`,
               });
@@ -1547,7 +1556,7 @@ export default function BgRemover() {
         );
       }
       setCompressSummary(summary.join(' · '));
-      setProgress({
+      setExportProgress({
         pct: 100,
         text: failed
           ? `Exported ${files.length} PNG${files.length > 1 ? 's' : ''} with ${failed} compression failure${failed > 1 ? 's' : ''}.`
@@ -1809,16 +1818,20 @@ export default function BgRemover() {
 
   // progress.text is never cleared once a run or an export has finished, so the compression
   // summary has to share the line with it rather than sit behind it in a fallback chain.
-  // The AI-edit phase can overlap a removal batch, so its line joins in rather than replacing.
+  // The AI-edit phase and the export can each overlap a removal batch, so their lines join in
+  // rather than replacing — three phases can legitimately be reporting at once.
   const statusLine =
     (download && describeDownload(download)) ||
-    [progress?.text, aiProgress?.text, compressSummary].filter(Boolean).join(' · ') ||
+    [progress?.text, aiProgress?.text, exportProgress?.text, compressSummary]
+      .filter(Boolean)
+      .join(' · ') ||
     'Cutouts export as PNGs in a ZIP.';
 
   const exportFooter = (
     <div className="space-y-2">
       {progress && <Progress value={progress.pct} />}
       {aiProgress && <Progress value={aiProgress.pct} />}
+      {exportProgress && <Progress value={exportProgress.pct} />}
       {download?.ratio != null && <Progress value={download.ratio * 100} />}
       <p className="text-xs break-words text-muted-foreground">
         {statusLine}
