@@ -81,7 +81,7 @@ import {
   disposePool, getPoolBackend, isPoolSupported, poolRemoveBackground, warmPool,
   type PoolCutout,
 } from '@/lib/bg/pool';
-import { PROJECT_EXTENSION, loadProject, saveProject } from '@/lib/bg/project';
+import { PROJECT_EXTENSION, loadProject, saveProject, type ProjectCsv } from '@/lib/bg/project';
 import { assessQuality, countFlagged, sortByQuality } from '@/lib/bg/quality';
 import { readParallel } from '@/lib/rate';
 import { createEta } from '@/lib/eta';
@@ -214,6 +214,14 @@ function itemFromAutosave(record: AutosaveRecord, id: number): BgItem {
     // A record without a cutout is an AI-regenerated source that crashed before re-removal —
     // it comes back queued, one "Remove backgrounds" away from where it left off.
     status: record.cutout ? 'done' : 'ready',
+    // Provenance has to come back with the row or a later remap has only the URL to go on, and
+    // one CSV row's images repeat across rows: two rows sharing a picture both took the first
+    // row's title, so restoring and then changing the name column mislabelled every duplicate.
+    ...(record.csv ? { csv: record.csv } : null),
+    ...(record.originalSourceUrl
+      ? { originalSource: { kind: 'url' as const, url: record.originalSourceUrl } }
+      : null),
+    ...(record.batch !== undefined ? { batch: record.batch } : null),
   };
 }
 
@@ -300,7 +308,27 @@ export default function BgRemover() {
     discard: discardAutosave,
     lastSavedAt: autosavedAt,
     failing: autosaveFailing,
+    saveCsv: autosaveCsv,
   } = useAutosave(items);
+
+  /**
+   * Rebuilds the panel's CSV state from a saved sheet. `headers` is not stored — re-parsing the
+   * text is what the mapping UI needs anyway, and one parse on open is cheaper than carrying a
+   * second copy of the column list that could disagree with the text it came from.
+   */
+  const csvInfoFromSheet = React.useCallback((sheet: ProjectCsv) => {
+    const { headers } = draftsFromCsv(sheet.text, {
+      nameColumn: sheet.nameColumn || null,
+      imageColumns: sheet.imageColumns,
+    });
+    return {
+      fileName: sheet.fileName,
+      text: sheet.text,
+      headers,
+      imageColumns: sheet.imageColumns,
+      nameColumn: sheet.nameColumn,
+    };
+  }, []);
 
   // Figma-style "file name" for the session, shown in the panel header. Working state, not
   // decoration: it seeds the .zesku and export ZIP filenames. Auto-seeded from the first
@@ -322,9 +350,12 @@ export default function BgRemover() {
         const base = nextItemId(prev);
         return [...prev, ...records.map((r, i) => itemFromAutosave(r, base + i))];
       });
+      // Only when this session has no sheet of its own: a recovered queue must never displace
+      // the CSV the user is already working against.
+      if (records.csv) setCsvInfo((prev) => prev ?? csvInfoFromSheet(records.csv!));
       toast.success(`Restored ${records.length} image${records.length === 1 ? '' : 's'}.`);
     });
-  }, [restoreAutosave]);
+  }, [restoreAutosave, csvInfoFromSheet]);
   const [selectedId, setSelectedId] = React.useState<number | null>(null);
   // Display-only reordering for the results grid — never touches `items`, so export naming and
   // retry-by-id are unaffected. Worst-first; ties keep queue order (Array#sort is stable).
@@ -665,6 +696,25 @@ export default function BgRemover() {
     setItems([...kept, ...fresh]);
   }, []);
 
+  // Mirrors the sheet into the crash net alongside the items. The ref is what stops a fresh
+  // mount from writing a null: that would delete a crashed session's CSV before its restore
+  // prompt has even been answered. Only a sheet that existed in THIS session can clear one.
+  const csvMirrored = React.useRef(false);
+  React.useEffect(() => {
+    if (!csvInfo && !csvMirrored.current) return;
+    csvMirrored.current = true;
+    autosaveCsv(
+      csvInfo
+        ? {
+            fileName: csvInfo.fileName,
+            text: csvInfo.text,
+            nameColumn: csvInfo.nameColumn,
+            imageColumns: csvInfo.imageColumns,
+          }
+        : null,
+    );
+  }, [csvInfo, autosaveCsv]);
+
   const handleCsv = React.useCallback(
     ({ fileName, text, imported }: CsvPayload) => {
       seedSessionName(fileName);
@@ -710,6 +760,16 @@ export default function BgRemover() {
       let skippedCount = 0;
       const blob = await saveProject(all, safeArea, outputBg, {
         includeOriginals: saveOriginals,
+        // The sheet travels with the queue: without it a reopened project cannot re-derive the
+        // column mapping, so the name column can never be changed again.
+        csv: csvInfo
+          ? {
+              fileName: csvInfo.fileName,
+              text: csvInfo.text,
+              nameColumn: csvInfo.nameColumn,
+              imageColumns: csvInfo.imageColumns,
+            }
+          : undefined,
         onSkip: (skipped) => {
           skippedCount = skipped.length;
           const names = skipped.slice(0, 3).map((s) => s.name).join(', ');
@@ -753,10 +813,20 @@ export default function BgRemover() {
               // v2 can restore rows that were saved before they ran.
               status: r.cutout ? 'done' : 'ready',
               ...(r.tileFit !== undefined ? { tileFit: r.tileFit } : null),
+              // Same reason as the autosave path: without the cell a later remap falls back to
+              // the URL, and rows that share a picture cannot be told apart.
+              ...(r.csv ? { csv: r.csv } : null),
+              ...(r.originalSourceUrl
+                ? { originalSource: { kind: 'url' as const, url: r.originalSourceUrl } }
+                : null),
+              ...(r.batch !== undefined ? { batch: r.batch } : null),
             }),
           ),
         ];
       });
+      // Same rule as the autosave restore: the file's sheet fills an empty panel, it never
+      // replaces the CSV this session is already mapped against.
+      if (restored.csv) setCsvInfo((prev) => prev ?? csvInfoFromSheet(restored.csv!));
       setSafeArea(restored.safeArea);
       setOutputBg(restored.outputBg);
       setTileFitOn(true);
