@@ -6,7 +6,7 @@
 // result, which is the only place the exact string sent to Azure can be read back.
 
 import * as React from 'react';
-import { CheckIcon, CopyIcon, DownloadIcon, RefreshCwIcon } from 'lucide-react';
+import { CheckIcon, CopyIcon, DownloadIcon, RefreshCwIcon, Undo2Icon } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import {
@@ -160,12 +160,15 @@ export function GenDialog({
   running,
   onClose,
   onRegenerate,
+  onUndo,
 }: {
   item: GenItem | null;
   previewPrompt: string;
   running: boolean;
   onClose: () => void;
   onRegenerate: (id: number) => void;
+  /** Restores the result the last regenerate replaced. Shown only while item.prev exists. */
+  onUndo: (id: number) => void;
 }) {
   const [saving, setSaving] = React.useState(false);
   const shown = item?.sentPrompt ?? previewPrompt;
@@ -246,6 +249,17 @@ export function GenDialog({
                 <RefreshCwIcon data-icon="inline-start" />
                 Regenerate
               </Button>
+              {item.prev && (
+                <Button
+                  variant="outline"
+                  disabled={running}
+                  title="Restore the image the last regenerate replaced"
+                  onClick={() => onUndo(item.id)}
+                >
+                  <Undo2Icon data-icon="inline-start" />
+                  Undo
+                </Button>
+              )}
               <Button disabled={!item.image || saving} onClick={handleDownload}>
                 {saving ? <Spinner data-icon="inline-start" /> : <DownloadIcon data-icon="inline-start" />}
                 Download PNG

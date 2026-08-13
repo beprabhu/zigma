@@ -128,6 +128,10 @@ export default function Compositor() {
   const itemIds = React.useMemo(() => items.map((it) => it.id), [items]);
   const sel = useGridSelection(itemIds, openId !== null);
 
+  // Post-await reads (undo eligibility, toast actions) need the LIVE queue, not the closure.
+  const itemsRef = React.useRef<QueueItem[]>(items);
+  React.useEffect(() => { itemsRef.current = items; }, [items]);
+
   const canvases = React.useRef(new Map<number, HTMLCanvasElement>());
   const registerCanvas = React.useCallback((id: number, canvas: HTMLCanvasElement | null) => {
     if (canvas) canvases.current.set(id, canvas);
@@ -238,7 +242,13 @@ export default function Compositor() {
         toast.warning(`Row ${item.id + 1}: tile generated without background removal — ${(e as Error).message}`);
       }
     }
-    patchItem(item.id, { status: 'done', resultImage, compressed: null });
+    patchItem(item.id, {
+      status: 'done',
+      resultImage,
+      compressed: null,
+      // `item` is the pre-run snapshot: if it had a tile, that tile becomes the undo slot.
+      ...(item.resultImage ? { prev: { resultImage: item.resultImage } } : null),
+    });
   }
 
   function guards(): boolean {
@@ -283,10 +293,32 @@ export default function Compositor() {
     setRunning(false);
   }
 
+  /** Restores the tile the last regenerate replaced. */
+  function undoItem(id: number) {
+    const item = itemsRef.current.find((it) => it.id === id);
+    if (!item?.prev) return;
+    patchItem(id, {
+      status: 'done',
+      resultImage: item.prev.resultImage,
+      compressed: null,
+      errorMsg: undefined,
+      prev: undefined,
+    });
+  }
+
   async function handleRegenerateSelected() {
     if (!guards()) return;
     // Rows without image URLs can't generate; quietly skip them like Generate-all does.
-    await runTiles(items.filter((it) => sel.checked.has(it.id) && it.urls.length), 'regenerated');
+    const todo = items.filter((it) => sel.checked.has(it.id) && it.urls.length);
+    await runTiles(todo, 'regenerated');
+    const undoable = todo
+      .map((it) => it.id)
+      .filter((id) => itemsRef.current.find((it) => it.id === id)?.prev);
+    if (undoable.length) {
+      toast.success(`${undoable.length} regenerated`, {
+        action: { label: 'Undo', onClick: () => undoable.forEach(undoItem) },
+      });
+    }
   }
 
   function deleteSelected() {
@@ -897,6 +929,7 @@ export default function Compositor() {
         running={running}
         onClose={() => setOpenId(null)}
         onRegenerate={handleRegenerate}
+        onUndo={(item) => undoItem(item.id)}
       />
     </div>
   );

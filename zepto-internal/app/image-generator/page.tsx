@@ -202,6 +202,10 @@ export default function ImageGenerator() {
         sentPrompt: prompt,
         durationMs: performance.now() - started,
         errorMsg: undefined,
+        // `item` is the pre-run snapshot: if it had a result, that result becomes the undo slot.
+        ...(item.image
+          ? { prev: { image: item.image, sentPrompt: item.sentPrompt, durationMs: item.durationMs } }
+          : null),
       });
       return true;
     } catch (e) {
@@ -294,11 +298,31 @@ export default function ImageGenerator() {
     sel.clear();
   }
 
+  /** Restores the result the last regenerate replaced. */
+  function undoItem(id: number) {
+    const item = itemsRef.current.find((it) => it.id === id);
+    if (!item?.prev) return;
+    patchItem(id, {
+      status: 'done',
+      image: item.prev.image,
+      sentPrompt: item.prev.sentPrompt,
+      durationMs: item.prev.durationMs,
+      errorMsg: undefined,
+      prev: undefined,
+    });
+  }
+
   async function handleRegenerateSelected() {
     if (busy || !guards()) return;
     const todo = itemsRef.current.filter((it) => sel.checked.has(it.id));
     if (!todo.length) return;
     await runBatch(todo, 'regenerated');
+    const undoable = todo.filter((it) => itemsRef.current.find((n) => n.id === it.id)?.prev);
+    if (undoable.length) {
+      toast.success(`${undoable.length} regenerated`, {
+        action: { label: 'Undo', onClick: () => undoable.forEach((it) => undoItem(it.id)) },
+      });
+    }
   }
 
   /** Full reset back to the drop zone. The brief survives — it is its own input document. */
@@ -652,6 +676,7 @@ export default function ImageGenerator() {
         running={busy}
         onClose={() => setOpenId(null)}
         onRegenerate={handleRegenerate}
+        onUndo={undoItem}
       />
 
       {/* Brief editor — the .md tile in the Input card opens this. */}

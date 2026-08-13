@@ -7,7 +7,8 @@
 
 import * as React from 'react';
 import {
-  CheckIcon, ChevronRightIcon, CopyIcon, DownloadIcon, RefreshCwIcon, SparklesIcon,
+  CheckIcon, ChevronRightIcon, CopyIcon, DownloadIcon, ExternalLinkIcon, RefreshCwIcon,
+  SparklesIcon, Undo2Icon,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
@@ -286,6 +287,8 @@ export interface CompareDialogProps {
   /** Seeds the dialog's refine checkbox from the global setting. */
   defaultRefine?: boolean;
   onRedo?: (item: BgItem, options: CompareRedoOptions) => void;
+  /** Restores what the last Redo / AI edit replaced. Shown only while item.prev exists. */
+  onUndo?: (item: BgItem) => void;
   /**
    * Send this image to Azure GPT-Image; the result replaces the item's source. The dialog
    * shows `defaultPrompt` in an editable per-image field and hands the (possibly tweaked)
@@ -329,6 +332,7 @@ export function CompareDialog({
   defaultModel,
   defaultRefine,
   onRedo,
+  onUndo,
   aiEdit,
   busy,
 }: CompareDialogProps) {
@@ -346,6 +350,7 @@ export function CompareDialog({
             defaultModel={defaultModel}
             defaultRefine={defaultRefine}
             onRedo={onRedo}
+            onUndo={onUndo}
             aiEdit={aiEdit}
             busy={busy}
           />
@@ -364,6 +369,7 @@ function CompareView({
   defaultModel,
   defaultRefine,
   onRedo,
+  onUndo,
   aiEdit,
   busy,
 }: {
@@ -375,6 +381,7 @@ function CompareView({
   defaultModel?: string;
   defaultRefine?: boolean;
   onRedo?: (item: BgItem, options: CompareRedoOptions) => void;
+  onUndo?: (item: BgItem) => void;
   aiEdit?: {
     ready: boolean;
     hint: string;
@@ -474,6 +481,19 @@ function CompareView({
             >
               {copied ? <CheckIcon /> : <CopyIcon />}
               <span className="sr-only">Copy image URL</span>
+            </Button>
+          )}
+          {sourceUrl && (
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              className="shrink-0"
+              title="Open the original image URL in a new tab"
+              nativeButton={false}
+              render={<a href={sourceUrl} target="_blank" rel="noreferrer" />}
+            >
+              <ExternalLinkIcon />
+              <span className="sr-only">Open original image</span>
             </Button>
           )}
         </div>
@@ -612,6 +632,17 @@ function CompareView({
             </Button>
           </div>
         ) : null}
+        {onUndo && item.prev && (
+          <Button
+            variant="outline"
+            disabled={busy}
+            title="Restore the image and cutout the last redo or AI edit replaced"
+            onClick={() => onUndo(item)}
+          >
+            <Undo2Icon data-icon="inline-start" />
+            Undo
+          </Button>
+        )}
         <Button disabled={!item.cutout || saving} onClick={handleDownload}>
           {saving ? <Spinner data-icon="inline-start" /> : <DownloadIcon data-icon="inline-start" />}
           Download PNG

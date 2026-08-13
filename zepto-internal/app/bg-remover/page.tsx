@@ -7,6 +7,7 @@ import {
   CircleStopIcon,
   CloudDownloadIcon,
   DownloadIcon,
+  FrameIcon,
   ImagesIcon,
   RefreshCwIcon,
   SaveIcon,
@@ -238,6 +239,12 @@ function itemFromAutosave(record: AutosaveRecord, id: number): BgItem {
 export default function BgRemover() {
   // Tile fit is a processing switch on the right pane now, not a mode of its own.
   const [tileFitOn, setTileFitOn] = usePersistedState('skuc_bgTileFit', false);
+  // The global toggle is only the DEFAULT — items can pin themselves on/off from the selection
+  // bar. Every render/export decision goes through this, never through tileFitOn directly.
+  const effectiveTileFit = React.useCallback(
+    (item: BgItem) => item.tileFit ?? tileFitOn,
+    [tileFitOn],
+  );
 
   // ---- Settings (persisted) ----
   const [storedModel, setModelId] = usePersistedState<BgModelId>('skuc_bgModel', DEFAULT_MODEL_ID);
@@ -249,6 +256,9 @@ export default function BgRemover() {
   // default: it is a heuristic, so it only ever runs where it was asked for.
   const [productOnly, setProductOnly] = usePersistedState('skuc_bgProductOnly', false);
   const [outputBg, setOutputBg] = usePersistedState('skuc_bgOutput', TRANSPARENT);
+  // Save-project scope: embedding dropped files makes a .zesku self-contained (v2); off keeps
+  // only cutouts + URLs for huge batches.
+  const [saveOriginals, setSaveOriginals] = usePersistedState('skuc_bgSaveOriginals', true);
   const [safeArea, setSafeArea] = usePersistedState<SafeAreaConfig>('skuc_bgSafeArea', DEFAULT_SAFE_AREA);
   // Azure credentials are the compositor's own keys, read from the same storage so the two
   // products never hold different values; only the default prompt is this product's.
@@ -595,18 +605,20 @@ export default function BgRemover() {
 
   // ---- Working file (.zesku): everything needed to resume tile fitting later -------------
   async function handleSaveProject() {
-    const ready = withCutout(itemsRef.current);
-    if (!ready.length || busy) return;
+    const all = itemsRef.current;
+    if (!all.length || busy) return;
     const projectName = `${sessionSlug || `zesku-project-${new Date().toISOString().slice(0, 10)}`}${PROJECT_EXTENSION}`;
     const dest = await pickSave(projectName);
     if (dest === 'cancelled') return;
     setExporting(true);
     try {
-      const blob = await saveProject(ready, safeArea, outputBg);
+      // v2: EVERY item goes in — unprocessed rows too — with sources (URLs as strings, files
+      // as embedded originals unless the size checkbox says otherwise).
+      const blob = await saveProject(all, safeArea, outputBg, { includeOriginals: saveOriginals });
       await saveTo(dest, blob, projectName);
-      const skipped = itemsRef.current.length - ready.length;
+      const cutouts = withCutout(all).length;
       toast.success(
-        `Saved ${ready.length} cutout${ready.length === 1 ? '' : 's'} with bounds and safe-area settings${skipped ? ` (${skipped} unprocessed item${skipped === 1 ? '' : 's'} not included)` : ''}.`,
+        `Saved ${all.length} image${all.length === 1 ? '' : 's'} (${cutouts} finished) with sources and safe-area settings.`,
       );
     } catch (e) {
       toast.error(`Could not save the project: ${errorMessage(e)}`);
@@ -634,7 +646,9 @@ export default function BgRemover() {
               source: r.source,
               original: null,
               cutout: r.cutout,
-              status: 'done',
+              // v2 can restore rows that were saved before they ran.
+              status: r.cutout ? 'done' : 'ready',
+              ...(r.tileFit !== undefined ? { tileFit: r.tileFit } : null),
             }),
           ),
         ];
@@ -644,8 +658,9 @@ export default function BgRemover() {
       setTileFitOn(true);
       seedSessionName(file.name);
       const count = restored.items.length;
+      const finished = restored.items.filter((r) => r.cutout).length;
       toast.success(
-        `${file.name}: restored ${count} cutout${count === 1 ? '' : 's'} — safe-area settings applied, ready for tile fit.`,
+        `${file.name}: restored ${count} image${count === 1 ? '' : 's'} (${finished} finished) — safe-area settings applied.`,
       );
     } catch (e) {
       toast.error(errorMessage(e));
@@ -930,6 +945,8 @@ export default function BgRemover() {
         status: 'ready',
         error: undefined,
         durationMs: undefined,
+        // Undo restores the pre-edit input AND its cutout in one step.
+        prev: { source: item.source, cutout: item.cutout },
       };
       patchItem(item.id, updated);
       return updated;
@@ -1027,7 +1044,10 @@ export default function BgRemover() {
       // handler's stale `busy` closure would otherwise not matter — but the flag must not
       // outlive the Azure phase it describes.
       setAiFixing(false);
-      if (updated.length) await runBatch(updated, 'Re-removing');
+      if (updated.length) {
+        await runBatch(updated, 'Re-removing');
+        offerUndo(updated.map((u) => u.id), 'AI-edited');
+      }
     } finally {
       aiAbortRef.current = null;
       setAiFixing(false);
@@ -1044,9 +1064,35 @@ export default function BgRemover() {
       status: 'ready',
       error: undefined,
       durationMs: undefined,
+      prev: { source: item.source, cutout: item.cutout },
     };
     patchItem(item.id, reset);
     void runBatch([reset], 'Redoing', overrides);
+  }
+
+  /** Restores an item to the source+cutout the last Redo / AI edit replaced. */
+  function undoItem(id: number) {
+    const item = itemsRef.current.find((it) => it.id === id);
+    if (!item?.prev) return;
+    dropPreview(id);
+    patchItem(id, {
+      source: item.prev.source,
+      cutout: item.prev.cutout,
+      status: item.prev.cutout ? 'done' : 'ready',
+      error: undefined,
+      durationMs: undefined,
+      original: null,
+      prev: undefined,
+    });
+  }
+
+  /** Post-batch toast with a one-click bulk undo over everything the batch replaced. */
+  function offerUndo(ids: number[], verb: string) {
+    const undoable = ids.filter((id) => itemsRef.current.find((it) => it.id === id)?.prev);
+    if (!undoable.length) return;
+    toast.success(`${undoable.length} ${verb}`, {
+      action: { label: 'Undo', onClick: () => undoable.forEach(undoItem) },
+    });
   }
 
   // ---- Selection bulk actions --------------------------------------------
@@ -1062,11 +1108,12 @@ export default function BgRemover() {
       status: 'ready' as const,
       error: undefined,
       durationMs: undefined,
+      prev: { source: it.source, cutout: it.cutout },
     }));
     for (const r of resets) dropPreview(r.id);
     setItems((prev) => prev.map((it) => resets.find((r) => r.id === it.id) ?? it));
     gridSel.clear();
-    void runBatch(resets, 'Redoing');
+    void runBatch(resets, 'Redoing').then(() => offerUndo(resets.map((r) => r.id), 'redone'));
   }
 
   function deleteSelected() {
@@ -1079,6 +1126,31 @@ export default function BgRemover() {
     setSelectedId((prev) => (prev !== null && gridSel.checked.has(prev) ? null : prev));
     setCompareId((prev) => (prev !== null && gridSel.checked.has(prev) ? null : prev));
     gridSel.clear();
+  }
+
+  // Whether ANY / ALL cells render as tiles — drives the uniform VirtualGrid row height.
+  const tileStats = React.useMemo(() => {
+    let on = 0;
+    for (const it of items) if (effectiveTileFit(it)) on++;
+    return { any: on > 0, all: items.length > 0 && on === items.length };
+  }, [items, effectiveTileFit]);
+
+  // Whether every selected cell currently RENDERS as a tile — the bar button toggles against
+  // what the user sees, not against the override bookkeeping. (An earlier cycle started by
+  // pinning the current state, which looked like "nothing happened to my selection while the
+  // global switch moves everything else".)
+  const selAllTiled = React.useMemo(() => {
+    if (!gridSel.active) return false;
+    const chosen = items.filter((it) => gridSel.checked.has(it.id));
+    return chosen.length > 0 && chosen.every((it) => effectiveTileFit(it));
+  }, [items, gridSel.active, gridSel.checked, effectiveTileFit]);
+
+  /** Flips tile fit for the SELECTED images only, pinning them regardless of the global switch. */
+  function toggleTileFitSelected() {
+    const next = !selAllTiled;
+    setItems((prev) =>
+      prev.map((it) => (gridSel.checked.has(it.id) ? { ...it, tileFit: next } : it)),
+    );
   }
 
   /** Empties the queue and frees every decoded original and cached preview. */
@@ -1129,14 +1201,19 @@ export default function BgRemover() {
   async function handleExport() {
     const ready = withCutout(itemsRef.current);
     if (!ready.length || busy) return;
-    const tiles = tileFitOn;
+    // Per-item now: each file renders by its own effective tile fit. Only the ZIP's name still
+    // needs an overall shape — all-tiles / all-cutouts keep their old names, a mix says so.
+    const tileCount = ready.filter((it) => effectiveTileFit(it)).length;
+    const shape = tileCount === ready.length ? 'tiles' : tileCount === 0 ? 'cutouts' : 'mixed';
     // The save dialog opens now, while the click still counts as user activation — after
     // minutes of encoding Chrome would refuse it. Cancelling the dialog cancels the export.
     const zipName = sessionSlug
-      ? `${sessionSlug}-${tiles ? 'tiles' : 'cutouts'}.zip`
-      : tiles
+      ? `${sessionSlug}-${shape === 'mixed' ? 'export' : shape}.zip`
+      : shape === 'tiles'
         ? 'safe-area-tiles.zip'
-        : 'bg-cutouts.zip';
+        : shape === 'cutouts'
+          ? 'bg-cutouts.zip'
+          : 'zigma-export.zip';
     const dest = await pickSave(zipName);
     if (dest === 'cancelled') return;
     // Snapshotted once: editing the ceiling mid-export must not give the ZIP two different rules.
@@ -1166,7 +1243,7 @@ export default function BgRemover() {
         // pixels alive for the whole session.
         const full = await decodeCutout(item.cutout);
         try {
-          const canvas = tiles
+          const canvas = effectiveTileFit(item)
             ? renderTile(full, safeArea, { bounds: item.cutout.bounds })
             : flattenOnBackground(full, outputBg);
           // fitToBudget owns the encode when the budget is on: its first rung is the same
@@ -1589,11 +1666,24 @@ export default function BgRemover() {
         {stage && stage !== 'done' ? ` · ${stage}` : ''}
       </p>
       <div className="flex flex-col gap-2">
+        <div className="flex items-center gap-2">
+          <Checkbox
+            id="bg-save-originals"
+            checked={saveOriginals}
+            disabled={busy}
+            onCheckedChange={(checked) => setSaveOriginals(checked === true)}
+          />
+          <FieldLabel htmlFor="bg-save-originals" className="font-normal">
+            <Hint hint="Embeds the dropped input files in the project so reopening it restores them — original view, Redo and AI edit all keep working. Untick for a smaller file that keeps only cutouts and URLs.">
+              Include original images
+            </Hint>
+          </FieldLabel>
+        </div>
         <Button
           variant="outline"
-          disabled={busy || !cutouts.length}
+          disabled={busy || !items.length}
           onClick={() => void handleSaveProject()}
-          title="Everything needed to reopen this batch later — cutouts, bounds and safe-area settings — without re-running the models"
+          title="Everything needed to reopen this batch later — inputs, cutouts, bounds and safe-area settings — without re-running the models"
         >
           <SaveIcon data-icon="inline-start" />
           Save project
@@ -1878,13 +1968,15 @@ export default function BgRemover() {
                     scrollRef={removeScrollRef}
                     minCellWidth={GRID_MIN_CELL}
                     gap={GRID_GAP}
-                    // Preview box plus the filename line beneath it. In tile mode the box carries
-                    // the tile's aspect ratio, so the row height has to follow it — rows stay
-                    // uniform because every cell shares one safe-area config.
-                    cellHeight={(w) =>
-                      (tileFitOn ? w * (safeArea.tile.height / safeArea.tile.width) : w) +
-                      GRID_LABEL_HEIGHT
-                    }
+                    // Preview box plus the filename line beneath it. VirtualGrid rows must stay
+                    // uniform, so with per-item overrides a MIXED queue sizes every row to the
+                    // taller of the two shapes and the shorter cells letterbox inside; all-tile
+                    // and all-square queues keep their exact old heights.
+                    cellHeight={(w) => {
+                      const r = safeArea.tile.height / safeArea.tile.width;
+                      const h = tileStats.all ? w * r : tileStats.any ? w * Math.max(1, r) : w;
+                      return h + GRID_LABEL_HEIGHT;
+                    }}
                     keyOf={(item) => item.id}
                     renderItem={(item, index) => (
                       <CutoutCell
@@ -1895,7 +1987,8 @@ export default function BgRemover() {
                         selectionActive={gridSel.active}
                         background={outputBg}
                         running={busy}
-                        tileConfig={tileFitOn ? safeArea : null}
+                        tileConfig={effectiveTileFit(item) ? safeArea : null}
+                        tileOverride={item.tileFit}
                         onSelect={selectById}
                         onCompare={compareById}
                         onRemove={removeById}
@@ -1925,6 +2018,14 @@ export default function BgRemover() {
                           label: 'Redo selected — re-remove backgrounds with the current model settings',
                           icon: RefreshCwIcon,
                           onRun: handleRetrySelected,
+                        },
+                        {
+                          key: 'tile-fit',
+                          label: selAllTiled
+                            ? 'Turn tile fit OFF for the selected images — only they change, and they stop following the global switch'
+                            : 'Turn tile fit ON for the selected images — only they change, and they stop following the global switch',
+                          icon: FrameIcon,
+                          onRun: toggleTileFitSelected,
                         },
                       ]}
                       deleteTitle={`Delete ${gridSel.checked.size} image${gridSel.checked.size === 1 ? '' : 's'}?`}
@@ -1957,6 +2058,7 @@ export default function BgRemover() {
         background={outputBg}
         numbered={numberFiles}
         onClose={() => setCompareId(null)}
+        onUndo={(item) => undoItem(item.id)}
         models={redoModels}
         defaultModel={modelId}
         defaultRefine={refine}
@@ -2064,6 +2166,7 @@ const CutoutCell = React.memo(function CutoutCell({
   background,
   running,
   tileConfig,
+  tileOverride,
   onSelect,
   onCompare,
   onRemove,
@@ -2076,8 +2179,10 @@ const CutoutCell = React.memo(function CutoutCell({
   selectionActive: boolean;
   background: string;
   running: boolean;
-  /** Set when Tile fit is on: the SAME cell then shows the cutout composited on its tile. */
+  /** Set when this item's EFFECTIVE tile fit is on: the cell shows the cutout on its tile. */
   tileConfig: SafeAreaConfig | null;
+  /** The item's own override (undefined = follows the global switch) — shown as a badge. */
+  tileOverride: boolean | undefined;
   onSelect: (id: number) => void;
   /** Clicking a finished result opens the same before/after view as a queue row. */
   onCompare: (id: number) => void;
@@ -2147,6 +2252,14 @@ const CutoutCell = React.memo(function CutoutCell({
             <CircleAlertIcon
               className={cn('size-4', quality.level === 'bad' ? 'text-destructive' : 'text-amber-500')}
             />
+          </Hint>
+        )}
+        {tileOverride !== undefined && (
+          <Hint
+            hint={`Tile fit forced ${tileOverride ? 'on' : 'off'} for this image — the global switch doesn't apply. Select it and use the bar's frame button to change.`}
+            className="absolute right-2 bottom-2"
+          >
+            <FrameIcon className={cn('size-4', tileOverride ? 'text-primary' : 'text-muted-foreground')} />
           </Hint>
         )}
       </div>

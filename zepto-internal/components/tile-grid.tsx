@@ -7,7 +7,7 @@
 // generated tile, copy-URL per source, regenerate and download.
 
 import * as React from 'react';
-import { CheckIcon, CopyIcon, DownloadIcon, RefreshCwIcon } from 'lucide-react';
+import { CheckIcon, CopyIcon, DownloadIcon, RefreshCwIcon, Undo2Icon } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import {
@@ -260,6 +260,8 @@ export interface TileDialogProps {
   running: boolean;
   onClose: () => void;
   onRegenerate: (item: QueueItem) => void;
+  /** Restores the tile the last regenerate replaced. Shown only while item.prev exists. */
+  onUndo: (item: QueueItem) => void;
 }
 
 /**
@@ -268,7 +270,7 @@ export interface TileDialogProps {
  */
 export function TileDialog({
   item, template, fallbackTitle, fallbackOffer, offerToggle, hasOfferCol,
-  running, onClose, onRegenerate,
+  running, onClose, onRegenerate, onUndo,
 }: TileDialogProps) {
   const [saving, setSaving] = React.useState(false);
 
@@ -382,6 +384,17 @@ export function TileDialog({
                 <RefreshCwIcon data-icon="inline-start" />
                 Regenerate
               </Button>
+              {item.prev && (
+                <Button
+                  variant="outline"
+                  disabled={running}
+                  title="Restore the tile the last regenerate replaced"
+                  onClick={() => onUndo(item)}
+                >
+                  <Undo2Icon data-icon="inline-start" />
+                  Undo
+                </Button>
+              )}
               <Button disabled={!item.resultImage || saving} onClick={handleDownload}>
                 {saving ? <Spinner data-icon="inline-start" /> : <DownloadIcon data-icon="inline-start" />}
                 Download PNG
