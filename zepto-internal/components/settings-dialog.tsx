@@ -34,7 +34,7 @@ import {
   SidebarMenuItem, SidebarProvider,
 } from '@/components/ui/sidebar';
 import { usePersistedState } from '@/hooks/use-persisted-state';
-import { newSkillId, useSkills, type PromptSkill } from '@/lib/skills';
+import { diffStat, newSkillId, useSkills, type PromptSkill } from '@/lib/skills';
 import { azureImageUrl } from '@/lib/pipeline';
 import { QUALITIES, QUALITY_BLURB, useImageQuality, type ImageQuality } from '@/lib/quality';
 import { clampParallel, clampRpm, useParallel, useRpm } from '@/lib/rate';
@@ -332,11 +332,25 @@ function SkillsPane() {
   const { skills, setCustom } = useSkills();
   const fileRef = React.useRef<HTMLInputElement>(null);
   // The editor dialog's draft. `fresh` = not yet in the list, so Cancel leaves no trace.
-  const [draft, setDraft] = React.useState<{ skill: PromptSkill; fresh: boolean } | null>(null);
+  // `original` snapshots name+content as the editor opened: the diff chip renders against it,
+  // and an unchanged save keeps the stored updatedAt instead of restamping.
+  const [draft, setDraft] = React.useState<{
+    skill: PromptSkill;
+    fresh: boolean;
+    original: { name: string; content: string };
+  } | null>(null);
+  const stat = draft ? diffStat(draft.original.content, draft.skill.content) : null;
 
   function saveDraft() {
     if (!draft) return;
-    const skill = { ...draft.skill, name: draft.skill.name.trim() || 'untitled.md' };
+    const name = draft.skill.name.trim() || 'untitled.md';
+    const changed =
+      draft.fresh || draft.skill.content !== draft.original.content || name !== draft.original.name;
+    const skill = {
+      ...draft.skill,
+      name,
+      ...(changed ? { updatedAt: new Date().toISOString() } : null),
+    };
     setCustom((prev) => {
       const list = Array.isArray(prev) ? prev : [];
       const at = list.findIndex((s) => s.id === skill.id);
@@ -365,7 +379,13 @@ function SkillsPane() {
             <div className="min-w-0 flex-1">
               <div className="truncate text-sm">{skill.name}</div>
               <div className="truncate text-xs text-muted-foreground">
-                {skill.content.split('\n').find((l) => l.trim()) || 'Empty'}
+                {/* Custom skills show when they last changed; built-ins (and skills saved
+                    before updatedAt existed) keep the first-line preview. */}
+                {skill.updatedAt
+                  ? `Updated ${new Date(skill.updatedAt).toLocaleString(undefined, {
+                      day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit',
+                    })}`
+                  : skill.content.split('\n').find((l) => l.trim()) || 'Empty'}
               </div>
             </div>
             {skill.builtin ? (
@@ -375,16 +395,14 @@ function SkillsPane() {
                   variant="ghost"
                   size="icon-sm"
                   title="Duplicate into an editable copy"
-                  onClick={() =>
+                  onClick={() => {
+                    const name = skill.name.replace(/\.md$/, '') + '-copy.md';
                     setDraft({
                       fresh: true,
-                      skill: {
-                        id: newSkillId(),
-                        name: skill.name.replace(/\.md$/, '') + '-copy.md',
-                        content: skill.content,
-                      },
-                    })
-                  }
+                      skill: { id: newSkillId(), name, content: skill.content },
+                      original: { name, content: skill.content },
+                    });
+                  }}
                 >
                   <CopyIcon />
                 </Button>
@@ -395,7 +413,9 @@ function SkillsPane() {
                   variant="ghost"
                   size="icon-sm"
                   title="Edit"
-                  onClick={() => setDraft({ fresh: false, skill })}
+                  onClick={() =>
+                    setDraft({ fresh: false, skill, original: { name: skill.name, content: skill.content } })
+                  }
                 >
                   <PencilIcon />
                 </Button>
@@ -418,7 +438,11 @@ function SkillsPane() {
           variant="outline"
           size="sm"
           onClick={() =>
-            setDraft({ fresh: true, skill: { id: newSkillId(), name: 'new-skill.md', content: '' } })
+            setDraft({
+              fresh: true,
+              skill: { id: newSkillId(), name: 'new-skill.md', content: '' },
+              original: { name: 'new-skill.md', content: '' },
+            })
           }
         >
           <PlusIcon data-icon="inline-start" />
@@ -443,7 +467,11 @@ function SkillsPane() {
               const name = /\.(md|markdown|txt)$/i.test(file.name)
                 ? file.name.replace(/\.(markdown|txt)$/i, '.md')
                 : `${file.name}.md`;
-              setDraft({ fresh: true, skill: { id: newSkillId(), name, content } });
+              setDraft({
+                fresh: true,
+                skill: { id: newSkillId(), name, content },
+                original: { name, content },
+              });
             });
           }}
         />
@@ -483,6 +511,17 @@ function SkillsPane() {
                 className="max-h-[50dvh] min-h-40 overflow-y-auto text-xs"
               />
               <DialogFooter>
+                {/* Git-style stat against the content the editor opened with — appears only
+                    once something actually changed. */}
+                {stat && (stat.added > 0 || stat.removed > 0) && (
+                  <span
+                    className="mr-auto self-center font-mono text-xs"
+                    aria-label={`${stat.added} lines added, ${stat.removed} lines removed`}
+                  >
+                    <span className="text-emerald-600 dark:text-emerald-400">+{stat.added}</span>{' '}
+                    <span className="text-red-600 dark:text-red-400">−{stat.removed}</span>
+                  </span>
+                )}
                 <Button variant="outline" onClick={() => setDraft(null)}>Cancel</Button>
                 <Button onClick={saveDraft} disabled={!draft.skill.content.trim()}>Save</Button>
               </DialogFooter>

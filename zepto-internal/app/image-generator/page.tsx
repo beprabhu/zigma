@@ -21,6 +21,8 @@ import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog';
 import { MdFileIcon, MdFileTile } from '@/components/md-file-tile';
+import { createEta } from '@/lib/eta';
+import { matchSkill, useSkills } from '@/lib/skills';
 import { SessionHeader, type SessionChip } from '@/components/session-header';
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty';
 import { Field, FieldContent, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field';
@@ -42,7 +44,7 @@ import { readParallel } from '@/lib/rate';
 import { canvasToPngBlob, mapWithLimit, pickSave, releaseCanvas, saveTo } from '@/lib/bg/batch';
 import { processImage } from '@/lib/process';
 import { useProcessing } from '@/components/process-panel';
-import { buildZip, type ZipFileEntry } from '@/lib/zip';
+import { buildZipStream, type ZipStreamEntry } from '@/lib/zip';
 import { cn } from '@/lib/utils';
 import { usePersistedState } from '@/hooks/use-persisted-state';
 import { DropzoneShell } from '@/components/dropzone';
@@ -64,6 +66,15 @@ export default function ImageGenerator() {
   const [briefName, setBriefName] = React.useState<string | null>(null);
   // The brief renders as an .md tile in the panel; this opens its editor modal.
   const [briefEditorOpen, setBriefEditorOpen] = React.useState(false);
+  // The tile's caret menu can seed the brief from a saved skill — same switcher as
+  // Compose's prompt and Cleanup's AI-edit prompt. Selection is content-derived.
+  const { skills } = useSkills();
+  const briefSkillId = matchSkill(brief, skills);
+  const activeBriefSkill = skills.find((sk) => sk.id === briefSkillId);
+  // Display identity, derived live so it can never go stale: a matched skill's name wins
+  // (and survives renames in Settings), then the dropped file's name, then the placeholder
+  // once something has been typed. null means "no brief at all" for the chips below.
+  const briefLabel = activeBriefSkill?.name ?? briefName ?? (brief.trim() ? 'brief.md' : null);
 
   const [csvName, setCsvName] = React.useState<string | null>(null);
   // Figma-style session name in the panel header; seeds the export ZIP filename. Auto-seeded
@@ -234,6 +245,7 @@ export default function ImageGenerator() {
     const limit = readParallel();
     let finished = 0;
     let ok = 0;
+    const eta = createEta();
     setProgress({ pct: 0, text: `0 of ${todo.length} — ${limit} at a time with ${mock ? 'mock' : 'azure'}…` });
     try {
       await mapWithLimit(todo, limit, async (item) => {
@@ -244,9 +256,10 @@ export default function ImageGenerator() {
         }
         if (await generateOne(item, controller.signal)) ok++;
         finished++;
+        const left = eta.remaining(finished, todo.length);
         setProgress({
           pct: (finished / todo.length) * 100,
-          text: `${finished} of ${todo.length} — ${limit} at a time with ${mock ? 'mock' : 'azure'}…`,
+          text: `${finished} of ${todo.length} — ${limit} at a time with ${mock ? 'mock' : 'azure'}…${left ? ` · ${left}` : ''}`,
         });
       });
     } finally {
@@ -349,9 +362,10 @@ export default function ImageGenerator() {
 
     setExporting(true);
     try {
-      const files: ZipFileEntry[] = [];
+      const files: ZipStreamEntry[] = [];
       const used = new Map<string, number>();
       let n = 0;
+      const eta = createEta();
       for (const item of ready) {
         const stem = genFileStem(item.name, `row-${item.id + 1}`);
         let fileName: string;
@@ -366,11 +380,17 @@ export default function ImageGenerator() {
         const blob = await canvasToPngBlob(canvas);
         releaseCanvas(canvas);
         const data = await proc.compressBytes(new Uint8Array(await blob.arrayBuffer()));
-        files.push({ name: fileName, data });
+        // Blob, not bytes: pages out to blob storage, so a full-CSV export never holds every
+        // PNG in memory at once.
+        files.push({ name: fileName, data: new Blob([data as BlobPart], { type: 'image/png' }) });
         n++;
-        setProgress({ pct: (n / ready.length) * 100, text: `Packing ${n} of ${ready.length}…` });
+        const left = eta.remaining(n, ready.length);
+        setProgress({
+          pct: (n / ready.length) * 100,
+          text: `Packing ${n} of ${ready.length}…${left ? ` · ${left}` : ''}`,
+        });
       }
-      await saveTo(dest, buildZip(files), zipName);
+      await saveTo(dest, await buildZipStream(files), zipName);
       setProgress({ pct: 100, text: `Exported ${files.length} image${files.length > 1 ? 's' : ''}.` });
     } catch (e) {
       toast.error(`Export failed: ${(e as Error).message}`);
@@ -393,9 +413,9 @@ export default function ImageGenerator() {
         <span className="text-primary underline underline-offset-2">browse</span>
       </span>
       <span className="flex flex-wrap justify-center gap-2 text-xs">
-        <span className={cn('rounded-md border px-2 py-0.5', briefName && 'border-primary text-foreground')}>
+        <span className={cn('rounded-md border px-2 py-0.5', briefLabel && 'border-primary text-foreground')}>
           <MdFileIcon className="mr-1 inline size-3" />
-          {briefName ?? 'no brief'}
+          {briefLabel ?? 'no brief'}
         </span>
         <span className={cn('rounded-md border px-2 py-0.5', csvName && 'border-primary text-foreground')}>
           {csvName ? `${csvName} — ${records.length} rows` : 'no CSV'}
@@ -448,7 +468,7 @@ export default function ImageGenerator() {
                 [
                   items.length > 0 && { label: `${items.length} row${items.length === 1 ? '' : 's'}` },
                   doneCount > 0 && { label: `${doneCount} generated` },
-                  briefName !== null && {
+                  briefLabel !== null && {
                     label: brief.trim() ? 'brief loaded' : 'brief empty',
                     tone: (brief.trim() ? 'default' : 'warn') as SessionChip['tone'],
                   },
@@ -460,19 +480,28 @@ export default function ImageGenerator() {
           <PanelSection title="Input" hint={<>One image per CSV row. Each prompt is the brief followed by that row&rsquo;s
                 fields, labelled with their column names.</>}>{dropzone}</PanelSection>
 
-          {briefName !== null && (
-            <PanelSection title="Brief">
-              {/* Same .md tile as the BG Remover's prompt: the brief is configuration, so the
-                  panel shows the file card and editing happens in the modal below. */}
-              <MdFileTile
-                name={briefName}
-                text={brief}
-                badge={brief.trim() ? `${brief.trim().length.toLocaleString()} chars` : 'empty'}
-                onClick={() => setBriefEditorOpen(true)}
-                disabled={busy}
-              />
-            </PanelSection>
-          )}
+          <PanelSection title="Brief" hint="Leads every row's prompt. Drop a .md file or pick a saved skill; skills are managed in Settings.">
+            {/* Same .md tile as the BG Remover's prompt: the brief is configuration, so the
+                panel shows the file card and editing happens in the modal below. Always
+                visible so a brief can start from a skill without dropping a file. */}
+            <MdFileTile
+              name={briefLabel ?? 'brief.md'}
+              text={brief}
+              badge={brief.trim() ? `${brief.trim().length.toLocaleString()} chars` : 'empty'}
+              onClick={() => setBriefEditorOpen(true)}
+              disabled={busy}
+              skills={{
+                list: skills,
+                activeId: briefSkillId,
+                onSelect: (sk) => {
+                  setBrief(sk.content);
+                  // A skill is not a dropped file: the tile derives its name from the live
+                  // match instead, so a rename in Settings can never leave a stale title.
+                  setBriefName(null);
+                },
+              }}
+            />
+          </PanelSection>
 
           {headers.length > 0 && (
             <PanelSection title={<>Columns — {csvName}</>} hint="Ticked columns are sent, each labelled with its header.">
@@ -674,7 +703,7 @@ export default function ImageGenerator() {
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <MdFileIcon className="size-4 text-muted-foreground" />
-              {briefName ?? 'Brief'}
+              {briefLabel ?? 'brief.md'}
             </DialogTitle>
             <DialogDescription>
               The brief leads every row&rsquo;s prompt. Edits apply to the next run — rows

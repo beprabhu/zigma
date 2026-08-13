@@ -160,6 +160,30 @@ const CLUSTER_MAX_AREA_FRACTION = 0.06;
 /** Sample every Nth pixel for the texture measure — full density buys nothing here. */
 const TEXTURE_STRIDE = 4;
 
+/**
+ * Bridged-fragment rescue. A weak matte (RMBG-1.4 on a pale corner against a pale background)
+ * can dip below alphaThreshold along a hairline, splitting a small piece of the product into
+ * its own region. That fragment then reads as a speck and the filter deletes it, after which
+ * floodSubThresholdBand eats the soft corner around it too. The tell that separates it from a
+ * real composited badge: a badge is isolated by confidently-cut alpha-0 background, while a
+ * broken-off fragment stays tethered to the product through semi-transparent pixels. So a
+ * SPECK-dropped region that reaches an originally-kept region within BRIDGE_RADIUS steps of
+ * alpha >= BRIDGE_ALPHA is reattached instead of deleted.
+ *
+ * Speck drops ONLY — never palette/geometry/cluster verdicts. A composited badge overlapping
+ * the product's soft halo is tethered exactly like a broken fragment (the halos meet — the
+ * band flood's own comments call this configuration out as routine), so connectivity cannot
+ * overrule measured artwork evidence; it may only save what was condemned for being small.
+ */
+const BRIDGE_RADIUS = 4;
+/** Band alpha at/above which a pixel can carry a bridge — confident background (0) cannot. */
+const BRIDGE_ALPHA = 40;
+/** Rescue floor. Matte noise along a soft outline is 2-25px dots that sit inside the product's
+ *  halo, so without a floor the bridge rescues every one of them (seen on a white pouch against
+ *  white: seven sub-25px specks all came back "kept"). A real broken-off fragment measured
+ *  ~400px; anything below this floor stays speck-cleanup's to delete. */
+const BRIDGE_MIN_AREA = 64;
+
 class UnionFind {
   private parent: Int32Array;
   private size = 1;
@@ -223,6 +247,8 @@ function floodSubThresholdBand(
   w: number,
   h: number,
   alphaThreshold: number,
+  /** Band pixels a bridge rescue traversed — barred like a kept region's outline. */
+  barred?: Uint8Array | null,
 ): number {
   const n = w * h;
   // A byte per pixel rather than a visited set: the band can be most of the image, and the flood
@@ -239,6 +265,7 @@ function floodSubThresholdBand(
     for (let x = 0; x < w; x++) {
       const i = row + x;
       if (labels[i]) continue;
+      if (barred?.[i]) continue;
       const alpha = data[i * 4 + 3];
       if (alpha === 0 || alpha > alphaThreshold) continue;
 
@@ -484,6 +511,8 @@ export function keepProductRegions(
   }
 
   const dropFlags = new Array<boolean>(measure.length).fill(false);
+  // Which drops were size-only verdicts — the only ones the bridge rescue may reconsider.
+  const speckFlags = new Array<boolean>(measure.length).fill(false);
   for (let i = 0; i < measure.length; i++) {
     const m = measure[i];
     const { acc, fillRatio, grad, coverage, colors } = m;
@@ -520,6 +549,9 @@ export function keepProductRegions(
       (flatPalette && fillRatio > rectangularity) ||
       (smooth && fillRatio > rectangularity);
     dropFlags[i] = !isAnchor && (graphic || speck);
+    // A speck that ALSO measured graphic is still rescue-eligible: at speck size the palette
+    // statistics rest on a handful of stride samples, too little to condemn on.
+    speckFlags[i] = !isAnchor && speck;
   }
 
   // ---- Text clusters. ----
@@ -569,6 +601,86 @@ export function keepProductRegions(
     }
   }
 
+  // ---- Rescue bridged specks (see BRIDGE_* constants). ----
+  // Tethers are tested against a SNAPSHOT of the verdicts: a fragment must bridge to a region
+  // the classifier itself kept, never to another rescued fragment — chaining would make the
+  // outcome depend on region enumeration (raster) order.
+  const preRescueDrop = dropFlags.slice();
+  // Band pixels a successful bridge traversed. floodSubThresholdBand treats them as barred, or
+  // the flood from some other dropped region's halo could sever the very tether that justified
+  // the rescue, leaving the fragment a floating island.
+  let bridgeBar: Uint8Array | null = null;
+  for (let i = 0; i < measure.length; i++) {
+    if (!dropFlags[i] || !speckFlags[i]) continue;
+    const acc = measure[i].acc;
+    if (acc.area < BRIDGE_MIN_AREA) continue;
+
+    // Local BFS in the fragment's padded bounding box: out from the fragment's own pixels,
+    // through semi-transparent unlabelled pixels, at most BRIDGE_RADIUS steps.
+    const wx0 = Math.max(0, acc.x0 - BRIDGE_RADIUS);
+    const wy0 = Math.max(0, acc.y0 - BRIDGE_RADIUS);
+    const wx1 = Math.min(w - 1, acc.x1 + BRIDGE_RADIUS);
+    const wy1 = Math.min(h - 1, acc.y1 + BRIDGE_RADIUS);
+    const ww = wx1 - wx0 + 1;
+    const wh = wy1 - wy0 + 1;
+    const depth = new Uint8Array(ww * wh).fill(255);
+    const queue = new Int32Array(ww * wh);
+    let tail = 0;
+    for (let y = wy0; y <= wy1; y++) {
+      for (let x = wx0; x <= wx1; x++) {
+        if (labels[y * w + x] === acc.id) {
+          const wi = (y - wy0) * ww + (x - wx0);
+          depth[wi] = 0;
+          queue[tail++] = wi;
+        }
+      }
+    }
+    let bridged = false;
+    for (let head = 0; head < tail && !bridged; head++) {
+      const wi = queue[head];
+      const d = depth[wi];
+      if (d >= BRIDGE_RADIUS) continue;
+      const wy = (wi / ww) | 0;
+      const wx = wi - wy * ww;
+      for (let ny = Math.max(0, wy - 1); ny <= Math.min(wh - 1, wy + 1) && !bridged; ny++) {
+        for (let nx = Math.max(0, wx - 1); nx <= Math.min(ww - 1, wx + 1); nx++) {
+          const wj = ny * ww + nx;
+          if (depth[wj] !== 255) continue;
+          const j = (wy0 + ny) * w + (wx0 + nx);
+          const id = labels[j];
+          if (id && id !== acc.id) {
+            // Another region: a tether only if the classifier kept it (snapshot, not the
+            // live flags — a rescued neighbour must not transitively rescue this one).
+            if (!preRescueDrop[id - 1]) {
+              bridged = true;
+              break;
+            }
+            depth[wj] = 254; // closed, not passable
+            continue;
+          }
+          if (!id && data[j * 4 + 3] >= BRIDGE_ALPHA) {
+            depth[wj] = d + 1;
+            queue[tail++] = wj;
+          } else {
+            depth[wj] = 254;
+          }
+        }
+      }
+    }
+    if (bridged) {
+      dropFlags[i] = false;
+      // Everything the BFS stepped through is (a superset of) the tether — bar it all; the
+      // window is tiny and over-barring only preserves halo that hugs a kept fragment.
+      bridgeBar ??= new Uint8Array(n);
+      for (let head = 0; head < tail; head++) {
+        const wi = queue[head];
+        if (depth[wi] === 0 || depth[wi] === 254) continue;
+        const wy = (wi / ww) | 0;
+        bridgeBar[(wy0 + wy) * w + (wx0 + (wi - wy * ww))] = 1;
+      }
+    }
+  }
+
   const drop = new Uint8Array(accs.length + 1);
   let removed = 0;
   let removedPixels = 0;
@@ -603,7 +715,7 @@ export function keepProductRegions(
     // anywhere. The anchor rule makes that unreachable, so this only keeps the walk bounded by
     // construction rather than by an invariant proved elsewhere.
     if (removed < accs.length) {
-      removedPixels += floodSubThresholdBand(data, labels, drop, w, h, alphaThreshold);
+      removedPixels += floodSubThresholdBand(data, labels, drop, w, h, alphaThreshold, bridgeBar);
     }
   }
 

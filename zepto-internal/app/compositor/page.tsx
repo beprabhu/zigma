@@ -38,8 +38,9 @@ import {
   CUSTOM_PRESET_ID, PRESET_TYPES, TILE_PRESETS as TEMPLATE_PRESETS, matchPreset,
 } from '@/lib/tile-presets';
 import { parseCSV, detectImageColumns, detectTitleColumn, detectOfferColumn, CsvRecord } from '@/lib/csv';
-import { buildZip, ZipFileEntry } from '@/lib/zip';
-import { CUSTOM_SKILL_ID, matchSkill, useSkills } from '@/lib/skills';
+import { buildZipStream, ZipStreamEntry } from '@/lib/zip';
+import { createEta } from '@/lib/eta';
+import { matchSkill, useSkills } from '@/lib/skills';
 import { loadImageFromUrl, callAzure, mockComposite } from '@/lib/pipeline';
 import {
   BG_MODELS, BG_MODEL_ORDER, DEFAULT_MODEL_ID, probeServerModel, removeBackground, type BgModelId,
@@ -308,6 +309,7 @@ export default function Compositor() {
     const limit = readParallel();
     let done = 0;
     let finished = 0;
+    const eta = createEta();
     setProgress({ pct: 0, text: `0 of ${todo.length} tiles — ${limit} at a time with ${mock ? 'mock' : 'azure'}…` });
     await mapWithLimit(todo, limit, async (item) => {
       // Stop skips everything not yet started; rows already in flight abort via the signal.
@@ -327,9 +329,10 @@ export default function Compositor() {
         }
       }
       finished++;
+      const left = eta.remaining(finished, todo.length);
       setProgress({
         pct: (finished / todo.length) * 100,
-        text: `${finished} of ${todo.length} tiles — ${limit} at a time with ${mock ? 'mock' : 'azure'}…`,
+        text: `${finished} of ${todo.length} tiles — ${limit} at a time with ${mock ? 'mock' : 'azure'}…${left ? ` · ${left}` : ''}`,
       });
     });
     setProgress(
@@ -427,7 +430,7 @@ export default function Compositor() {
     const budget = budgetActive
       ? { maxBytes: budgetKbSafe * 1024, allowDownscale: budgetShrink, dither: false }
       : null;
-    const files: ZipFileEntry[] = [];
+    const files: ZipStreamEntry[] = [];
     let inTotal = 0, outTotal = 0, failed = 0;
     let budgetSummary = '';
     // Encoding and zipping can throw (toBlob returning null, an allocation failure on a big
@@ -437,6 +440,9 @@ export default function Compositor() {
       // a time made a big batch wait many times over for work that costs the same done at once.
       // The limit bounds how many tile canvases are encoding simultaneously.
       let encoded = 0;
+      // Per-phase clocks: encode and compress throughputs differ wildly, so one shared
+      // tracker would carry the first phase's pace into the second.
+      const encodeEta = createEta();
       const outcomes = new Array<BudgetResult | null>(done.length).fill(null);
       const raw = await mapWithLimit(done, ENCODE_CONCURRENCY, async (item, n) => {
         // The cached TinyPNG bytes were negotiated under no budget, so a budgeted run encodes
@@ -453,13 +459,18 @@ export default function Compositor() {
           data = new Uint8Array(await blob.arrayBuffer());
         }
         encoded++;
-        setProgress({ pct: (encoded / done.length) * 50, text: `Encoding tile ${encoded} of ${done.length}…` });
+        const left = encodeEta.remaining(encoded, done.length);
+        setProgress({
+          pct: (encoded / done.length) * 50,
+          text: `Encoding tile ${encoded} of ${done.length}…${left ? ` · ${left}` : ''}`,
+        });
         return data;
       });
 
       // The processing space's shared compress step (pngquant + oxipng, local). A failure
       // keeps the uncompressed PNG for that tile rather than sinking the export.
       let sent = 0;
+      const compressEta = createEta();
       const finalBytes = await mapWithLimit(raw, COMPRESS_CONCURRENCY, async (data, n) => {
         const item = done[n];
         if (!proc.compressOn || (!budget && item.compressed)) return data;
@@ -476,7 +487,11 @@ export default function Compositor() {
           return data;
         } finally {
           sent++;
-          setProgress({ pct: 50 + (sent / done.length) * 50, text: `Compressing tile ${sent} of ${done.length}…` });
+          const left = compressEta.remaining(sent, done.length);
+          setProgress({
+            pct: 50 + (sent / done.length) * 50,
+            text: `Compressing tile ${sent} of ${done.length}…${left ? ` · ${left}` : ''}`,
+          });
         }
       });
 
@@ -540,7 +555,7 @@ export default function Compositor() {
           (budgetSummary ? ` · ${budgetSummary}` : ''),
       });
 
-      const zip = buildZip(files);
+      const zip = await buildZipStream(files);
       await saveTo(dest, zip, zipName);
     } catch (e) {
       toast.error(`Export failed: ${(e as Error).message}`);
@@ -743,34 +758,15 @@ export default function Compositor() {
 
           <PanelSection title="Prompt" hint="What the composite model is told to do. Skills are managed in Settings.">
               <FieldGroup className="gap-4">
-                <Select
-                  value={skillId}
-                  onValueChange={(v) => {
-                    const skill = skills.find((sk) => sk.id === v);
-                    if (skill) setPrompt(skill.content);
-                  }}
-                >
-                  <SelectTrigger aria-label="Prompt skill">
-                    <SelectValue>
-                      {(v) => skills.find((sk) => sk.id === v)?.name ?? 'Custom'}
-                    </SelectValue>
-                  </SelectTrigger>
-                  <SelectContent alignItemWithTrigger={false} sideOffset={4}>
-                    {skills.map((sk) => (
-                      <SelectItem key={sk.id} value={sk.id}>{sk.name}</SelectItem>
-                    ))}
-                    {/* Indicator, not an action: it becomes selected by editing the prompt. */}
-                    <SelectItem value={CUSTOM_SKILL_ID} disabled={skillId !== CUSTOM_SKILL_ID}>
-                      Custom
-                    </SelectItem>
-                  </SelectContent>
-                </Select>
+                {/* The tile carries the skill switcher (the caret menu) — same control on
+                    Cleanup's AI-edit prompt and Generate's brief. */}
                 <MdFileTile
                   name={activeSkill?.name ?? 'custom-prompt.md'}
                   text={prompt}
                   badge={activeSkill ? (activeSkill.builtin ? 'Skill' : 'Custom skill') : 'Edited'}
                   onClick={() => setPromptEditorOpen(true)}
                   disabled={running}
+                  skills={{ list: skills, activeId: skillId, onSelect: (sk) => setPrompt(sk.content) }}
                 />
               </FieldGroup>
             </PanelSection>

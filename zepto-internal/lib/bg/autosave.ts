@@ -85,6 +85,11 @@ function writeBatch(puts: AutosaveRecord[], deletes: number[]): Promise<void> {
   }).then(() => undefined);
 }
 
+/** Cutouts run ~1 MB each; two dozen per transaction keeps commits fast and bounded, where a
+    single transaction over a freshly restored 3,000-item project moves gigabytes at once and
+    fails wholesale — which is exactly how a week of batches went unprotected. */
+const WRITE_CHUNK = 24;
+
 export function clearAutosave(): Promise<void> {
   return withStore('readwrite', (store) => store.clear()).then(() => undefined);
 }
@@ -149,6 +154,9 @@ export interface Autosave {
   discard(): void;
   /** When this session last wrote a record — the UI's "Autosaved HH:MM" signal. */
   lastSavedAt: number | null;
+  /** True after a write failure until a write succeeds again. Failures self-retry, but the
+      user deserves to know the crash net has holes while they do. */
+  failing: boolean;
 }
 
 /**
@@ -163,11 +171,23 @@ export interface Autosave {
 export function useAutosave(items: BgItem[]): Autosave {
   const [pending, setPending] = React.useState<PendingRestore | null>(null);
   const [lastSavedAt, setLastSavedAt] = React.useState<number | null>(null);
+  const [failing, setFailing] = React.useState(false);
   // 'boot' -> reading the store; 'held' -> records await a decision; 'active' -> mirroring.
   const phaseRef = React.useRef<'boot' | 'held' | 'active'>('boot');
   const recordsRef = React.useRef<AutosaveRecord[]>([]);
   const knownRef = React.useRef(new Map<number, Signature>());
   const persistAskedRef = React.useRef(false);
+  // Single-runner pump. The effect only records "state changed" and the latest items; the
+  // running pass computes its diff AGAINST THE CURRENT state when it starts. Pre-computing
+  // the diff at effect time raced a still-running pass two ways: a mid-pass deletion was
+  // diffed against a `known` map the pass had not marked yet (no delete enqueued — the item's
+  // record survived and resurrected on the next restore), and every items change during a
+  // long pass re-enqueued puts for everything not yet marked (gigabytes of write
+  // amplification on a big restore).
+  const latestItemsRef = React.useRef<BgItem[]>([]);
+  const dirtyRef = React.useRef(false);
+  const runningRef = React.useRef(false);
+  const retryTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -195,55 +215,102 @@ export function useAutosave(items: BgItem[]): Autosave {
     };
   }, []);
 
-  React.useEffect(() => {
-    if (phaseRef.current !== 'active') return;
-    const known = knownRef.current;
-    const savedAt = Date.now();
-    const puts: AutosaveRecord[] = [];
-    const seen = new Set<number>();
+  // Created once (state initializer, not useCallback): the runner re-invokes itself from its
+  // own finally/retry, and a named function may self-reference where a const cannot.
+  const [pump] = React.useState(() => function pumpOnce(): void {
+    if (runningRef.current || !dirtyRef.current) return;
+    runningRef.current = true;
+    dirtyRef.current = false;
 
-    for (const item of items) {
-      seen.add(item.id);
-      const sig = signatureOf(item);
-      const prev = known.get(item.id);
-      if (prev && prev.cutout === sig.cutout && prev.source === sig.source && prev.name === sig.name) {
-        continue;
-      }
-      const record = recordOf(item, savedAt);
-      if (record) {
-        puts.push(record);
-        known.set(item.id, sig);
-      } else if (prev) {
-        // Work was discarded in place (redo in flight, AI edit cleared the cutout): the item
-        // stays known with its stale record until new work replaces it — deleting here would
-        // throw away the last recoverable state right when a crash is most likely.
-        continue;
-      }
-    }
+    (async () => {
+      const known = knownRef.current;
+      const savedAt = Date.now();
+      // `known` is only marked AFTER a chunk commits: a failed write leaves its items
+      // unmarked, so a later pass recomputes and retries them. The old code marked before
+      // writing and swallowed the failure — records could silently never exist.
+      const puts: { record: AutosaveRecord; sig: Signature }[] = [];
+      const seen = new Set<number>();
 
-    const deletes: number[] = [];
-    for (const id of known.keys()) {
-      if (!seen.has(id)) {
-        deletes.push(id);
-        known.delete(id);
+      for (const item of latestItemsRef.current) {
+        seen.add(item.id);
+        const sig = signatureOf(item);
+        const prev = known.get(item.id);
+        if (prev && prev.cutout === sig.cutout && prev.source === sig.source && prev.name === sig.name) {
+          continue;
+        }
+        const record = recordOf(item, savedAt);
+        if (record) {
+          puts.push({ record, sig });
+        }
+        // Work discarded in place (redo in flight, AI edit cleared the cutout): the item stays
+        // known with its stale record until new work replaces it — deleting here would throw
+        // away the last recoverable state right when a crash is most likely.
       }
-    }
 
-    if (puts.length && !persistAskedRef.current) {
-      persistAskedRef.current = true;
-      // Best effort: persisted storage exempts the store from eviction under disk pressure.
-      void navigator.storage?.persist?.().catch(() => {});
-    }
-    writeBatch(puts, deletes)
-      .then(() => {
-        if (puts.length) setLastSavedAt(savedAt);
+      const deletes: number[] = [];
+      for (const id of known.keys()) {
+        if (!seen.has(id)) deletes.push(id);
+      }
+      if (!puts.length && !deletes.length) return;
+
+      if (puts.length && !persistAskedRef.current) {
+        persistAskedRef.current = true;
+        // Best effort: persisted storage exempts the store from eviction under disk pressure.
+        void navigator.storage?.persist?.().catch(() => {});
+      }
+
+      // Deletes FIRST: under quota pressure the user's own pruning must be able to free
+      // space, or the failing puts would starve the deletes forever and wedge autosave.
+      if (deletes.length) {
+        await writeBatch([], deletes);
+        for (const id of deletes) known.delete(id);
+      }
+      for (let at = 0; at < puts.length; at += WRITE_CHUNK) {
+        const chunk = puts.slice(at, at + WRITE_CHUNK);
+        await writeBatch(chunk.map((p) => p.record), []);
+        for (const p of chunk) known.set(p.record.id, p.sig);
+      }
+      if (puts.length) setLastSavedAt(savedAt);
+      setFailing(false);
+    })()
+      .catch((e) => {
+        // Never an app failure — but never silent either: `failing` drives a visible warning,
+        // and a timed retry keeps its promise even when the queue goes quiet.
+        console.error('autosave: write failed, will retry', e);
+        setFailing(true);
+        if (retryTimerRef.current === null) {
+          retryTimerRef.current = setTimeout(() => {
+            retryTimerRef.current = null;
+            dirtyRef.current = true;
+            pumpOnce();
+          }, 5000);
+        }
       })
-      .catch(() => {
-        // Same stance as the boot read: autosave failures must never surface as app failures.
+      .finally(() => {
+        runningRef.current = false;
+        // Drain whatever changed while this pass was committing.
+        pumpOnce();
       });
-  }, [items]);
+  });
+
+  React.useEffect(() => {
+    latestItemsRef.current = items;
+    if (phaseRef.current !== 'active') return;
+    dirtyRef.current = true;
+    pump();
+  }, [items, pump]);
+
+  React.useEffect(
+    () => () => {
+      if (retryTimerRef.current !== null) clearTimeout(retryTimerRef.current);
+    },
+    [],
+  );
 
   const restore = React.useCallback(async () => {
+    // Idempotent: a second call (double-click while the dialog animates out) must not run
+    // clearAutosave again — that wipes the records the sync effect just re-put.
+    if (phaseRef.current === 'active') return [];
     const records = recordsRef.current;
     recordsRef.current = [];
     setPending(null);
@@ -255,11 +322,12 @@ export function useAutosave(items: BgItem[]): Autosave {
   }, []);
 
   const discard = React.useCallback(() => {
+    if (phaseRef.current === 'active') return;
     recordsRef.current = [];
     setPending(null);
     void clearAutosave().catch(() => {});
     phaseRef.current = 'active';
   }, []);
 
-  return { pending, restore, discard, lastSavedAt };
+  return { pending, restore, discard, lastSavedAt, failing };
 }

@@ -340,17 +340,31 @@ interface SaveHandle {
   createWritable(): Promise<{ write(data: Blob): Promise<void>; close(): Promise<void> }>;
 }
 
+interface SavePickerOptions {
+  suggestedName?: string;
+  types?: { description: string; accept: Record<string, string[]> }[];
+}
+
 /** The user's chosen destination, or how to proceed without one. */
 export type SaveDestination = SaveHandle | 'fallback' | 'cancelled';
 
 export async function pickSave(suggestedName: string): Promise<SaveDestination> {
   const picker = (
-    window as { showSaveFilePicker?: (opts: { suggestedName?: string }) => Promise<SaveHandle> }
+    window as { showSaveFilePicker?: (opts: SavePickerOptions) => Promise<SaveHandle> }
   ).showSaveFilePicker;
   // No picker (non-Chromium): the plain anchor download still applies the suggested name.
   if (typeof picker !== 'function') return 'fallback';
   try {
-    return await picker.call(window, { suggestedName });
+    // The types entry is what makes Chrome KEEP the extension when the user edits the name
+    // in the dialog. Without it, typing "Continue" over "batch.zesku" saves an extensionless
+    // file the dropzone then refuses — a real 3.3 GB support case.
+    const ext = suggestedName.includes('.')
+      ? suggestedName.slice(suggestedName.lastIndexOf('.')).toLowerCase()
+      : '';
+    const types = /^\.[a-z0-9]+$/.test(ext)
+      ? [{ description: `${ext.slice(1).toUpperCase()} file`, accept: { 'application/octet-stream': [ext] } }]
+      : undefined;
+    return await picker.call(window, { suggestedName, ...(types ? { types } : null) });
   } catch (e) {
     // Dismissing the dialog means "don't export", not "export to the default name".
     if (e instanceof DOMException && e.name === 'AbortError') return 'cancelled';

@@ -14,7 +14,7 @@
 // file sources embed their bytes under originals/ (skippable via includeOriginals for huge
 // batches). v1 files still load exactly as before.
 
-import { buildZip, readZipIndex, type ZipFileEntry } from '../zip';
+import { buildZipStream, readZipIndex, type ZipStreamEntry } from '../zip';
 import type { BgCutout, BgItem, BgItemSource } from './batch';
 import { ANCHORS, DEFAULT_SAFE_AREA, type SafeAreaConfig, type SubjectBounds } from './safe-area';
 
@@ -25,6 +25,30 @@ const VERSION = 2;
 
 export function isProjectFile(file: File): boolean {
   return file.name.toLowerCase().endsWith(PROJECT_EXTENSION);
+}
+
+const ZIP_MAGIC = [0x50, 0x4b, 0x03, 0x04]; // "PK\x03\x04", every non-empty zip starts with it
+
+/**
+ * Extension check plus a content fallback: save dialogs can strip the suffix (a 3.3 GB
+ * extensionless "Continue" was a real case), and the format doc explicitly blesses renaming
+ * to .zip. A file qualifies when it is named .zesku, OR when its name claims nothing else
+ * (no extension, or .zip) and its first bytes are the zip magic. Images and CSVs keep their
+ * own routes — they never reach the byte sniff. A non-project zip that slips through fails
+ * in loadProject with a readable "no manifest.json" error, which is the right message anyway.
+ */
+export async function sniffProjectFile(file: File): Promise<boolean> {
+  if (isProjectFile(file)) return true;
+  const name = file.name.toLowerCase();
+  const ext = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1) : '';
+  if (ext && ext !== 'zip') return false;
+  if (file.size < 22) return false; // smaller than even an empty zip
+  try {
+    const head = new Uint8Array(await file.slice(0, 4).arrayBuffer());
+    return ZIP_MAGIC.every((byte, i) => head[i] === byte);
+  } catch {
+    return false;
+  }
 }
 
 interface ManifestItem {
@@ -71,48 +95,93 @@ function mimeFromName(name: string): string {
   );
 }
 
+export interface SkippedEntry {
+  name: string;
+  lost: 'cutout' | 'original';
+  origin: string;
+  reason: string;
+}
+
 /** Packs EVERY item (finished or not) plus the current settings into a project blob. */
 export async function saveProject(
   items: BgItem[],
   safeArea: SafeAreaConfig,
   outputBg: string,
-  opts: { includeOriginals?: boolean } = {},
+  opts: {
+    includeOriginals?: boolean;
+    /** Fired (once, before packing) when unreadable blobs were dropped from the save — the
+        call site must warn while the live queue still holds the recoverable rows; a silent
+        skip behind a success toast reads as "everything saved" right when it is not. */
+    onSkip?: (skipped: SkippedEntry[]) => void;
+  } = {},
 ): Promise<Blob> {
   const includeOriginals = opts.includeOriginals ?? true;
-  const entries: ZipFileEntry[] = [];
+  const entries: ZipStreamEntry[] = [];
   const manifestItems: ManifestItem[] = [];
+  // A blob backed by a file that changed on disk after it was dropped throws NotReadableError
+  // on first touch — and one dead reference must not sink a save carrying hours of batch work.
+  // Each blob is probed with a one-byte read; unreadable halves are dropped from the item (a
+  // v2 manifest row with path '' is a legitimate unprocessed item) and reported in
+  // skipped.json inside the archive. The full bytes are never materialized here: entries go
+  // into buildZipStream as Blob references, so a queue-scale save cannot exhaust the tab.
+  const skipped: SkippedEntry[] = [];
+  const readable = async (blob: Blob) => {
+    try {
+      await blob.slice(0, 1).arrayBuffer();
+      return true;
+    } catch {
+      return false;
+    }
+  };
 
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     const n = String(i + 1).padStart(3, '0');
 
     let path = '';
+    let saved: BgCutout | null = null;
     if (item.cutout) {
-      path = `cutouts/${n}.webp`;
-      entries.push({ name: path, data: new Uint8Array(await item.cutout.blob.arrayBuffer()) });
+      if (await readable(item.cutout.blob)) {
+        path = `cutouts/${n}.webp`;
+        saved = item.cutout;
+        entries.push({ name: path, data: item.cutout.blob });
+      } else {
+        skipped.push({ name: item.name, lost: 'cutout', origin: originOf(item.source), reason: 'unreadable blob' });
+        console.warn(`save: skipping unreadable cutout for "${item.name}"`);
+      }
     }
 
     let originalPath: string | undefined;
     let originalName: string | undefined;
     if (includeOriginals && item.source.kind === 'file') {
       const file = item.source.file;
-      const ext = file.name.includes('.') ? file.name.slice(file.name.lastIndexOf('.')) : '.png';
-      originalPath = `originals/${n}${ext.toLowerCase()}`;
-      originalName = file.name;
-      entries.push({ name: originalPath, data: new Uint8Array(await file.arrayBuffer()) });
+      if (await readable(file)) {
+        const ext = file.name.includes('.') ? file.name.slice(file.name.lastIndexOf('.')) : '.png';
+        originalPath = `originals/${n}${ext.toLowerCase()}`;
+        originalName = file.name;
+        entries.push({ name: originalPath, data: file });
+      } else {
+        skipped.push({ name: item.name, lost: 'original', origin: originOf(item.source), reason: 'unreadable blob' });
+        console.warn(`save: skipping unreadable original for "${item.name}"`);
+      }
     }
 
     manifestItems.push({
       name: item.name,
       path,
-      width: item.cutout?.width ?? 0,
-      height: item.cutout?.height ?? 0,
-      bounds: item.cutout?.bounds ?? null,
+      width: saved?.width ?? 0,
+      height: saved?.height ?? 0,
+      bounds: saved?.bounds ?? null,
       origin: originOf(item.source),
       ...(item.source.kind === 'url' ? { sourceUrl: item.source.url } : null),
       ...(originalPath ? { originalPath, originalName } : null),
       ...(item.tileFit !== undefined ? { tileFit: item.tileFit } : null),
     });
+  }
+
+  if (skipped.length) {
+    entries.push({ name: 'skipped.json', data: new TextEncoder().encode(JSON.stringify(skipped, null, 1)) });
+    opts.onSkip?.(skipped);
   }
 
   const manifest: Manifest = {
@@ -125,7 +194,7 @@ export async function saveProject(
   };
   // Manifest first, so even a truncated file fails with a readable error about the right entry.
   entries.unshift({ name: MANIFEST, data: new TextEncoder().encode(JSON.stringify(manifest, null, 1)) });
-  return buildZip(entries);
+  return buildZipStream(entries);
 }
 
 export interface RestoredItem {
