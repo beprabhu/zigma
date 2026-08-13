@@ -42,6 +42,7 @@ import {
 import { callAzureGenerate, mockGenerate } from '@/lib/pipeline';
 import { readParallel } from '@/lib/rate';
 import { canvasToPngBlob, mapWithLimit, pickSave, releaseCanvas, saveTo } from '@/lib/bg/batch';
+import { readSession, restingStatus, saveSession, sessionKey } from '@/lib/bg/session-store';
 import { processImage } from '@/lib/process';
 import { useProcessing } from '@/components/process-panel';
 import { buildZipStream, type ZipStreamEntry } from '@/lib/zip';
@@ -53,6 +54,32 @@ const NONE = '__none__';
 const SIZES = ['1024x1024', '1536x1024', '1024x1536', 'auto'] as const;
 type GenSize = (typeof SIZES)[number];
 
+/**
+ * Everything a product switch would otherwise destroy. The rail's <Link>s unmount this page, so
+ * without a hand-off the brief, the parsed CSV and every generated image — none of which exist
+ * anywhere but in this component's state — are gone the moment someone clicks Compose.
+ *
+ * Only settled state belongs here: `running` and `exporting` are false again by definition on
+ * the next mount, because leaving aborted the run. Persisted settings (endpoint, key, size,
+ * numbering, the process panel) are localStorage-backed and never needed a snapshot. See
+ * lib/bg/session-store.ts for what this does NOT survive — it is a tab-lifetime hand-off, not
+ * storage.
+ */
+interface GenSession {
+  brief: string;
+  briefName: string | null;
+  csvName: string | null;
+  sessionName: string;
+  headers: string[];
+  records: CsvRecord[];
+  nameCol: string;
+  excluded: string[];
+  items: GenItem[];
+  progress: { pct: number; text: string } | null;
+}
+
+const GEN_SESSION = sessionKey<GenSession>('image-generator');
+
 export default function ImageGenerator() {
   // Azure credentials are the suite's shared pair — set them once in any product.
   const [endpoint] = usePersistedState('skuc_azureEndpoint', '');
@@ -60,10 +87,17 @@ export default function ImageGenerator() {
   const [size, setSize] = usePersistedState<GenSize>('skuc_genSize', '1024x1024');
   const [numberFiles, setNumberFiles] = usePersistedState('skuc_genNumberFiles', true);
 
-  // Brief: session-only on purpose. It is document-sized and specific to one batch, so
-  // persisting it would silently apply an old brief to a new CSV.
-  const [brief, setBrief] = React.useState('');
-  const [briefName, setBriefName] = React.useState<string | null>(null);
+  // Whatever the last unmount left behind, read once for the initializers below and nowhere
+  // else. readSession never consumes, so StrictMode's double-invoked render and its dev-only
+  // remount both see the same snapshot rather than racing each other for it.
+  const revived = React.useMemo(() => readSession(GEN_SESSION), []);
+
+  // Brief: never written to storage, on purpose. It is document-sized and specific to one batch,
+  // so persisting it would silently apply an old brief to a new CSV. Surviving a product switch
+  // is a different matter — the CSV it was written for is still sitting in the panel — so it
+  // rides along in the session snapshot with the rest of the run.
+  const [brief, setBrief] = React.useState(() => revived?.brief ?? '');
+  const [briefName, setBriefName] = React.useState<string | null>(() => revived?.briefName ?? null);
   // The brief renders as an .md tile in the panel; this opens its editor modal.
   const [briefEditorOpen, setBriefEditorOpen] = React.useState(false);
   // The tile's caret menu can seed the brief from a saved skill — same switcher as
@@ -76,23 +110,25 @@ export default function ImageGenerator() {
   // once something has been typed. null means "no brief at all" for the chips below.
   const briefLabel = activeBriefSkill?.name ?? briefName ?? (brief.trim() ? 'brief.md' : null);
 
-  const [csvName, setCsvName] = React.useState<string | null>(null);
+  const [csvName, setCsvName] = React.useState<string | null>(() => revived?.csvName ?? null);
   // Figma-style session name in the panel header; seeds the export ZIP filename. Auto-seeded
   // from the dropped CSV, but never over a name the user already typed.
-  const [sessionName, setSessionName] = React.useState('');
+  const [sessionName, setSessionName] = React.useState(() => revived?.sessionName ?? '');
   const sessionSlug = sessionName.trim().replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '');
   const seedSessionName = React.useCallback((fileName: string) => {
     setSessionName((prev) => (prev.trim() ? prev : fileName.replace(/\.[^.]+$/, '')));
   }, []);
-  const [headers, setHeaders] = React.useState<string[]>([]);
-  const [records, setRecords] = React.useState<CsvRecord[]>([]);
-  const [nameCol, setNameCol] = React.useState('');
-  const [excluded, setExcluded] = React.useState<string[]>([]);
+  const [headers, setHeaders] = React.useState<string[]>(() => revived?.headers ?? []);
+  const [records, setRecords] = React.useState<CsvRecord[]>(() => revived?.records ?? []);
+  const [nameCol, setNameCol] = React.useState(() => revived?.nameCol ?? '');
+  const [excluded, setExcluded] = React.useState<string[]>(() => revived?.excluded ?? []);
 
-  const [items, setItems] = React.useState<GenItem[]>([]);
+  const [items, setItems] = React.useState<GenItem[]>(() => revived?.items ?? []);
   const [running, setRunning] = React.useState(false);
   const [exporting, setExporting] = React.useState(false);
-  const [progress, setProgress] = React.useState<{ pct: number; text: string } | null>(null);
+  const [progress, setProgress] = React.useState<{ pct: number; text: string } | null>(
+    () => revived?.progress ?? null,
+  );
   const [openId, setOpenId] = React.useState<number | null>(null);
   const resultScrollRef = React.useRef<HTMLDivElement>(null);
 
@@ -101,6 +137,59 @@ export default function ImageGenerator() {
   const genAbortRef = React.useRef<AbortController | null>(null);
   const itemsRef = React.useRef<GenItem[]>(items);
   React.useEffect(() => { itemsRef.current = items; }, [items]);
+
+  // The snapshot the unmount below hands to the next mount, restated after every commit. The
+  // cleanup that reads it has to be mount-once — anything else would tear down and re-arm the
+  // abort on every keystroke — so its closure is stuck with the empty state it was created
+  // with, and a ref is the only thing it can reach that is still current.
+  const sessionRef = React.useRef<GenSession | null>(null);
+  React.useEffect(() => {
+    sessionRef.current = {
+      brief,
+      briefName,
+      csvName,
+      sessionName,
+      headers,
+      records,
+      nameCol,
+      excluded,
+      items,
+      // A run still in flight is a run the unmount is about to cancel, so it comes back
+      // reported as stopped. Reviving the live line instead would leave a progress bar parked
+      // at 40% with nothing behind it, reading as a batch that is still going. An export is the
+      // opposite case — nothing aborts it, and it writes into a handle the user already picked,
+      // so it really does finish; only its per-file counter dies with the component.
+      progress: running
+        ? { pct: 100, text: 'Stopped — leaving Generate cancelled the run; nothing further was sent.' }
+        : exporting
+          ? { pct: 100, text: 'Export is still packing in the background; it writes to the file you chose.' }
+          : progress,
+    };
+  });
+
+  // Leaving the product must stop the run. The rail navigates client-side, so this component is
+  // unmounted while the document lives on: without the abort, the batch keeps working down the
+  // CSV and billing Azure for images nobody is on screen to see, then patches state on a page
+  // that no longer exists. Same unmount abort the BG Remover does for its removal and AI phases.
+  React.useEffect(
+    () => () => {
+      genAbortRef.current?.abort();
+      const session = sessionRef.current;
+      if (!session) return;
+      // Those aborts reject after this cleanup has run, so their "put the row back" patches
+      // never commit and rows caught mid-flight are still 'generating' in what we hold here.
+      // restingStatus is what stops them reviving as spinners that can never finish; a row that
+      // had an earlier image keeps it and comes back 'done'.
+      saveSession(GEN_SESSION, {
+        ...session,
+        items: session.items.map((item) => ({
+          ...item,
+          status: restingStatus(item.status, item.image !== null),
+        })),
+      });
+    },
+    [],
+  );
 
   const itemIds = React.useMemo(() => items.map((it) => it.id), [items]);
   const sel = useGridSelection(itemIds, openId !== null);
