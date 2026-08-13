@@ -21,6 +21,7 @@ import {
 import { Spinner } from '@/components/ui/spinner';
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 
 import { TemplateEditor } from '@/components/template-editor';
 import { CsvDropzone } from '@/components/csv-dropzone';
@@ -741,7 +742,7 @@ export default function Compositor() {
           )}
 
           <PanelSection title="Prompt" hint="What the composite model is told to do. Skills are managed in Settings.">
-              <FieldGroup className="gap-3">
+              <FieldGroup className="gap-4">
                 <Select
                   value={skillId}
                   onValueChange={(v) => {
@@ -933,28 +934,33 @@ export default function Compositor() {
                       <FieldLabel>
                         <Hint hint="Sets the template frame — fine-tune width, height and corners in the Design pane. Layers keep their positions, so check the preview after a big jump.">Tile size</Hint>
                       </FieldLabel>
-                      <div className="flex flex-wrap items-center gap-1.5">
+                      {/* Exclusive choice, so a toggle group — not styled Buttons. */}
+                      <ToggleGroup
+                        size="sm"
+                        variant="outline"
+                        className="flex-wrap justify-start"
+                        value={[
+                          TILE_PRESETS.find(
+                            (preset) =>
+                              template.frame.width === preset.width &&
+                              template.frame.height === preset.height,
+                          )?.id ?? '',
+                        ]}
+                        onValueChange={(next) => {
+                          const preset = TILE_PRESETS.find((pr) => pr.id === next[0]);
+                          if (!preset || running) return;
+                          setTemplate((t) => ({
+                            ...t,
+                            frame: { ...t.frame, width: preset.width, height: preset.height },
+                          }));
+                        }}
+                      >
                         {TILE_PRESETS.map((preset) => (
-                          <Button
-                            key={preset.id}
-                            size="sm"
-                            variant={
-                              template.frame.width === preset.width && template.frame.height === preset.height
-                                ? 'default'
-                                : 'outline'
-                            }
-                            disabled={running}
-                            onClick={() =>
-                              setTemplate((t) => ({
-                                ...t,
-                                frame: { ...t.frame, width: preset.width, height: preset.height },
-                              }))
-                            }
-                          >
+                          <ToggleGroupItem key={preset.id} value={preset.id} disabled={running}>
                             {preset.width}×{preset.height}
-                          </Button>
+                          </ToggleGroupItem>
                         ))}
-                      </div>
+                      </ToggleGroup>
                     </Field>
 
                     <BudgetControls

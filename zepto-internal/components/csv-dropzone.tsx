@@ -27,7 +27,7 @@ export function CsvDropzone({ fileName, rowCount, onFile }: CsvDropzoneProps) {
       ) : (
         <>
           <UploadCloudIcon className="size-6" />
-          <span>Drop CSV here or <u className="text-primary">browse</u></span>
+          <span>Drop CSV here or <span className="text-primary underline underline-offset-2">browse</span></span>
         </>
       )}
     </DropzoneShell>

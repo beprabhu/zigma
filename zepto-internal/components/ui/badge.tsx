@@ -19,6 +19,13 @@ const badgeVariants = cva(
         ghost:
           "hover:bg-muted hover:text-muted-foreground dark:hover:bg-muted/50",
         link: "text-primary underline-offset-4 hover:underline",
+        // The suite's status chip (session-header chips, md-file-tile badges, settings
+        // "Built-in"): Micro rank, muted, tighter padding than a regular badge.
+        chip: "bg-muted px-1.5 text-[11px] font-medium text-muted-foreground",
+        // Warn tone of the chip. Amber recipe lives here ONCE — call sites must not
+        // re-hardcode it. (Future token work: a --warning pair in globals.css.)
+        "chip-warn":
+          "bg-amber-500/15 px-1.5 text-[11px] font-medium text-amber-600 dark:text-amber-400",
       },
     },
     defaultVariants: {

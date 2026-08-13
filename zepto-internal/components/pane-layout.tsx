@@ -92,7 +92,7 @@ function Panel({ side, title, children, header, footer, className }: PanelProps 
       <ScrollArea className="min-h-0 flex-1">
         <div className={cn('divide-y divide-border', !header && 'pt-4')}>{children}</div>
       </ScrollArea>
-      {footer && <div className="shrink-0 border-t p-3">{footer}</div>}
+      {footer && <div className="shrink-0 border-t px-4 py-3">{footer}</div>}
     </section>
   );
 }
@@ -183,7 +183,7 @@ export function Canvas({
         {children}
       </div>
       {footer && (
-        <div className="shrink-0 border-t bg-background px-4 py-2.5">{footer}</div>
+        <div className="shrink-0 border-t bg-background px-4 py-3">{footer}</div>
       )}
     </section>
   );

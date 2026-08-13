@@ -55,16 +55,7 @@ export function SessionHeader({
       {chips.length > 0 && (
         <div className="mt-2 flex flex-wrap gap-1.5">
           {chips.map((chip) => (
-            <Badge
-              key={chip.label}
-              variant="secondary"
-              className={cn(
-                'px-1.5 text-[10px]',
-                chip.tone === 'warn'
-                  ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
-                  : 'bg-muted text-muted-foreground',
-              )}
-            >
+            <Badge key={chip.label} variant={chip.tone === 'warn' ? 'chip-warn' : 'chip'}>
               {chip.label}
             </Badge>
           ))}

@@ -1362,11 +1362,13 @@ export default function BgRemover() {
   }
 
   const inputCard = (
+    <>
     <PanelSection title="Images" hint="Files, a clipboard paste, or a CSV of image URLs.">
         <ImageDropzone onAdd={handleAdd} onCsv={handleCsv} onProject={(file) => void handleProject(file)} itemCount={items.length} disabled={busy} />
+    </PanelSection>
         {csvInfo && (
-          <div className="mt-4 space-y-4 border-t pt-4">
-            <div className="text-sm font-medium">CSV columns — {csvInfo.fileName}</div>
+          <PanelSection title={<>Columns — {csvInfo.fileName}</>}>
+          <div className="space-y-4">
             <Field>
               <FieldLabel htmlFor="csv-name-col">
                 <Hint hint="Names the previews and exported files. Safe to change any time — finished rows are renamed in place and their cutouts are kept.">
@@ -1419,8 +1421,9 @@ export default function BgRemover() {
               ))}
             </Field>
           </div>
+          </PanelSection>
         )}
-      </PanelSection>
+    </>
   );
 
   // The queue used to be a separate card of rows here; the results grid IS the queue now —
@@ -1489,7 +1492,7 @@ export default function BgRemover() {
               onReset={() => setSafeArea(structuredClone(DEFAULT_SAFE_AREA))}
               disabled={busy}
             />
-            <div className="rounded-xl bg-muted/30 p-3">
+            <div className="rounded-lg bg-muted/40 p-3">
               <TilePreview
                 source={selectedPreview}
                 bounds={selectedPreviewBounds}

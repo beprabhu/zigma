@@ -390,7 +390,7 @@ export default function ImageGenerator() {
       <UploadCloudIcon className="size-6" />
       <span>
         Drop the brief (.md) and the rows (.csv), or{' '}
-        <u className="text-primary">browse</u>
+        <span className="text-primary underline underline-offset-2">browse</span>
       </span>
       <span className="flex flex-wrap justify-center gap-2 text-xs">
         <span className={cn('rounded-md border px-2 py-0.5', briefName && 'border-primary text-foreground')}>
@@ -457,7 +457,7 @@ export default function ImageGenerator() {
             />
           }
         >
-          <PanelSection title="Input" description={<>One image per CSV row. Each prompt is the brief followed by that row&rsquo;s
+          <PanelSection title="Input" hint={<>One image per CSV row. Each prompt is the brief followed by that row&rsquo;s
                 fields, labelled with their column names.</>}>{dropzone}</PanelSection>
 
           {briefName !== null && (
@@ -475,7 +475,7 @@ export default function ImageGenerator() {
           )}
 
           {headers.length > 0 && (
-            <PanelSection title={<>Columns — {csvName}</>} description={<>Ticked columns are sent, each labelled with its header.</>}>
+            <PanelSection title={<>Columns — {csvName}</>} hint="Ticked columns are sent, each labelled with its header.">
                 <FieldGroup className="gap-4">
                   <Field>
                     <FieldLabel htmlFor="gen-name-col">Name column</FieldLabel>
@@ -506,14 +506,17 @@ export default function ImageGenerator() {
                     <FieldLabel>Send in the prompt</FieldLabel>
                     <div className="flex flex-col gap-2">
                       {headers.map((h) => (
-                        <label key={h} className="flex cursor-pointer items-center gap-2 text-sm">
+                        <Field key={h} orientation="horizontal">
                           <Checkbox
+                            id={`gen-col-${h}`}
                             checked={!excludedSet.has(h)}
                             disabled={busy}
                             onCheckedChange={(checked) => toggleColumn(h, checked === true)}
                           />
-                          <span className="truncate">{h}</span>
-                        </label>
+                          <FieldLabel htmlFor={`gen-col-${h}`} className="min-w-0 font-normal">
+                            <span className="block truncate">{h}</span>
+                          </FieldLabel>
+                        </Field>
                       ))}
                     </div>
                     <FieldDescription>
@@ -524,7 +527,7 @@ export default function ImageGenerator() {
               </PanelSection>
           )}
 
-          <PanelSection title="Model" description={<>Calls Azure GPT-Image&rsquo;s generations endpoint. Credentials live in
+          <PanelSection title="Model" hint={<>Calls Azure GPT-Image&rsquo;s generations endpoint. Credentials live in
                 Settings — the gear at the bottom of the rail.</>}>
               <FieldGroup className="gap-4">
                 <Field>
@@ -550,7 +553,7 @@ export default function ImageGenerator() {
 
         <Canvas scrollRef={resultScrollRef}>
           {sampleLength > PROMPT_WARN_CHARS && (
-            <p className="mb-3 rounded-lg border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
+            <p className="mb-3 rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
               A row&rsquo;s prompt is about {sampleLength.toLocaleString()} characters — Azure
               rejects very long prompts. Shorten the brief or untick a column.
             </p>

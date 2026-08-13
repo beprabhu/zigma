@@ -210,7 +210,7 @@ export default function PngCompressorPage() {
           <DropzoneShell accept="image/png" multiple onFiles={(files) => addFiles(files)}>
             <UploadCloudIcon className="size-6" />
             <span className="font-medium text-foreground">
-              Drop PNGs here, <u className="font-normal text-primary">browse</u>, or paste
+              Drop PNGs here, <span className="font-normal text-primary underline underline-offset-2">browse</span>, or paste
             </span>
             <span className="text-xs">
               {items.length ? `${items.length} file${items.length === 1 ? '' : 's'} in queue` : 'PNG files only'}

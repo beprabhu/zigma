@@ -209,7 +209,7 @@ export function GenDialog({
                   </span>
                   <CopyButton text={shown} title="Copy the full prompt" />
                 </div>
-                <pre className="max-h-64 min-w-0 overflow-auto rounded-lg border bg-muted/40 p-2 text-[11px] leading-snug whitespace-pre-wrap">
+                <pre className="max-h-64 min-w-0 overflow-auto rounded-lg bg-muted/40 p-3 text-[11px] leading-snug whitespace-pre-wrap">
                   {shown || 'Nothing to send.'}
                 </pre>
                 {stale && (

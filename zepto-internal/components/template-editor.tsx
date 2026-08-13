@@ -162,7 +162,7 @@ export function TemplateEditor({
       <div className="flex gap-4">
         {/* Layers panel — flat rows, controls surface on hover. */}
         <div className="h-fit w-[148px] shrink-0 overflow-hidden rounded-lg border">
-          <div className="border-b bg-muted/50 px-2.5 py-1.5 text-[11px] font-semibold text-muted-foreground">
+          <div className="border-b bg-muted/50 px-2.5 py-1.5 text-[11px] font-semibold tracking-wide text-muted-foreground uppercase">
             Layers
           </div>
           {listRows.map((name) => {

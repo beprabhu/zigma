@@ -14,6 +14,7 @@ import {
   SlidersHorizontalIcon, SparklesIcon, Trash2Icon, UploadIcon,
 } from 'lucide-react';
 
+import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Hint } from '@/components/hint';
 import {
@@ -64,7 +65,7 @@ export function SettingsDialog({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[calc(100dvh-3rem)] grid-rows-[auto_minmax(0,1fr)] gap-0 overflow-hidden p-0 sm:max-w-3xl">
-        <DialogHeader className="border-b px-5 py-3.5">
+        <DialogHeader className="border-b px-6 py-3.5">
           <DialogTitle>Settings</DialogTitle>
           <DialogDescription className="sr-only">
             Suite-wide settings: API keys and token usage.
@@ -307,7 +308,7 @@ function DefaultsPane() {
   return (
     <div className="space-y-5">
       <div className="space-y-3">
-        <h3 className="text-xs font-semibold text-muted-foreground uppercase">Projects (.zesku)</h3>
+        <h3 className="text-[11px] font-semibold tracking-wide text-muted-foreground uppercase">Projects (.zesku)</h3>
         <Field orientation="horizontal">
           <FieldContent>
             <FieldLabel htmlFor="settings-save-originals" className="font-normal">
@@ -369,7 +370,7 @@ function SkillsPane() {
             </div>
             {skill.builtin ? (
               <>
-                <span className="shrink-0 text-[10px] text-muted-foreground uppercase">Built-in</span>
+                <Badge variant="chip" className="shrink-0">Built-in</Badge>
                 <Button
                   variant="ghost"
                   size="icon-sm"

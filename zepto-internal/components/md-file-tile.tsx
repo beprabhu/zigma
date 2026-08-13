@@ -73,9 +73,7 @@ export function MdFileTile({
         <ItemDescription className="truncate text-xs">{preview}</ItemDescription>
       </ItemContent>
       <ItemActions>
-        <Badge variant="secondary" className="bg-muted px-1.5 text-[10px] text-muted-foreground">
-          {badge}
-        </Badge>
+        <Badge variant="chip">{badge}</Badge>
       </ItemActions>
     </Item>
   );
