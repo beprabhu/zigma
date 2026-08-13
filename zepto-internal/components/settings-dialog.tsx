@@ -34,6 +34,7 @@ import {
   SidebarMenuItem, SidebarProvider,
 } from '@/components/ui/sidebar';
 import { usePersistedState } from '@/hooks/use-persisted-state';
+import { DEFAULT_SEAL_SIZE } from '@/lib/bg/ledger';
 import { diffStat, newSkillId, useSkills, type PromptSkill } from '@/lib/skills';
 import { azureImageUrl } from '@/lib/pipeline';
 import { QUALITIES, QUALITY_BLURB, useImageQuality, type ImageQuality } from '@/lib/quality';
@@ -303,10 +304,45 @@ function ImageModelPane() {
 }
 
 function DefaultsPane() {
-  // Same persisted key Cleanup's save flow reads — the setting moved here from its footer.
+  // Same persisted keys Cleanup's save and seal flows read — both settings moved here from the
+  // page. DEFAULT_SEAL_SIZE is imported rather than retyped as 500: the page seeds its own state
+  // from that constant, so a literal here would drift the moment the constant moves and the
+  // dialog would show a number the run is not using.
   const [saveOriginals, setSaveOriginals] = usePersistedState('skuc_bgSaveOriginals', true);
+  const [sealSize, setSealSize] = usePersistedState('skuc_bgSealSize', DEFAULT_SEAL_SIZE);
   return (
+    // Groups run in the order their settings bite. Batch size shapes what arrives DURING a run —
+    // it is set before starting 14,000 images and changes delivery for the next several hours —
+    // while project contents only matter once someone chooses to save afterwards.
     <div className="space-y-5">
+      <div className="space-y-3">
+        <h3 className="text-[11px] font-semibold tracking-wide text-muted-foreground uppercase">Batches (.zip)</h3>
+        <Field orientation="horizontal">
+          <FieldContent>
+            <FieldLabel htmlFor="settings-seal-size" className="font-normal">
+              <Hint hint="Cleanup groups clean results into a downloadable ZIP each time this many have landed, so a long run delivers throughout instead of one file at the end. Flagged images are never sealed — they wait for the AI fix and ship with the rest.">
+                Clean images per batch
+              </Hint>
+            </FieldLabel>
+          </FieldContent>
+          <Input
+            id="settings-seal-size"
+            type="number"
+            min={1}
+            step={50}
+            className="w-24"
+            value={sealSize}
+            onChange={(e) => {
+              // An emptied field parses to NaN, which passes every threshold comparison and
+              // switches sealing off for the rest of a run — nothing throws, and the only symptom
+              // is ZIPs that stop arriving. NaN cannot survive JSON either, so it would persist
+              // as null and come back as null on every later mount.
+              const next = Number.parseInt(e.target.value, 10);
+              setSealSize(Number.isFinite(next) && next > 0 ? next : DEFAULT_SEAL_SIZE);
+            }}
+          />
+        </Field>
+      </div>
       <div className="space-y-3">
         <h3 className="text-[11px] font-semibold tracking-wide text-muted-foreground uppercase">Projects (.zesku)</h3>
         <Field orientation="horizontal">

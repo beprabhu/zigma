@@ -91,7 +91,7 @@ import {
   type QueueFilter, type QueueSort,
 } from '@/lib/bg/quality';
 import { QueueFilters } from '@/components/bg-remover/queue-filters';
-import { BatchRail } from '@/components/bg-remover/batch-rail';
+import { BatchList } from '@/components/bg-remover/batch-list';
 import {
   DEFAULT_SEAL_SIZE, cleanUnexported, nextAllocation, planExport, planReexport, planSeal,
   recordBatch, remainingUnexported, stampBatch, summarizeLedger,
@@ -456,7 +456,8 @@ export default function BgRemover() {
     () => new Set(openPlans.flatMap((plan) => plan.items.map((it) => it.id))),
     [openPlans],
   );
-  const [sealSize, setSealSize] = usePersistedState('skuc_bgSealSize', DEFAULT_SEAL_SIZE);
+  // Set in Settings -> Defaults; usePersistedState syncs the change into this tab live.
+  const [sealSize] = usePersistedState('skuc_bgSealSize', DEFAULT_SEAL_SIZE);
   const [selectedBatch, setSelectedBatch] = React.useState<number | null>(null);
   const [exportingBatch, setExportingBatch] = React.useState<number | null>(null);
   // Files already written cannot be un-written, so numbering may never retreat into names that
@@ -484,12 +485,12 @@ export default function BgRemover() {
   );
 
   /**
-   * Chips for both halves of a batch's life: rows already on disk come from the ledger, rows
+   * Rows for both halves of a batch's life: rows already on disk come from the ledger, rows
    * sealed but not yet downloaded come from the open plans — a sealed batch has its number the
    * moment it is allocated, so it gets a chip and a Download button straight away instead of
    * being invisible until its file exists.
    */
-  const railBatches = React.useMemo(() => {
+  const batchRows = React.useMemo(() => {
     const shipped = ledgerSummary.batches.map((b) => ({
       batch: b.batch,
       done: b.present,
@@ -497,9 +498,10 @@ export default function BgRemover() {
       downloaded: true,
       stale: b.staleness === 'stale',
     }));
+    // No custom label: the list renders its own state chip, and "Batch 1 · ready" beside a
+    // "ready" chip said the same thing twice.
     const waiting = openPlans.map((plan) => ({
       batch: plan.batch,
-      label: `Batch ${plan.batch} · ready`,
       done: plan.items.length,
       total: plan.items.length,
       downloaded: false,
@@ -1684,10 +1686,6 @@ export default function BgRemover() {
 
   // ---- Export: render, optionally compress, zip ---------------------------
 
-  function handleExport() {
-    exportCohort(withCutout(itemsRef.current));
-  }
-
   /** The next unused batch number and file range, counting every plan still open. */
   function allocate(): Allocation {
     return nextAllocation(itemsRef.current, ledger, openPlans, allocFloorRef.current);
@@ -2076,9 +2074,74 @@ export default function BgRemover() {
               </FieldLabel>
             </FieldContent>
           </Field>
+          {/* The action lives with the prompt and the skill it will actually send, rather than
+              floating in the grid toolbar between a filter and a sort control where its cost —
+              one paid Azure call per flagged image — read like another view toggle. Disabled
+              rather than hidden at zero flagged: a button that vanishes teaches nothing. */}
+          <Field orientation="horizontal" className="items-center justify-between">
+            <Button
+              size="sm"
+              variant="outline"
+              // `running` is deliberately absent: flagged images can start their Azure phase
+              // while the rest of the batch is still removing; only their re-removal waits for
+              // the workers to free up.
+              disabled={aiFixing || exporting || warming || !aiReady || !flaggedItems.length}
+              title={
+                !aiReady
+                  ? 'AI edit needs the Azure endpoint + key (Settings, gear in the rail)'
+                  : !flaggedItems.length
+                    ? 'Nothing is flagged that the AI fix can re-run.'
+                    : 'Regenerate every flagged image with the prompt above, then re-remove their backgrounds (after the current batch, if one is running).'
+              }
+              onClick={() => void handleAiEditFlagged()}
+            >
+              {aiFixing ? (
+                <Spinner data-icon="inline-start" />
+              ) : (
+                <WandSparklesIcon data-icon="inline-start" />
+              )}
+              Fix flagged ({flaggedItems.length.toLocaleString()})
+            </Button>
+            <label
+              className="flex items-center gap-1.5 text-xs text-muted-foreground"
+              title="Keep watching the queue and send every newly flagged image to the AI edit automatically — each image is sent at most once."
+            >
+              <Switch checked={autoAiFix} onCheckedChange={setAutoAiFix} disabled={!aiReady} />
+              Auto
+            </label>
+          </Field>
         </FieldGroup>
       </PanelSection>
   );
+
+  // The list itself; the footer frames it. Renders nothing until there is something to show,
+  // so a small queue never pays for the block.
+  const batchList =
+    batchRows.length || running || restCohort.length ? (
+      <BatchList
+        batches={batchRows}
+        selected={selectedBatch}
+        onSelect={setSelectedBatch}
+        onDownload={(batch: number) => {
+          const open = openPlans.find((p) => p.batch === batch);
+          if (open) return void runPlan(open);
+          const row = ledger.find((r) => r.batch === batch);
+          const redo = row && planReexport(itemsRef.current, row);
+          if (redo) void runPlan(redo, { reexport: true });
+        }}
+        downloadingBatch={exportingBatch}
+        downloadDisabled={exporting}
+        running={running}
+        filling={running ? { clean: cleanCohort.length, threshold: Math.max(1, sealSize) } : null}
+        // Shown for context only — the footer's primary button is the one that ships it, so the
+        // same action does not appear twice a few pixels apart.
+        tail={
+          restCohort.length
+            ? { count: restCohort.length, flagged: restCohort.length - cleanCohort.length }
+            : null
+        }
+      />
+    ) : null;
 
   // Tile fit — the old second tab, now a properties section: switch it on, tune the safe
   // area, and the export renders tiles instead of raw cutouts. The live preview shows the
@@ -2151,34 +2214,6 @@ export default function BgRemover() {
             </FieldContent>
           </Field>
 
-          <Field orientation="horizontal">
-            <FieldContent>
-              <FieldLabel htmlFor="bg-seal-size" className="font-normal">
-                Seal a batch every
-              </FieldLabel>
-              <FieldDescription>
-                Clean results are grouped into a downloadable ZIP as they land, so a long run
-                delivers throughout instead of one file at the end. Flagged images are never
-                sealed — they wait for the AI fix and ship with the rest.
-              </FieldDescription>
-            </FieldContent>
-            <Input
-              id="bg-seal-size"
-              type="number"
-              min={1}
-              step={50}
-              className="w-24"
-              value={sealSize}
-              disabled={busy}
-              onChange={(e) => {
-                // An empty field parses to NaN, which would silently switch sealing off for the
-                // rest of the run rather than failing where anyone could see it.
-                const next = Number.parseInt(e.target.value, 10);
-                setSealSize(Number.isFinite(next) && next > 0 ? next : DEFAULT_SEAL_SIZE);
-              }}
-            />
-          </Field>
-
           <BudgetControls
             idPrefix="bg"
             on={budgetOn}
@@ -2226,8 +2261,21 @@ export default function BgRemover() {
       .join(' · ') ||
     'Cutouts export as PNGs in a ZIP.';
 
+  // A sealed batch already owns part of the queue even before its ZIP exists, so the plain
+  // "Export ZIP" label would promise the whole queue while shipping only what is left.
+  const batched = ledger.length > 0 || openPlans.length > 0;
+
   const exportFooter = (
     <div className="space-y-2">
+      {/* Batches sit with the export CTAs, not up in the settings: a batch ZIP is rendered with
+          whatever tile fit, background and compression are live when Download is pressed, so it
+          belongs downstream of the controls that decide its contents, not above them.
+          Height-capped with its own scroll because this footer does not scroll — a 14,000-image
+          run seals 28 batches, and an unbounded list would squeeze the settings above it out of
+          the panel entirely. */}
+      {batchList && (
+        <div className="-mx-1 max-h-52 overflow-y-auto px-1 pb-2">{batchList}</div>
+      )}
       {progress && <Progress value={progress.pct} />}
       {aiProgress && <Progress value={aiProgress.pct} />}
       {exportProgress && <Progress value={exportProgress.pct} />}
@@ -2246,9 +2294,23 @@ export default function BgRemover() {
           <SaveIcon data-icon="inline-start" />
           Save project
         </Button>
-        <Button disabled={busy || !cutouts.length} onClick={handleExport}>
+        {/* One export action, and its label says what it will actually ship. It exports the
+            rows no batch has taken yet — never the whole queue — because once anything has been
+            exported, "everything with a cutout" would put images that are already inside a
+            downloaded ZIP into a second one under different numbers, and re-stamp them into a
+            batch they were never part of. With nothing exported yet the two sets are identical,
+            so the plain case is unchanged. */}
+        <Button
+          disabled={busy || !restCohort.length}
+          onClick={() => exportCohort(restCohort)}
+          title={
+            batched
+              ? 'Everything no batch has taken yet, including images you have since fixed.'
+              : 'Every finished cutout in the queue, as PNGs in one ZIP.'
+          }
+        >
           {exporting ? <Spinner data-icon="inline-start" /> : <DownloadIcon data-icon="inline-start" />}
-          Export ZIP
+          {batched ? `Export remaining (${restCohort.length.toLocaleString()})` : 'Export ZIP'}
         </Button>
       </div>
     </div>
@@ -2466,116 +2528,40 @@ export default function BgRemover() {
                 emptyState
               ) : (
                 <>
-                  {/* Grid toolbar: count on the left, whole-queue reset on the right. */}
-                  <div className="mb-2 flex items-center justify-between gap-2">
-                    <span className="text-xs text-muted-foreground">
-                      {/* Scoped to what is on screen: under a filter, "select all" only ever
-                          reaches the visible rows, so counting the whole queue here would
-                          promise a selection the button cannot make. */}
-                      {gridSel.active
-                        ? `${gridSel.checked.size} of ${displayItems.length} selected`
-                        : displayItems.length === items.length
-                          ? `${items.length} image${items.length === 1 ? '' : 's'}`
-                          : `${displayItems.length} of ${items.length} images`}
-                    </span>
-                    <ClearAllButton
-                      title="Clear the queue?"
-                      disabled={busy}
-                      onConfirm={clearAllItems}
-                      description={
-                        <>
-                          Removes all {items.length} image{items.length === 1 ? '' : 's'},
-                          including finished cutouts that haven&rsquo;t been exported. Your
-                          source files on disk are untouched.
-                        </>
-                      }
+                  {/* One row: what the grid is showing on the left, how much of it on the
+                      right. The filter and sort controls used to be nine identically-shaped
+                      pills spread over three rows, where nothing but the label said which of
+                      them changed the order and which changed the contents. */}
+                  <div className="mb-3 flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
+                    <QueueFilters
+                      filter={queueFilter}
+                      onFilterChange={changeQueueFilter}
+                      counts={filterCounts}
+                      sort={queueSort}
+                      onSortChange={setQueueSort}
                     />
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-muted-foreground tabular-nums">
+                        {gridSel.active
+                          ? `${gridSel.checked.size.toLocaleString()} of ${displayItems.length.toLocaleString()} selected`
+                          : displayItems.length === items.length
+                            ? `${items.length.toLocaleString()} image${items.length === 1 ? '' : 's'}`
+                            : `${displayItems.length.toLocaleString()} of ${items.length.toLocaleString()}`}
+                      </span>
+                      <ClearAllButton
+                        title="Clear the queue?"
+                        disabled={busy}
+                        onConfirm={clearAllItems}
+                        description={
+                          <>
+                            Removes all {items.length.toLocaleString()} image
+                            {items.length === 1 ? '' : 's'}, including finished cutouts that
+                            haven&rsquo;t been exported. Your source files on disk are untouched.
+                          </>
+                        }
+                      />
+                    </div>
                   </div>
-                  {/* Mounted whenever the queue is non-empty, never behind a count: the old
-                      toolbar disappeared the moment nothing was flagged, which would strand
-                      anyone sitting inside the flagged filter on an empty grid with no way out. */}
-                  <QueueFilters
-                    className="mb-3"
-                    filter={queueFilter}
-                    onFilterChange={changeQueueFilter}
-                    counts={filterCounts}
-                    visible={displayItems.length}
-                    sort={queueSort}
-                    onSortChange={setQueueSort}
-                    actions={
-                      flaggedItems.length > 0 && (
-                        <>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            // `running` is deliberately absent: flagged items can start their
-                            // Azure phase while the rest of the batch is still removing; only
-                            // their re-removal waits for the workers to free up.
-                            disabled={aiFixing || exporting || warming || !aiReady}
-                            title={
-                              aiReady
-                                ? 'Regenerate every flagged image with the AI edit prompt, then re-remove their backgrounds (after the current batch, if one is running). Parallelism comes from Settings → Image model.'
-                                : 'AI edit needs the Azure endpoint + key (Settings, gear in the rail)'
-                            }
-                            onClick={() => void handleAiEditFlagged()}
-                          >
-                            {aiFixing ? (
-                              <Spinner data-icon="inline-start" />
-                            ) : (
-                              <WandSparklesIcon data-icon="inline-start" />
-                            )}
-                            AI-fix flagged ({flaggedItems.length})
-                          </Button>
-                          <label
-                            className="flex items-center gap-1.5 text-xs text-muted-foreground"
-                            title="Keep watching the queue and send every newly flagged image to the AI edit automatically — each image is sent at most once."
-                          >
-                            <Switch
-                              checked={autoAiFix}
-                              onCheckedChange={setAutoAiFix}
-                              disabled={!aiReady}
-                            />
-                            Auto
-                          </label>
-                        </>
-                      )
-                    }
-                  />
-                  {/* Above the grid, never inside it: the virtual window's arithmetic needs
-                      every row the same height, so a header interleaved with the cells breaks
-                      the scroll maths outright. */}
-                  <BatchRail
-                    className="mb-3"
-                    batches={railBatches}
-                    selected={selectedBatch}
-                    onSelect={setSelectedBatch}
-                    onDownload={(batch) => {
-                      const open = openPlans.find((p) => p.batch === batch);
-                      if (open) return void runPlan(open);
-                      const row = ledger.find((r) => r.batch === batch);
-                      const redo = row && planReexport(itemsRef.current, row);
-                      if (redo) void runPlan(redo, { reexport: true });
-                    }}
-                    downloadingBatch={exportingBatch}
-                    downloadDisabled={exporting}
-                    running={running}
-                    filling={
-                      running
-                        ? { clean: cleanCohort.length, threshold: Math.max(1, sealSize) }
-                        : null
-                    }
-                    tail={
-                      restCohort.length
-                        ? {
-                            count: restCohort.length,
-                            flagged: restCohort.length - cleanCohort.length,
-                            label: cleanCohort.length ? undefined : 'Remaining',
-                          }
-                        : null
-                    }
-                    onExportTail={() => exportCohort(restCohort)}
-                    exportingTail={exportingBatch !== null}
-                  />
                   <VirtualGrid
                     items={displayItems}
                     scrollRef={removeScrollRef}
