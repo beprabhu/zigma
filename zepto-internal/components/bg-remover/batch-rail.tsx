@@ -3,6 +3,16 @@
 // One chip per batch of a large CSV import: progress, a spinner while it runs, its own Download
 // once it finishes, and click-to-filter so the grid can be narrowed to a single batch.
 //
+// A batch is born when its images are EXPORTED, so the rail also carries two things that are not
+// batches yet and are drawn as such (dashed, unnumbered, unselectable):
+//
+//   Filling    the clean cutouts piling up toward the next automatic seal. It has no number
+//              because nothing has stamped BgItem.batch for it yet, and no ZIP because the run
+//              has not sealed it.
+//   Remaining  everything with a cutout that no batch has claimed — flagged or not — which is
+//              the cohort the user exports by hand once the AI fixes have landed. Its export is
+//              what guarantees the ZIPs add up to the whole queue.
+//
 // The rail sits ABOVE the results grid as a sibling element, and nothing here may ever become a
 // grid row. VirtualGrid computes its window from one uniform row height (cellHeight takes a
 // width, not an item, for exactly that reason) — a batch header interleaved between rows would
@@ -11,7 +21,9 @@
 //
 // Purely presentational: it is handed a progress snapshot per batch and reports clicks back.
 
-import { CircleCheckIcon, DownloadIcon, LayersIcon, RefreshCwIcon } from 'lucide-react';
+import {
+  CircleCheckIcon, DownloadIcon, InboxIcon, LayersIcon, PackagePlusIcon, RefreshCwIcon,
+} from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -41,6 +53,39 @@ export interface BatchProgress {
   stale?: boolean;
 }
 
+/**
+ * The cohort accumulating toward the next seal: finished, clean and not yet exported.
+ *
+ * Deliberately not a BatchProgress. It has no `batch` number to be identified by, and its
+ * membership is a live predicate rather than a stamp — an item leaves it the moment a quality
+ * flag lands on it and rejoins when an AI fix clears one — so anything that treats it as a batch
+ * would be describing a set that has already changed.
+ */
+export interface FillingBatch {
+  /** Clean unexported cutouts counted so far — the numerator of the seal. */
+  clean: number;
+  /** How many it takes to seal. The page's batch size; 500 by default. */
+  threshold: number;
+}
+
+/**
+ * The unexported tail: every item that HAS a cutout and no batch, whatever its flag says.
+ *
+ * Flag state is not part of the definition on purpose. Flagged-ness moves — an AI fix un-flags
+ * an item — so a cohort defined by it would let items slip out between the seal and the export
+ * and end up in no ZIP at all. "Has a cutout, not yet exported" is the only membership rule that
+ * makes the sealed ZIPs plus this one add up to the queue exactly once.
+ */
+export interface TailCohort {
+  /** Everything still unexported, including the clean ones counted by FillingBatch above — one
+   *  set contains the other, which is why exporting this cohort ends the run cleanly. */
+  count: number;
+  /** How many of those are flagged. Shown because it is the reason the tail exists at all. */
+  flagged?: number;
+  /** Defaults to "Remaining". */
+  label?: string;
+}
+
 export interface BatchRailProps {
   batches: readonly BatchProgress[];
   /** null = no batch filter; the grid shows every batch. */
@@ -52,6 +97,23 @@ export interface BatchRailProps {
   downloadingBatch?: number | null;
   /** Exports are serialised, so one running download disables the rest. */
   downloadDisabled?: boolean;
+  /**
+   * The cohort filling toward the next seal. Pass it for the WHOLE run, from zero — gating it on
+   * `clean > 0` would have it appear a few seconds in and push the chips after it sideways for
+   * no reason the user can see.
+   */
+  filling?: FillingBatch | null;
+  /** The unexported tail. Omit to leave the manual-export affordance out entirely. */
+  tail?: TailCohort | null;
+  /** Omit to show the tail as a count only, with no export button. */
+  onExportTail?: () => void;
+  /** The tail's ZIP is being built right now. */
+  exportingTail?: boolean;
+  /**
+   * A run is in flight, so the two live counts are still climbing. Rail-level rather than
+   * per-cohort: one run feeds both, and two flags that could disagree would only ever be a bug.
+   */
+  running?: boolean;
   className?: string;
 }
 
@@ -62,9 +124,14 @@ export function BatchRail({
   onDownload,
   downloadingBatch = null,
   downloadDisabled,
+  filling,
+  tail,
+  onExportTail,
+  exportingTail,
+  running,
   className,
 }: BatchRailProps) {
-  if (batches.length === 0) return null;
+  if (batches.length === 0 && !filling && !tail) return null;
 
   return (
     // Chips keep their intrinsic width and the rail scrolls: a 3,000-row CSV is six chips at the

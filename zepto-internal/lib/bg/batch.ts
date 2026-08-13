@@ -258,6 +258,13 @@ export interface ExportNameOptions {
    */
   numbered?: boolean;
   extension?: string;
+  /**
+   * Added to the position each name is numbered from. A batched export ships several ZIPs, and
+   * numbering each from 01 puts an `01-` file in every one of them — unzip two into the same
+   * folder and they collide. The offset is how many images earlier batches already shipped, so
+   * the second ZIP starts where the first stopped.
+   */
+  offset?: number;
 }
 
 export function exportFileName(
@@ -265,8 +272,8 @@ export function exportFileName(
   index: number,
   options: ExportNameOptions = {},
 ): string {
-  const { numbered = true, extension = 'png' } = options;
-  const position = index + 1;
+  const { numbered = true, extension = 'png', offset = 0 } = options;
+  const position = offset + index + 1;
   const base = sanitizeName(name, `image-${position}`);
   return numbered ? `${String(position).padStart(2, '0')}-${base}.${extension}` : `${base}.${extension}`;
 }

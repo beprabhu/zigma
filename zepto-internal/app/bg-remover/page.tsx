@@ -72,6 +72,8 @@ import {
   exportFileNames, flattenOnBackground, formatKb, isAbortError,
   decodeCutout, loadImageFromFile, looksLikeMissingWeights, mapWithLimit, needsCutout,
   nextItemId, pickSave, previewScale, releaseCanvas, releaseItem, releaseOriginal, sameCsvOrigin, saveTo, withCutout,
+  type CutoutItem,
+  type SaveDestination,
   type BgItem, type BgItemDraft, type BgItemSource, type BgItemStatus,
 } from '@/lib/bg/batch';
 import { useAutosave, type AutosaveRecord } from '@/lib/bg/autosave';
@@ -1586,23 +1588,39 @@ export default function BgRemover() {
 
   // ---- Export: render, optionally compress, zip ---------------------------
 
-  async function handleExport() {
-    const ready = withCutout(itemsRef.current);
-    if (!ready.length || busy) return;
+  function handleExport() {
+    return exportItems(withCutout(itemsRef.current));
+  }
+
+  /**
+   * Renders, optionally compresses and zips one cohort. A batched run calls this per sealed
+   * batch rather than once over the whole queue, so everything that used to be implicitly "the
+   * queue" is a parameter now: which rows, what the ZIP is called, and where its numbering
+   * starts. `offset` is what stops every ZIP from opening with an `01-` file — unzip two of
+   * those into one folder and the second overwrites the first.
+   */
+  async function exportItems(
+    ready: CutoutItem[],
+    opts: { suffix?: string; offset?: number; dest?: SaveDestination } = {},
+  ) {
+    if (!ready.length || (busy && !opts.dest)) return;
     // Per-item now: each file renders by its own effective tile fit. Only the ZIP's name still
     // needs an overall shape — all-tiles / all-cutouts keep their old names, a mix says so.
     const tileCount = ready.filter((it) => effectiveTileFit(it)).length;
     const shape = tileCount === ready.length ? 'tiles' : tileCount === 0 ? 'cutouts' : 'mixed';
+    const suffix = opts.suffix ? `-${opts.suffix}` : '';
     // The save dialog opens now, while the click still counts as user activation — after
     // minutes of encoding Chrome would refuse it. Cancelling the dialog cancels the export.
     const zipName = sessionSlug
-      ? `${sessionSlug}-${shape === 'mixed' ? 'export' : shape}.zip`
+      ? `${sessionSlug}-${shape === 'mixed' ? 'export' : shape}${suffix}.zip`
       : shape === 'tiles'
-        ? 'safe-area-tiles.zip'
+        ? `safe-area-tiles${suffix}.zip`
         : shape === 'cutouts'
-          ? 'bg-cutouts.zip'
-          : 'zigma-export.zip';
-    const dest = await pickSave(zipName);
+          ? `bg-cutouts${suffix}.zip`
+          : `zigma-export${suffix}.zip`;
+    // A destination handed in was already chosen — an auto-saving run picked its folder once,
+    // at a click, and must not ask again per batch.
+    const dest = opts.dest ?? (await pickSave(zipName));
     if (dest === 'cancelled') return;
     // Snapshotted once: editing the ceiling mid-export must not give the ZIP two different rules.
     const budget = budgetActive
@@ -1690,7 +1708,7 @@ export default function BgRemover() {
 
       const names = exportFileNames(
         ready.map((item) => item.name),
-        { numbered: numberFiles },
+        { numbered: numberFiles, offset: opts.offset ?? 0 },
       );
       ready.forEach((item, n) => files.push({ name: names[n], data: finalBytes[n] }));
 
