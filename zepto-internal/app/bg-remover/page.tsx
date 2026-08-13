@@ -67,7 +67,7 @@ import {
   type SafeAreaConfig,
 } from '@/lib/bg/safe-area';
 import {
-  SETUP_HINT, canRetry, canvasToPngBlob, canvasToPngBytes, createItems, csvCellKey, describeDownload, draftsFromCsv, errorMessage,
+  SETUP_HINT, canRetry, canvasToPngBlob, canvasToPngBytes, createItems, csvCellKey, csvSourceUrl, describeDownload, draftsFromCsv, errorMessage,
   exportFileNames, flattenOnBackground, formatKb, isAbortError,
   decodeCutout, loadImageFromFile, looksLikeMissingWeights, mapWithLimit, needsCutout,
   nextItemId, pickSave, previewScale, releaseCanvas, releaseItem, releaseOriginal, sameCsvOrigin, saveTo, withCutout,
@@ -561,21 +561,25 @@ export default function BgRemover() {
    * touches nothing else: no membership change, no reorder, no ids, no cutouts.
    */
   const renameCsvItems = React.useCallback((drafts: BgItemDraft[]) => {
-    const nameByCell = new Map<string, string>();
+    // Each cell carries the URL it names, because a cell is a position and positions repeat
+    // across files: without the check, a row left over from an earlier CSV takes the new file's
+    // title for the same row number and the export ships one product's picture under another's.
+    const byCell = new Map<string, { name: string; url: string | null }>();
     const nameByUrl = new Map<string, string>();
     for (const draft of drafts) {
-      if (draft.csv) nameByCell.set(csvCellKey(draft.csv), draft.name);
+      const url = draft.source.kind === 'url' ? draft.source.url : null;
+      if (draft.csv) byCell.set(csvCellKey(draft.csv), { name: draft.name, url });
       // Fallback for rows imported before provenance existed (restored projects and older
       // autosaves): first URL wins, matching the old by-URL behaviour for duplicates.
-      if (draft.source.kind === 'url' && !nameByUrl.has(draft.source.url)) {
-        nameByUrl.set(draft.source.url, draft.name);
-      }
+      if (url && !nameByUrl.has(url)) nameByUrl.set(url, draft.name);
     }
     setItems((prev) =>
       prev.map((it) => {
+        const url = csvSourceUrl(it);
+        const cell = it.csv ? byCell.get(csvCellKey(it.csv)) : undefined;
         const name =
-          (it.csv ? nameByCell.get(csvCellKey(it.csv)) : undefined) ??
-          (it.source.kind === 'url' ? nameByUrl.get(it.source.url) : undefined);
+          (cell && cell.url === url ? cell.name : undefined) ??
+          (url ? nameByUrl.get(url) : undefined);
         // Unchanged rows keep their object identity, so the memoised cells do not repaint and
         // autosave's identity diff does not rewrite records that did not actually change.
         return name === undefined || name === it.name ? it : { ...it, name };
@@ -592,11 +596,13 @@ export default function BgRemover() {
     const kept = current.filter((it) => it.source.kind !== 'url');
 
     // An AI edit moves a row out of the 'url' population and into `kept`, but it still stands
-    // for its CSV cell. Without this set the row is minted a second time under a fresh id —
-    // a visible duplicate, and one the AI-fix dedupe has never seen, so it can be paid for
-    // at Azure all over again.
-    const claimed = new Set<string>();
-    for (const it of kept) if (it.csv) claimed.add(csvCellKey(it.csv));
+    // for its CSV cell. Without this the row is minted a second time under a fresh id — a
+    // visible duplicate, and one the AI-fix dedupe has never seen, so it can be paid for at
+    // Azure all over again. The URL is stored alongside so the claim only suppresses the row it
+    // is actually standing in for: a position claimed against one file must not swallow the
+    // same-numbered row of the next, which vanished from the queue with nothing said.
+    const claimed = new Map<string, string | null>();
+    for (const it of kept) if (it.csv) claimed.set(csvCellKey(it.csv), csvSourceUrl(it));
 
     // Remapping must not throw finished work away. Rows are matched to the new drafts by their
     // CSV cell, with the URL as the fallback for rows imported before provenance existed. The
@@ -617,10 +623,15 @@ export default function BgRemover() {
     const fresh: BgItem[] = [];
     for (const draft of drafts) {
       const cell = draft.csv ? csvCellKey(draft.csv) : '';
+      const draftUrl = draft.source.kind === 'url' ? draft.source.url : null;
       // Already on screen as an AI-edited row — minting a second one is the duplicate bug.
-      if (cell && claimed.has(cell)) continue;
+      if (cell && claimed.has(cell) && claimed.get(cell) === draftUrl) continue;
       let match = cell ? byCell.get(cell) : undefined;
-      if (match && reused.has(match.id)) match = undefined;
+      // A cell alone does not identify a row: it is a position, and every sheet exported from
+      // the same template repeats it. Reusing on a bare cell hit handed the new row the old
+      // file's URL and cutout, so a corrected CSV re-dropped over its own queue kept serving
+      // the picture the correction was meant to replace.
+      if (match && (reused.has(match.id) || csvSourceUrl(match) !== draftUrl)) match = undefined;
       if (!match && draft.source.kind === 'url') {
         const list = byUrl.get(draft.source.url) ?? [];
         let at = cursor.get(draft.source.url) ?? 0;
@@ -1108,6 +1119,10 @@ export default function BgRemover() {
         durationMs: undefined,
         // Undo restores the pre-edit input AND its cutout in one step.
         prev: { source: item.source, cutout: item.cutout },
+        // Write-once: a second edit finds this already set and keeps the imported image rather
+        // than promoting the first AI output to "the original". `prev` holds one step only, so
+        // without this nothing in the item still pointed at the CSV picture after two edits.
+        originalSource: item.originalSource ?? item.source,
       };
       patchItem(item.id, patch);
       return { ...item, ...patch };
