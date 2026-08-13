@@ -1603,7 +1603,13 @@ export default function BgRemover() {
     ready: CutoutItem[],
     opts: { suffix?: string; offset?: number; dest?: SaveDestination } = {},
   ) {
-    if (!ready.length || (busy && !opts.dest)) return;
+    // Exports serialize against each other and wait for a model warm-up, but NOT for a run: a
+    // batch that sealed mid-run has to be able to write itself out while the workers keep going,
+    // which is the whole point of sealing early. The whole-queue button stays disabled by `busy`
+    // in the footer, so only a deliberate per-batch export takes this path. The encode side is
+    // bounded (a fixed number of lanes, each one image at a time) and reports on its own
+    // progress line, so it does not fight the run for either memory or the status bar.
+    if (!ready.length || exporting || warming) return;
     // Per-item now: each file renders by its own effective tile fit. Only the ZIP's name still
     // needs an overall shape — all-tiles / all-cutouts keep their old names, a mix says so.
     const tileCount = ready.filter((it) => effectiveTileFit(it)).length;
