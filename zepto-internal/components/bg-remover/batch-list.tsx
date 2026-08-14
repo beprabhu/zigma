@@ -68,6 +68,8 @@ export interface BatchProgress {
  * would be describing a set that has already changed.
  */
 export interface FillingBatch {
+  /** True when no run is in flight: the row becomes an action instead of a progress readout. */
+  idle?: boolean;
   /** Clean unexported cutouts counted so far — the numerator of the seal. */
   clean: number;
   /** How many it takes to seal. The page's batch size; 500 by default. */
@@ -118,6 +120,9 @@ export interface BatchListProps {
   tail?: TailCohort | null;
   /** Omit to show the tail as a count only, with no export button. */
   onExportTail?: () => void;
+  /** Ships the clean cohort as its own batch — the idle filling row's action. */
+  onExportClean?: () => void;
+  exportingClean?: boolean;
   /** The tail's ZIP is being built right now. */
   exportingTail?: boolean;
   /**
@@ -175,6 +180,8 @@ export function BatchList({
   tail,
   onExportTail,
   exportingTail,
+  onExportClean,
+  exportingClean,
   running,
   className,
 }: BatchListProps) {
@@ -189,7 +196,14 @@ export function BatchList({
     <div role="group" aria-label="Batches" className={cn('flex flex-col gap-1.5', className)}>
       {/* Live rows first: the seal countdown is the only number in this section that moves on
           its own, so it sits where the eye lands rather than under a growing pile of history. */}
-      {filling && <FillingRow entry={filling} running={running} />}
+      {filling && (
+        <FillingRow
+          entry={filling}
+          running={running}
+          onExport={onExportClean}
+          exporting={exportingClean}
+        />
+      )}
 
       {batches.length > 0 && (
         // Capped and scrolled INSIDE the section instead of growing it. 14,000 images seal 28
@@ -375,9 +389,22 @@ function BatchRow({
  * A batch row appears the moment it seals, which is the point at which the set stops moving and
  * is worth filtering to.
  */
-function FillingRow({ entry, running }: { entry: FillingBatch; running?: boolean }) {
-  const { clean, threshold } = entry;
+function FillingRow({
+  entry,
+  running,
+  onExport,
+  exporting,
+}: {
+  entry: FillingBatch;
+  running?: boolean;
+  onExport?: () => void;
+  exporting?: boolean;
+}) {
+  const { clean, threshold, idle } = entry;
   const target = Math.max(1, threshold);
+  // At rest these images are not "filling" anything — no further results are coming, so they are
+  // a batch that simply has not been asked for yet, and the row says so and offers the ask.
+  const ready = Boolean(idle) && clean > 0;
 
   return (
     // Dashed and muted: the outline of a batch rather than one, because it can be neither
@@ -385,35 +412,64 @@ function FillingRow({ entry, running }: { entry: FillingBatch; running?: boolean
     <div
       className={cn(ROW, 'border-dashed')}
       title={
-        `${n(clean)} clean cutout${clean === 1 ? '' : 's'} of ${n(threshold)} are waiting to be ` +
-        `exported. At ${n(threshold)} they become the next batch and get their own row — flagged ` +
-        'images are held back for the Remaining export instead.'
+        ready
+          ? `${n(clean)} clean cutout${clean === 1 ? '' : 's'} that no batch has taken. Export ` +
+            'them as their own ZIP so finished work stays separate from the flagged images ' +
+            'still waiting on an AI fix.'
+          : `${n(clean)} clean cutout${clean === 1 ? '' : 's'} of ${n(threshold)} are waiting to ` +
+            `be exported. At ${n(threshold)} they become the next batch and get their own row — ` +
+            'flagged images are held back for the Remaining export instead.'
       }
     >
       <div className={ROW_BODY}>
         {running ? (
           <Spinner className="size-3.5 shrink-0 text-muted-foreground" />
         ) : (
-          <PackagePlusIcon className="size-3.5 shrink-0 text-muted-foreground" />
+          <PackagePlusIcon
+            className={cn('size-3.5 shrink-0', ready ? 'text-primary' : 'text-muted-foreground')}
+          />
         )}
-        <span className="min-w-0 truncate text-[0.8rem] font-medium text-muted-foreground">
-          Filling
+        <span
+          className={cn(
+            'min-w-0 truncate text-[0.8rem] font-medium',
+            ready ? undefined : 'text-muted-foreground',
+          )}
+        >
+          {ready ? 'Clean · not batched' : 'Filling'}
         </span>
-        <Progress
-          className={ROW_TRACK}
-          // Clamped because results land in bursts: several can settle between the count
-          // crossing the threshold and the seal committing, and a value past max draws an
-          // indicator wider than its own track.
-          value={Math.min(clean, target)}
-          max={target}
-          aria-label={`${n(clean)} of ${n(threshold)} clean images toward the next batch`}
-        />
-        {/* "clean" stays in the visible text: this counts a narrower set than every other number
-            in the list, and a bare fraction would read as the same measurement. */}
-        <span className={ROW_COUNT}>
-          {n(clean)}/{n(threshold)} clean
+        {/* The bar is a progress reading toward a seal; once nothing more is coming it measures
+            nothing, and a part-full track beside an export button reads as "not ready yet". */}
+        {!ready && (
+          <Progress
+            className={ROW_TRACK}
+            // Clamped because results land in bursts: several can settle between the count
+            // crossing the threshold and the seal committing, and a value past max draws an
+            // indicator wider than its own track.
+            value={Math.min(clean, target)}
+            max={target}
+            aria-label={`${n(clean)} of ${n(threshold)} clean images toward the next batch`}
+          />
+        )}
+        <span className={cn(ROW_COUNT, ready && 'ml-auto')}>
+          {ready ? n(clean) : `${n(clean)}/${n(threshold)} clean`}
         </span>
       </div>
+      {ready && onExport && (
+        <>
+          <div className="w-px shrink-0 bg-border" aria-hidden />
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            className="h-auto shrink-0 rounded-none px-2.5"
+            onClick={onExport}
+            disabled={exporting}
+            title={`Export these ${n(clean)} clean images as their own batch`}
+          >
+            {exporting ? <Spinner /> : <DownloadIcon />}
+            <span className="sr-only">Export {n(clean)} clean images as a batch</span>
+          </Button>
+        </>
+      )}
     </div>
   );
 }

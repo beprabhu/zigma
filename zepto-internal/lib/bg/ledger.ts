@@ -270,6 +270,24 @@ export function planSeal(
 }
 
 /**
+ * The tail: every clean image still unexported, however few. The threshold is a CEILING on how
+ * big one ZIP gets, never a minimum for shipping — treating it as a gate is what left 2,829
+ * finished images stranded at the end of a 14,105-image run, with the only remaining button
+ * offering to ship them mixed in with 5,264 that still needed an AI fix. That is the exact
+ * separation this whole feature exists to make.
+ *
+ * Deliberately unbounded by the threshold: what is left is by definition less than one full
+ * batch, because a full one would already have sealed.
+ */
+export function planFinalSeal(
+  items: readonly BgItem[],
+  verdictOf: VerdictLookup,
+  options: { alloc: Allocation } & CohortOptions,
+): ExportPlan | null {
+  return planExport(cleanUnexported(items, verdictOf, options), options.alloc);
+}
+
+/**
  * A replacement ZIP for a batch that has gone stale. Keeps the original batch number AND its
  * original offset: the point is to overwrite the files already sitting in the user's folder, so
  * fresh numbers would leave the superseded pictures behind under their old names.

@@ -93,7 +93,8 @@ import {
 import { QueueFilters } from '@/components/bg-remover/queue-filters';
 import { BatchList } from '@/components/bg-remover/batch-list';
 import {
-  DEFAULT_SEAL_SIZE, cleanUnexported, nextAllocation, planExport, planReexport, planSeal,
+  DEFAULT_SEAL_SIZE, cleanUnexported, nextAllocation, planExport, planFinalSeal, planReexport,
+  planSeal,
   recordBatch, remainingUnexported, stampBatch, summarizeLedger,
   type Allocation, type BatchRecord, type ExportPlan,
 } from '@/lib/bg/ledger';
@@ -359,6 +360,7 @@ export default function BgRemover() {
     lastSavedAt: autosavedAt,
     failing: autosaveFailing,
     saveCsv: autosaveCsv,
+    saveLedger: autosaveLedger,
   } = useAutosave(items, {
     // A queue carried across a product switch is not a crash to recover from.
     adopt: adoptedSessionRef.current,
@@ -399,9 +401,29 @@ export default function BgRemover() {
   const handleRestoreAutosave = React.useCallback(() => {
     void restoreAutosave().then((records) => {
       if (!records.length) return; // second click of a double-click — nothing left to restore
+      // Stamps are resolved against the RECORD ids, before the rebuild re-mints them — after
+      // that the question "was this row already exported?" has no answer, and every image of
+      // every shipped batch would go out again in the next ZIP.
+      const shipped = new Map<number, number>();
+      for (const row of records.ledger ?? []) {
+        for (const id of row.ids) shipped.set(id, row.batch);
+      }
+      batchIdsRef.current = new Map();
       setItems((prev) => {
         const base = nextItemId(prev);
-        return [...prev, ...records.map((r, i) => itemFromAutosave(r, base + i))];
+        return [
+          ...prev,
+          ...records.map((r, i) => {
+            const item = itemFromAutosave(r, base + i);
+            const batch = shipped.get(r.id) ?? item.batch;
+            if (batch !== undefined) {
+              const ids = batchIdsRef.current.get(batch) ?? [];
+              ids.push(item.id);
+              batchIdsRef.current.set(batch, ids);
+            }
+            return batch === undefined ? item : { ...item, batch };
+          }),
+        ];
       });
       // Only when this session has no sheet of its own: a recovered queue must never displace
       // the CSV the user is already working against.
@@ -463,6 +485,12 @@ export default function BgRemover() {
   // Files already written cannot be un-written, so numbering may never retreat into names that
   // exist — not when shipped rows are deleted, and not when a restore brings back stamps without
   // their records. Moved when a range is handed out, never when it lands.
+  // Whether the run in progress has sealed a batch, which is what decides if its leftover clean
+  // images are worth a batch of their own when it ends.
+  const sealedThisRunRef = React.useRef(false);
+  const wasRunningRef = React.useRef(false);
+  /** Ids per shipped batch — what the crash net needs to re-stamp a restored queue. */
+  const batchIdsRef = React.useRef(new Map<number, number[]>());
   const allocFloorRef = React.useRef<Allocation>(
     readSession(BG_SESSION)?.allocFloor ?? { batch: 1, offset: 0 },
   );
@@ -891,8 +919,45 @@ export default function BgRemover() {
     });
     if (!plan) return;
     openPlan(plan);
-    toast.info(`Batch ${plan.batch} sealed — ${plan.items.length} clean images ready to download.`);
+    sealedThisRunRef.current = true;
+    toast.info(`Batch ${plan.batch} sealed — ${plan.items.length.toLocaleString()} clean images ready to download.`);
   }, [items, verdictOf, running, sealSize, ledger, openPlans, claimed]);
+
+  /**
+   * The tail of a run. The threshold caps how big a ZIP gets; it was never meant to decide
+   * whether the last images ship at all, and as a gate it stranded every run's remainder — a
+   * 14,105-image run finished with 2,829 clean cutouts that no batch would take, leaving one
+   * button that would have mixed them back in with the 5,264 still awaiting an AI fix.
+   *
+   * Only when this run actually sealed something: a queue smaller than one batch is not batching
+   * at all, and turning a 40-image run into "Batch 1 · 40 files" would be ceremony where a plain
+   * export is the whole story.
+   */
+  React.useEffect(() => {
+    // Edges only. This effect also re-runs on every commit of the queue (verdictOf is rebuilt
+    // with the items), so a plain `if (running) reset` cleared the flag again a tick after each
+    // seal set it, and the run always ended looking as though it had sealed nothing.
+    const was = wasRunningRef.current;
+    wasRunningRef.current = running;
+    if (running) {
+      if (!was) sealedThisRunRef.current = false;
+      return;
+    }
+    if (!was || !sealedThisRunRef.current) return;
+    sealedThisRunRef.current = false;
+    const plan = planFinalSeal(itemsRef.current, verdictOf, {
+      alloc: nextAllocation(itemsRef.current, ledger, openPlans, allocFloorRef.current),
+      claimed,
+    });
+    if (!plan) return;
+    openPlan(plan);
+    toast.info(
+      `Batch ${plan.batch} sealed — the last ${plan.items.length.toLocaleString()} clean images.`,
+    );
+    // openPlans/claimed are read through the allocation above, which is recomputed on every run
+    // edge; listing them would re-fire this the moment it seals its own batch.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [running, verdictOf]);
 
   // Feeds the once-only unmount snapshot with current values instead of first-render ones.
   React.useEffect(() => {
@@ -908,6 +973,24 @@ export default function BgRemover() {
       aiAttempted: [...aiAttemptedRef.current],
     };
   });
+
+  // The seal has to reach disk on its own: stamping a batch changes nothing else about a row, so
+  // the item records are never rewritten by it, and a crash right after a ZIP was written would
+  // bring all of its images back reading as unexported — straight into the next export, a second
+  // time, under different numbers.
+  const ledgerMirrored = React.useRef(false);
+  React.useEffect(() => {
+    if (!ledger.length && !ledgerMirrored.current) return;
+    ledgerMirrored.current = true;
+    autosaveLedger(
+      ledger.map((row) => ({
+        batch: row.batch,
+        ids: batchIdsRef.current.get(row.batch) ?? [],
+        exportedAt: row.savedAt,
+        fileName: row.fileName ?? '',
+      })),
+    );
+  }, [ledger, autosaveLedger]);
 
   // Mirrors the sheet into the crash net alongside the items. The ref is what stops a fresh
   // mount from writing a null: that would delete a crashed session's CSV before its restore
@@ -1717,6 +1800,7 @@ export default function BgRemover() {
       });
       if (!saved) return;
       setItems((prev) => stampBatch(prev, plan));
+      batchIdsRef.current.set(plan.batch, plan.items.map((it) => it.id));
       const record = recordBatch(plan, { fileName: saved });
       setLedger((prev) =>
         opts.reexport
@@ -2132,7 +2216,16 @@ export default function BgRemover() {
         downloadingBatch={exportingBatch}
         downloadDisabled={exporting}
         running={running}
-        filling={running ? { clean: cleanCohort.length, threshold: Math.max(1, sealSize) } : null}
+        // At rest the same row stops being a progress readout and becomes an action: clean work
+        // that no batch took — a run stopped early, or one whose tail predates this behaviour —
+        // would otherwise only be shippable mixed in with the flagged pile.
+        filling={
+          running || cleanCohort.length
+            ? { clean: cleanCohort.length, threshold: Math.max(1, sealSize), idle: !running }
+            : null
+        }
+        onExportClean={() => exportCohort(cleanCohort)}
+        exportingClean={exportingBatch !== null}
         // Shown for context only — the footer's primary button is the one that ships it, so the
         // same action does not appear twice a few pixels apart.
         tail={
