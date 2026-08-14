@@ -64,6 +64,16 @@ const SUBSTANTIAL_REGION_FRACTION = 0.01;
  * beside it already covers the large-companion end.
  */
 const COMPANION_MIN_ANCHOR_FRACTION = 0.005;
+/**
+ * A companion at or above this share of the anchor reads as a composed shot — a second view,
+ * the box beside the product — rather than something the matte failed to drop. Set from the
+ * measured healthy pairs (front/back ~1.0, racquet+box 0.63, bottle+carton 0.84, tube+applicator
+ * 0.45) against the true-prop examples, which all sat well under a quarter of the anchor.
+ */
+const COMPOSED_MIN_ANCHOR_FRACTION = 0.25;
+/** This many canvas-substantial pieces cannot be a composed pair any more — the matte shattered.
+ *  The measured failures held 3-10 pieces; the deliberate compositions never exceeded two. */
+const FRAGMENTED_MIN_PIECES = 3;
 /** Faint out-of-bbox coverage (measureFaintResidue) above this share of the canvas reads as
  *  ghosted overlay graphics or a stray soft shadow. Kept high on purpose: matte edges always
  *  bleed a little, and a flag that fires on every soft-edged cutout teaches people to ignore it. */
@@ -114,24 +124,34 @@ export function assessQuality(item: BgItem): QualityAssessment {
     reasons.push(`${kept.length} disconnected regions kept — likely leftover background speckle`);
   }
 
-  // Two or more meaningfully-sized kept regions = the matte kept something besides the product:
-  // a scene prop (bean bowl beside a drink) or a second item. An accessory set trips this too —
-  // acceptable, the flag means "look", not "reject".
+  // The multi-object check is about FRAGMENTATION, not the count of things in frame. Measured
+  // on a real 1,000-row batch, region count alone flagged 286 images and the bulk of them were
+  // this catalogue's ordinary conventions photographed on purpose: product beside its box, a
+  // front-and-back pair, a tube with its applicator. What separates those from a genuinely
+  // shredded matte (a packet reduced to its logo and a zigzag) is the SHAPE of the pieces:
+  // deliberate compositions are one or two large coherent regions of comparable size, while a
+  // failure is either many substantial pieces or one anchor trailed by mid-sized scraps.
   //
-  // Two views of "meaningfully-sized", because neither denominator catches both misses. Against
-  // the CANVAS, a prop in a tight crop is unmissable but a real accessory in a padded frame is
-  // not. Against the largest kept region, a small companion is unmissable but a genuinely huge
-  // second object can drag the comparison the other way when the two are close in size — that
-  // one the canvas view already has. Either signal firing is enough; the count reported is
-  // whichever view saw more, so the reason never undercounts what the user is about to look at.
+  // So a companion only counts against the image inside the scrap band — big enough to be a
+  // detached piece or a surviving prop (the coconut chunk, the bean bowl), too small to be a
+  // deliberately composed second object. Above the band it reads as composition and passes;
+  // below it, the region pass's own speck bar already ate it.
   const substantial = kept.filter((r) => r.area / canvasArea >= SUBSTANTIAL_REGION_FRACTION);
   const anchor = kept.reduce<RegionReport | null>((max, r) => (!max || r.area > max.area ? r : max), null);
-  const companions = anchor
-    ? kept.filter((r) => r !== anchor && r.area >= anchor.area * COMPANION_MIN_ANCHOR_FRACTION)
+  const scraps = anchor
+    ? kept.filter(
+        (r) =>
+          r !== anchor &&
+          r.area >= anchor.area * COMPANION_MIN_ANCHOR_FRACTION &&
+          r.area < anchor.area * COMPOSED_MIN_ANCHOR_FRACTION,
+      )
     : [];
-  if (substantial.length >= 2 || companions.length > 0) {
-    const objects = Math.max(substantial.length, companions.length + 1);
-    reasons.push(`${objects} separate objects kept — a scene prop or accessory may have survived the cutout`);
+  if (substantial.length >= FRAGMENTED_MIN_PIECES) {
+    reasons.push(`${substantial.length} separate pieces kept — the matte may have shattered the product`);
+  } else if (scraps.length > 0) {
+    reasons.push(
+      `${scraps.length + 1} separate objects kept — a scene prop or detached piece may have survived the cutout`,
+    );
   }
 
   // Analysis-only runs (Product only OFF) mark would-drop regions instead of deleting them.
@@ -148,7 +168,20 @@ export function assessQuality(item: BgItem): QualityAssessment {
     reasons.push('Faint semi-transparent residue outside the subject — ghosted graphics or a leftover shadow');
   }
 
-  if (regions.length > 1 && removedCount / regions.length > HEAVY_REMOVAL_FRACTION) {
+  // Weighted by pixels when the report allows it: counting REGIONS reads seven dust specks
+  // exactly like seven product parts, and a clean cutout that shed its specks was arriving
+  // flagged for aggressive trimming. Reports old enough to lack removed entries (the count was
+  // once all that survived a save) keep the count-based reading rather than silently passing.
+  const removedEntries = regions.filter((r) => r.removed);
+  if (removedEntries.length > 0) {
+    const totalArea = regions.reduce((sum, r) => sum + r.area, 0);
+    const removedArea = removedEntries.reduce((sum, r) => sum + r.area, 0);
+    if (totalArea > 0 && removedArea / totalArea > HEAVY_REMOVAL_FRACTION) {
+      reasons.push(
+        `${Math.round((removedArea / totalArea) * 100)}% of detected pixels removed — check the kept product wasn't over-trimmed`,
+      );
+    }
+  } else if (regions.length > 1 && removedCount / regions.length > HEAVY_REMOVAL_FRACTION) {
     reasons.push(`${removedCount}/${regions.length} regions removed — check the kept product wasn't over-trimmed`);
   }
 
