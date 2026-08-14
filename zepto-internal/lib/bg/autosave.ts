@@ -35,6 +35,7 @@
 import * as React from 'react';
 
 import type { BgItem, CsvOrigin } from './batch';
+import type { RegionReport } from './regions';
 import type { ProjectCsv } from './project';
 import type { SubjectBounds } from './safe-area';
 
@@ -81,6 +82,15 @@ export interface AutosaveRecord {
    * is why the ledger record, and not this field, is what decides what a batch contained.
    */
   batch?: number;
+  /**
+   * The evidence the quality verdict is computed from. Only a live run produces it, so a record
+   * without it comes back re-judged on its bounding box alone — eight of the eleven checks
+   * unable to fire, and a row that was flagged for residue or a surviving prop restored looking
+   * clean. Written beside the cutout it describes, so the two can never disagree.
+   */
+  regions?: RegionReport[];
+  removedRegions?: number;
+  residueFraction?: number;
 }
 
 /** The stored sheet. Same shape a .zesku carries, plus when this copy was written. */
@@ -370,6 +380,14 @@ function recordOf(item: BgItem, savedAt: number): AutosaveRecord | null {
       ? { originalSourceUrl: item.originalSource.url }
       : null),
     ...(typeof item.batch === 'number' ? { batch: item.batch } : null),
+    // Structured-cloned as-is. These ride along with the cutout that produced them, so the
+    // identity diff below already covers them: nothing can change the analysis without also
+    // replacing the blob it was measured from.
+    ...(item.regionReport?.length ? { regions: item.regionReport } : null),
+    ...(item.removedRegions !== undefined ? { removedRegions: item.removedRegions } : null),
+    ...(item.cutout?.residueFraction !== undefined
+      ? { residueFraction: item.cutout.residueFraction }
+      : null),
   };
 }
 

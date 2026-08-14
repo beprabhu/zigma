@@ -106,7 +106,25 @@ export function cleanUnexported(
       !claimed?.has(item.id) &&
       item.status === 'done' &&
       item.cutout !== null &&
+      // A row restored from a file that predates saved quality evidence has no verdict worth
+      // acting on — eight of the eleven checks cannot fire, so "ok" here means "nothing was
+      // measured", not "nothing is wrong". Sealing those into a batch would ship exactly the
+      // images an operator was keeping back. They fall to the remaining cohort instead, where
+      // shipping them is a decision someone makes rather than one the tool makes for them.
+      !item.qualityUnknown &&
       verdictOf(item).level === 'ok',
+  );
+}
+
+/** Rows whose verdict could not be recomputed — surfaced so the shortfall is never silent. */
+export function unverifiedUnexported(
+  items: readonly BgItem[],
+  options: CohortOptions = {},
+): CutoutItem[] {
+  const { claimed } = options;
+  return items.filter(
+    (item): item is CutoutItem =>
+      !isExported(item) && !claimed?.has(item.id) && item.cutout !== null && !!item.qualityUnknown,
   );
 }
 

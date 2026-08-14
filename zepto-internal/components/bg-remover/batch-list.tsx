@@ -85,6 +85,12 @@ export interface FillingBatch {
  * makes the sealed ZIPs plus this one add up to the queue exactly once.
  */
 export interface TailCohort {
+  /**
+   * Rows restored from a file that predates saved quality evidence. They are never sealed as
+   * clean because their verdict cannot be recomputed, so without a number here they would just
+   * look like an unexplained gap between this count and the flagged one.
+   */
+  unverified?: number;
   /** Everything still unexported, including the clean ones counted by FillingBatch above — one
    *  set contains the other, which is why exporting this cohort ends the run cleanly. */
   count: number;
@@ -494,7 +500,7 @@ function TailRow({
   exporting?: boolean;
   exportDisabled?: boolean;
 }) {
-  const { count, flagged = 0 } = entry;
+  const { count, flagged = 0, unverified = 0 } = entry;
   // "Not yet exported" rather than "Remaining", because the number below it is a flagged count
   // and the toolbar has one too — over the WHOLE queue, including images that already shipped.
   // Two flagged numbers that disagree by design need the smaller one to say out loud which set
@@ -520,6 +526,19 @@ function TailRow({
         {flagged > 0 && (
           <span className="shrink-0 text-xs text-amber-500 tabular-nums">
             {n(flagged)} flagged
+          </span>
+        )}
+        {unverified > 0 && (
+          <span
+            className="shrink-0 text-xs text-muted-foreground tabular-nums"
+            title={
+              `${n(unverified)} of these came from a project saved before quality evidence was ` +
+              'stored, so their flags cannot be recomputed. They are held out of the clean ' +
+              'batches rather than shipped as if they had passed — re-run background removal to ' +
+              'judge them properly.'
+            }
+          >
+            {n(unverified)} unverified
           </span>
         )}
         <span className={cn(ROW_COUNT, 'ml-auto')}>{n(count)}</span>

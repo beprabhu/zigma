@@ -182,6 +182,15 @@ export interface BgItem {
   batch?: number;
   /** Set for items imported from a CSV; absent for dropped files and pasted images. */
   csv?: CsvOrigin;
+  /**
+   * True for a row restored from a file written before quality signals were saved. Its verdict
+   * can only be recomputed from the bounding box, so eight of the eleven checks — every one that
+   * reads the region analysis or the residue measurement — silently cannot fire, and the row
+   * comes back looking clean whatever the run that produced it actually found. Reopening one
+   * such project turned 2,716 flagged images into clean ones. Nothing may treat these as
+   * verified: the export cohorts hold them back rather than sealing them into a batch.
+   */
+  qualityUnknown?: boolean;
 }
 
 /** preview px per full-resolution px, for mapping bounds onto a decoded preview. */

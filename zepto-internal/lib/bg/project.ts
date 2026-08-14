@@ -17,6 +17,7 @@
 
 import { buildZipStream, readZipIndex, type ZipStreamEntry } from '../zip';
 import type { BgCutout, BgItem, BgItemSource, CsvOrigin } from './batch';
+import type { RegionReport } from './regions';
 import { ANCHORS, DEFAULT_SAFE_AREA, type SafeAreaConfig, type SubjectBounds } from './safe-area';
 
 export const PROJECT_EXTENSION = '.zesku';
@@ -96,6 +97,17 @@ interface ManifestItem {
   originalSourceUrl?: string;
   /** v2: batch grouping, so a reopened project keeps the grouping it was saved with. */
   batch?: number;
+  /**
+   * The evidence behind the row's quality verdict. Eight of the eleven checks read the region
+   * analysis, the removal count or the residue measurement, and all three are produced only by
+   * an actual inference run — so a project saved without them reopened with those checks unable
+   * to fire, and every row whose only complaint was residue or a surviving prop came back
+   * indistinguishable from a clean one. On a 14,105-image project that silently moved 2,716
+   * images from flagged to clean.
+   */
+  regions?: RegionReport[];
+  removedRegions?: number;
+  residueFraction?: number;
 }
 
 /** Where the CSV text lives and how its columns were mapped; the text itself is a zip entry. */
@@ -109,6 +121,13 @@ interface ManifestCsv {
 interface Manifest {
   format: string;
   version: number;
+  /**
+   * Marks a file whose items carry their quality evidence. Absent on everything written before
+   * that was saved, and the distinction has to be explicit: "this row had no regions" and "this
+   * file never stored any" produce identical item records, and only the second means the verdict
+   * cannot be trusted.
+   */
+  qualitySignals?: true;
   savedAt: string;
   safeArea: SafeAreaConfig;
   outputBg: string;
@@ -124,6 +143,50 @@ export interface ProjectCsv {
   /** Column that names each image; '' means names come from the URL's filename. */
   nameColumn: string;
   imageColumns: string[];
+}
+
+/**
+ * Region measurements, trimmed for the manifest. The ratios come out of the analysis as full
+ * doubles, and 0.8912345678901234 costs four times what 0.891 does across five regions on
+ * fourteen thousand rows — while every threshold that reads them is coarse enough that the
+ * digits being dropped could never change a verdict.
+ */
+/**
+ * Rebuilds region records field by field, like every other manifest read here. A region drives
+ * arithmetic the verdict depends on, and a wrong-typed area or a missing flag would either throw
+ * or — worse — read as "nothing to complain about" and quietly clear a flag.
+ */
+function parseRegions(raw: unknown[]): RegionReport[] {
+  const out: RegionReport[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue;
+    const r = entry as Partial<RegionReport>;
+    const bounds = parseBounds(r.bounds ?? null);
+    if (!bounds) continue;
+    out.push({
+      bounds,
+      area: num(r.area, 0),
+      flatness: num(r.flatness, 0),
+      paletteCoverage: num(r.paletteCoverage, 0),
+      distinctColors: Math.round(num(r.distinctColors, 0)),
+      fillRatio: num(r.fillRatio, 0),
+      touchesEdge: r.touchesEdge === true,
+      dominantBin: Math.round(num(r.dominantBin, -1)),
+      removed: r.removed === true,
+      ...(r.flagged === true ? { flagged: true } : null),
+    });
+  }
+  return out;
+}
+
+function packRegions(regions: RegionReport[]): RegionReport[] {
+  const r3 = (n: number) => Math.round(n * 1000) / 1000;
+  return regions.map((region) => ({
+    ...region,
+    flatness: r3(region.flatness),
+    paletteCoverage: r3(region.paletteCoverage),
+    fillRatio: r3(region.fillRatio),
+  }));
 }
 
 function originOf(source: BgItemSource): string {
@@ -230,6 +293,14 @@ export async function saveProject(
         ? { regenerated: true }
         : null),
       ...(item.tileFit !== undefined ? { tileFit: item.tileFit } : null),
+      // Saved for every item that has them, independent of the cutout's own readability probe:
+      // the verdict has to survive the round trip or a reopened project quietly downgrades its
+      // own flagged rows to clean.
+      ...(item.regionReport?.length ? { regions: packRegions(item.regionReport) } : null),
+      ...(item.removedRegions !== undefined ? { removedRegions: item.removedRegions } : null),
+      ...(saved?.residueFraction !== undefined
+        ? { residueFraction: Math.round(saved.residueFraction * 1e5) / 1e5 }
+        : null),
       ...(item.csv ? { csv: { row: item.csv.row, column: item.csv.column } } : null),
       // Only a URL survives the round trip: an original that was a dropped FILE is already
       // embedded under originals/ when the save includes them, and re-embedding it a second
@@ -266,6 +337,7 @@ export async function saveProject(
   const manifest: Manifest = {
     format: FORMAT,
     version: VERSION,
+    qualitySignals: true,
     savedAt: new Date().toISOString(),
     safeArea,
     outputBg,
@@ -289,10 +361,18 @@ export interface RestoredItem {
   /** Pre-AI-edit provenance, URL only — the caller rebuilds a {kind:'url'} source from it. */
   originalSourceUrl?: string;
   batch?: number;
+  regions?: RegionReport[];
+  removedRegions?: number;
 }
 
 export interface RestoredProject {
   items: RestoredItem[];
+  /**
+   * False for a file written before quality evidence was saved. Its rows can only be re-judged
+   * on their bounding box, so the caller must not present them as verified — see
+   * BgItem.qualityUnknown.
+   */
+  qualitySignals: boolean;
   safeArea: SafeAreaConfig;
   outputBg: string;
   savedAt: string;
@@ -375,7 +455,14 @@ export async function loadProject(file: File): Promise<RestoredProject> {
         if (width <= 0 || height <= 0) {
           throw new Error(`${file.name}: ${path || 'an entry'} has no recorded dimensions`);
         }
-        cutout = { blob, bounds: parseBounds(rec.bounds), width, height };
+        const residue = num(rec.residueFraction, NaN);
+        cutout = {
+          blob,
+          bounds: parseBounds(rec.bounds),
+          width,
+          height,
+          ...(Number.isFinite(residue) && residue >= 0 ? { residueFraction: residue } : null),
+        };
       }
 
       // Source, richest first: embedded original file → URL → archived label (v1, or a file
@@ -416,13 +503,15 @@ export async function loadProject(file: File): Promise<RestoredProject> {
         cutout,
         ...(typeof rec.tileFit === 'boolean' ? { tileFit: rec.tileFit } : null),
         ...(csvOrigin ? { csv: csvOrigin } : null),
-        // Same http(s) test the live source gets: a stored "undefined" or a file path would
-        // otherwise reach the AI-edit and view-original paths as if it were fetchable.
         ...(typeof rec.originalSourceUrl === 'string' && /^https?:\/\//i.test(rec.originalSourceUrl)
           ? { originalSourceUrl: rec.originalSourceUrl }
           : null),
-        ...(typeof rec.batch === 'number' && Number.isFinite(rec.batch)
-          ? { batch: Math.round(rec.batch) }
+        ...(Number.isFinite(num(rec.batch, NaN)) ? { batch: Math.round(num(rec.batch, 0)) } : null),
+        // Trusted only as far as the shapes check out: a hand-edited manifest must not put a
+        // wrong-typed region through arithmetic that reads NaN as "no complaint".
+        ...(Array.isArray(rec.regions) ? { regions: parseRegions(rec.regions) } : null),
+        ...(Number.isFinite(num(rec.removedRegions, NaN))
+          ? { removedRegions: Math.round(num(rec.removedRegions, 0)) }
           : null),
       });
     }
@@ -498,6 +587,7 @@ export async function loadProject(file: File): Promise<RestoredProject> {
 
   return {
     items,
+    qualitySignals: manifest.qualitySignals === true,
     safeArea,
     outputBg:
       typeof manifest.outputBg === 'string' && manifest.outputBg ? manifest.outputBg : 'transparent',

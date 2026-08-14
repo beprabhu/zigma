@@ -95,7 +95,7 @@ import { BatchList } from '@/components/bg-remover/batch-list';
 import {
   DEFAULT_SEAL_SIZE, cleanUnexported, nextAllocation, planExport, planFinalSeal, planReexport,
   planSeal,
-  recordBatch, remainingUnexported, stampBatch, summarizeLedger,
+  recordBatch, remainingUnexported, stampBatch, summarizeLedger, unverifiedUnexported,
   type Allocation, type BatchRecord, type ExportPlan,
 } from '@/lib/bg/ledger';
 import { readParallel } from '@/lib/rate';
@@ -254,7 +254,15 @@ function itemFromAutosave(record: AutosaveRecord, id: number): BgItem {
     source,
     original: null,
     cutout: record.cutout
-      ? { blob: record.cutout, bounds: record.bounds, width: record.width, height: record.height }
+      ? {
+          blob: record.cutout,
+          bounds: record.bounds,
+          width: record.width,
+          height: record.height,
+          ...(record.residueFraction !== undefined
+            ? { residueFraction: record.residueFraction }
+            : null),
+        }
       : null,
     // A record without a cutout is an AI-regenerated source that crashed before re-removal —
     // it comes back queued, one "Remove backgrounds" away from where it left off.
@@ -267,6 +275,10 @@ function itemFromAutosave(record: AutosaveRecord, id: number): BgItem {
       ? { originalSource: { kind: 'url' as const, url: record.originalSourceUrl } }
       : null),
     ...(record.batch !== undefined ? { batch: record.batch } : null),
+    // Without these the verdict is recomputed from the bounding box alone and a row that was
+    // flagged for residue or a surviving prop comes back looking clean.
+    ...(record.regions?.length ? { regionReport: record.regions } : null),
+    ...(record.removedRegions !== undefined ? { removedRegions: record.removedRegions } : null),
   };
 }
 
@@ -507,6 +519,10 @@ export default function BgRemover() {
     [items, verdictOf, claimed],
   );
   const restCohort = React.useMemo(() => remainingUnexported(items, { claimed }), [items, claimed]);
+  const unverifiedCohort = React.useMemo(
+    () => unverifiedUnexported(items, { claimed }),
+    [items, claimed],
+  );
   const ledgerSummary = React.useMemo(
     () => summarizeLedger(items, ledger, { claimed }),
     [items, ledger, claimed],
@@ -1116,6 +1132,11 @@ export default function BgRemover() {
                 ? { originalSource: { kind: 'url' as const, url: r.originalSourceUrl } }
                 : null),
               ...(r.batch !== undefined ? { batch: r.batch } : null),
+              ...(r.regions?.length ? { regionReport: r.regions } : null),
+              ...(r.removedRegions !== undefined ? { removedRegions: r.removedRegions } : null),
+              // A file written before the evidence was saved cannot be re-judged on anything but
+              // its bounding box, so its rows are marked rather than quietly presented as clean.
+              ...(restored.qualitySignals || !r.cutout ? null : { qualityUnknown: true }),
             }),
           ),
         ];
@@ -2230,7 +2251,13 @@ export default function BgRemover() {
         // same action does not appear twice a few pixels apart.
         tail={
           restCohort.length
-            ? { count: restCohort.length, flagged: restCohort.length - cleanCohort.length }
+            ? {
+                count: restCohort.length,
+                // The flagged share is what is left once the clean and the unjudgeable are
+                // accounted for; deriving it keeps the three numbers adding up to the count.
+                flagged: restCohort.length - cleanCohort.length - unverifiedCohort.length,
+                unverified: unverifiedCohort.length,
+              }
             : null
         }
       />
