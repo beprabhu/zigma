@@ -744,6 +744,46 @@ export function analyzeRegions(
  * icons, watermarks) or a stray soft shadow. Pixels in this band are invisible to both the
  * bbox scan and the region classifier (both gate on alpha > high), so nothing else can see them.
  */
+/** The original's content footprint, measured before the matte touches anything. */
+export interface InkFootprint {
+  /** Bounding box of non-background pixels, as a fraction of the canvas. */
+  bbox: number;
+  /** Non-background pixel count, as a fraction of the canvas. */
+  ink: number;
+}
+
+/**
+ * Measures what the ORIGINAL covers, so quality triage can ask the one question no cutout-side
+ * check can answer: is most of the picture simply gone? A set of six transparent glasses came
+ * back as one glass — the other five left no regions, no residue, nothing to inspect, because
+ * absent objects leave no evidence. The only side that still remembers them is the original.
+ *
+ * Background is near-white or transparent. Catalogue shots are white-field as a rule, and the
+ * check that consumes this is thresholded so a genuinely full-bleed original (ink ~1.0) cannot
+ * fire it against a legitimately small product.
+ */
+export function measureInkFootprint(pixels: ImageData): InkFootprint {
+  const { width: w, height: h, data } = pixels;
+  const n = w * h;
+  if (!n) return { bbox: 0, ink: 0 };
+  let minX = w, minY = h, maxX = -1, maxY = -1, ink = 0;
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      const i = (row + x) * 4;
+      if (data[i + 3] < 32) continue; // transparent = background
+      if (data[i] > 240 && data[i + 1] > 240 && data[i + 2] > 240) continue; // near-white
+      ink++;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
+  if (maxX < 0) return { bbox: 0, ink: 0 };
+  return { bbox: ((maxX - minX + 1) * (maxY - minY + 1)) / n, ink: ink / n };
+}
+
 export function measureFaintResidue(
   pixels: ImageData,
   bounds: SubjectBounds | null,

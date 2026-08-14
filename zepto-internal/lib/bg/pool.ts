@@ -18,7 +18,7 @@ import {
 } from './engine';
 import type { RefineMode } from './refine';
 import type { SubjectBounds } from './safe-area';
-import type { RegionReport } from './regions';
+import type { InkFootprint, RegionReport } from './regions';
 import type { DetectedBand } from './bands';
 import type { WorkerRequest, WorkerResponse } from './bg.worker';
 import { MAX_EDGE } from './constants';
@@ -38,6 +38,8 @@ export interface PoolCutout {
   regionReport: RegionReport[];
   /** Share of canvas covered by faint sub-threshold pixels outside the subject bbox. */
   residueFraction: number;
+  /** The original's content footprint, from before the matte — see regions.measureInkFootprint. */
+  originalInk: InkFootprint;
   /** Flat edge strips masked from the source. */
   bands: DetectedBand[];
   width: number;
@@ -165,6 +167,7 @@ function handleMessage(slot: Slot, msg: WorkerResponse) {
         removedRegions: msg.removedRegions,
         regionReport: msg.regionReport,
         residueFraction: msg.residueFraction,
+        originalInk: msg.originalInk,
         bands: msg.bands,
         width: msg.width,
         height: msg.height,

@@ -282,6 +282,7 @@ function itemFromAutosave(record: AutosaveRecord, id: number): BgItem {
     // flagged for residue or a surviving prop comes back looking clean.
     ...(record.regions?.length ? { regionReport: record.regions } : null),
     ...(record.removedRegions !== undefined ? { removedRegions: record.removedRegions } : null),
+    ...(record.originalInk ? { originalInk: record.originalInk } : null),
   };
 }
 
@@ -1166,6 +1167,7 @@ export default function BgRemover() {
               ...(r.batch !== undefined ? { batch: r.batch } : null),
               ...(r.regions?.length ? { regionReport: r.regions } : null),
               ...(r.removedRegions !== undefined ? { removedRegions: r.removedRegions } : null),
+              ...(r.originalInk ? { originalInk: r.originalInk } : null),
               // A file written before the evidence was saved cannot be re-judged on anything but
               // its bounding box, so its rows are marked rather than quietly presented as clean.
               ...(restored.qualitySignals || !r.cutout ? null : { qualityUnknown: true }),
@@ -1220,6 +1222,7 @@ export default function BgRemover() {
       backend: result.backend,
       model: result.model,
       removedRegions: result.removedRegions,
+      originalInk: result.originalInk,
       // The main-thread engine does not run band detection; the pooled worker path does.
       bands: [],
       regionReport: result.regionReport,
@@ -1312,6 +1315,7 @@ export default function BgRemover() {
         durationMs: produced.durationMs,
         removedRegions: produced.removedRegions,
         regionReport: produced.regionReport,
+        originalInk: produced.originalInk,
         error: undefined,
       },
       (live) => ({ status: live.cutout ? 'done' : 'ready', original: null }),

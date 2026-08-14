@@ -11,7 +11,10 @@ import type { PreTrainedModel, Processor, RawImage, Tensor } from '@huggingface/
 import { BG_MODELS, type BgBackend, type BgModelId } from './engine';
 import { refineAlpha, type RefineMode } from './refine';
 import { detectBands, maskBands, type DetectedBand } from './bands';
-import { analyzeRegions, keepProductRegions, measureFaintResidue, type RegionReport } from './regions';
+import {
+  analyzeRegions, keepProductRegions, measureFaintResidue, measureInkFootprint,
+  type InkFootprint, type RegionReport,
+} from './regions';
 import { subjectBounds, type SubjectBounds } from './safe-area';
 import { MAX_EDGE, STORE_TYPE } from './constants';
 
@@ -54,6 +57,9 @@ export type WorkerResponse =
       regionReport: RegionReport[];
       /** Share of canvas covered by faint (sub-threshold) pixels outside the subject bbox. */
       residueFraction: number;
+      /** What the ORIGINAL covered, measured before the matte was applied — the only side that
+       *  still remembers objects the model deleted outright. */
+      originalInk: InkFootprint;
       /** Flat edge strips masked from the source before region analysis. */
       bands: DetectedBand[];
       width: number;
@@ -228,6 +234,10 @@ async function remove(req: WorkerRemoveRequest): Promise<void> {
   }
 
   const pixels = source2d.getImageData(0, 0, width, height);
+  // This is the one moment the buffer still holds the untouched original: the very next loop
+  // overwrites its alpha with the matte, after which "what did the original cover?" has no
+  // answer anywhere in the pipeline.
+  const originalInk = measureInkFootprint(pixels);
   for (let i = 0; i < mask.data.length; i++) {
     pixels.data[4 * i + 3] = mask.data[i];
   }
@@ -292,6 +302,7 @@ async function remove(req: WorkerRemoveRequest): Promise<void> {
     removedRegions,
     regionReport,
     residueFraction,
+    originalInk,
     bands,
     width,
     height,

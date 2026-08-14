@@ -9,7 +9,9 @@
 import type { PreTrainedModel, Processor, RawImage, Tensor } from '@huggingface/transformers';
 
 import { refineAlpha, type RefineMode } from './refine';
-import { analyzeRegions, keepProductRegions, type RegionReport } from './regions';
+import {
+  analyzeRegions, keepProductRegions, measureInkFootprint, type InkFootprint, type RegionReport,
+} from './regions';
 
 export type BgModelId = 'rmbg2' | 'rmbg' | 'birefnet' | 'ben2' | 'modnet';
 
@@ -154,6 +156,8 @@ export interface RemoveResult {
   removedRegions: number;
   /** Per-region measurements behind that decision. */
   regionReport: RegionReport[];
+  /** The original's content footprint, from before the matte — see regions.measureInkFootprint. */
+  originalInk: InkFootprint;
 }
 
 export type BgSource = Blob | HTMLImageElement | HTMLCanvasElement | ImageBitmap;
@@ -343,6 +347,11 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
 
   // ---- Server model: post the encoded image, get a finished RGBA PNG back. ----
   if (spec.server) {
+    // Measured from the SOURCE: the server hands back an already-matted RGBA, and by then the
+    // question "what did the original cover?" is unanswerable from anything it returns.
+    const originalInk = measureInkFootprint(
+      sourceCanvas.getContext('2d')!.getImageData(0, 0, width, height),
+    );
     const blob = await canvasToBlob(sourceCanvas);
     const res = await fetch('/api/remove-hq', { method: 'POST', body: blob, signal });
     if (!res.ok) {
@@ -374,6 +383,7 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
       backend,
       removedRegions,
       regionReport,
+      originalInk,
     };
   }
 
@@ -456,6 +466,9 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
   const ctx = canvas.getContext('2d')!;
   ctx.drawImage(sourceCanvas, 0, 0);
   const pixels = ctx.getImageData(0, 0, width, height);
+  // The one moment this buffer still holds the untouched original — the next loop replaces its
+  // alpha with the matte, and nothing downstream remembers what the picture used to cover.
+  const originalInk = measureInkFootprint(pixels);
   for (let i = 0; i < mask.data.length; i++) {
     pixels.data[4 * i + 3] = mask.data[i];
   }
@@ -476,6 +489,7 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
   return {
     canvas,
     pixels,
+    originalInk,
     width,
     height,
     durationMs: performance.now() - started,
