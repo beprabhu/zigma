@@ -48,7 +48,7 @@ import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { ResultCell } from '@/components/result-cell';
 import { BUDGET_KB_MIN, BudgetControls } from '@/components/budget-controls';
 import { ClearAllButton, SelectionBar, useGridSelection } from '@/components/selection';
-import { Canvas, LeftPanel, PanelSection, RightPanel, StudioShell } from '@/components/pane-layout';
+import { Canvas, CanvasToolbar, LeftPanel, PanelSection, RightPanel, StudioShell } from '@/components/pane-layout';
 import { useProcessing } from '@/components/process-panel';
 import {
   CompareDialog, CutoutImage, SourceImage, backdropStyle, statusLine,
@@ -69,13 +69,13 @@ import {
   type SafeAreaConfig,
 } from '@/lib/bg/safe-area';
 import {
-  SETUP_HINT, canRetry, canvasToPngBlob, canvasToPngBytes, createItems, csvCellKey, csvSourceUrl, describeDownload, draftsFromCsv, errorMessage,
+  SETUP_HINT, canRetry, canvasToPngBlob, canvasToPngBytes, createItems, csvCellKey, csvSourceUrl, cutoutEvidence, describeDownload, draftsFromCsv, errorMessage,
   exportFileNames, flattenOnBackground, formatKb, isAbortError,
   decodeCutout, loadImageFromFile, looksLikeMissingWeights, mapWithLimit, needsCutout,
   nextItemId, pickSave, previewScale, releaseCanvas, releaseItem, releaseOriginal, sameCsvOrigin, saveTo, withCutout,
   type CutoutItem,
   type SaveDestination,
-  type BgItem, type BgItemDraft, type BgItemSource, type BgItemStatus,
+  type BgCutout, type BgItem, type BgItemDraft, type BgItemSource, type BgItemStatus,
 } from '@/lib/bg/batch';
 import { useAutosave, type AutosaveRecord } from '@/lib/bg/autosave';
 import { measureFaintResidue } from '@/lib/bg/regions';
@@ -87,11 +87,15 @@ import {
 } from '@/lib/bg/pool';
 import { PROJECT_EXTENSION, loadProject, saveProject, type ProjectCsv } from '@/lib/bg/project';
 import {
-  assessQuality, assessQueue, countQueueFilters, filterQueue, isAiGenerated, sortByQualityWith,
-  verdictLookup,
+  assessQuality, assessQueue, countQueueFilters, filterQueue, isAiGenerated, needsVerify,
+  sortByQualityWith, verdictLookup,
   type QueueFilter, type QueueSort,
 } from '@/lib/bg/quality';
+import { VERIFY_MODEL_ID, compareCutouts, filteredRects } from '@/lib/bg/verify';
 import { QueueFilters } from '@/components/bg-remover/queue-filters';
+import { ColumnPicker } from '@/components/column-picker';
+import { parseCSV } from '@/lib/csv';
+import { buildRowPrompt } from '@/lib/row-prompt';
 import { BatchList } from '@/components/bg-remover/batch-list';
 import {
   DEFAULT_SEAL_SIZE, cleanUnexported, nextAllocation, planExport, planFinalSeal, planReexport,
@@ -148,6 +152,13 @@ interface RunOverrides {
 
 // Parallel Azure requests during "AI-fix flagged": suite-wide, from Settings → Image model
 // (lib/rate.ts) — this was a local constant (6) before the knob moved there.
+
+/**
+ * Separates the AI-edit prompt from the CSV row's cells. Worded for the edits endpoint, which
+ * is looking at the product rather than inventing it: the row describes what the picture
+ * already shows ("this is a 500 g butter pack"), it does not order up a new one.
+ */
+const AI_ROW_HEADING = 'Details of the product in this image:';
 
 /** Padding around the hero region's bbox when focus-cropping the AI-edit reference. */
 const HERO_CROP_PAD = 0.08;
@@ -235,6 +246,11 @@ interface CsvInfo {
   headers: string[];
   imageColumns: string[];
   nameColumn: string;
+  /**
+   * Columns whose cells ride along with the AI-edit prompt; empty = the prompt goes alone.
+   * Optional: a session snapshot written before this field existed revives without it.
+   */
+  promptColumns?: string[];
   /** Optional: a session revived from before this field existed simply shows no row badge. */
   rowCount?: number;
 }
@@ -283,6 +299,9 @@ function itemFromAutosave(record: AutosaveRecord, id: number): BgItem {
     ...(record.regions?.length ? { regionReport: record.regions } : null),
     ...(record.removedRegions !== undefined ? { removedRegions: record.removedRegions } : null),
     ...(record.originalInk ? { originalInk: record.originalInk } : null),
+    ...(record.components?.length ? { originalComponents: record.components } : null),
+    ...(record.verify ? { verify: record.verify } : null),
+    ...(record.bands?.length ? { bands: record.bands } : null),
   };
 }
 
@@ -308,6 +327,10 @@ export default function BgRemover() {
   // Continuously sends newly flagged cutouts through the AI edit, no button press per wave.
   // Off by default: every send spends Azure money, so the standing order has to be explicit.
   const [autoAiFix, setAutoAiFix] = usePersistedState('skuc_bgAutoAiFix', false);
+  // Second-model cross-check on ambiguous cutouts after each batch (quality.needsVerify).
+  // On by default: the ambiguous band is small by construction, so the cost is a handful of
+  // BiRefNet inferences per batch — and the failures it catches are the invisible ones.
+  const [verifyPass, setVerifyPass] = usePersistedState('skuc_bgVerifyPass', true);
   const [outputBg, setOutputBg] = usePersistedState('skuc_bgOutput', TRANSPARENT);
   // Save-project scope: embedding dropped files makes a .zesku self-contained (v2); off keeps
   // only cutouts + URLs for huge batches.
@@ -398,6 +421,7 @@ export default function BgRemover() {
       headers,
       imageColumns: sheet.imageColumns,
       nameColumn: sheet.nameColumn,
+      promptColumns: sheet.promptColumns ?? [],
       rowCount,
     };
   }, []);
@@ -564,6 +588,9 @@ export default function BgRemover() {
   const [warming, setWarming] = React.useState(false);
   /** True while "AI-fix flagged" is mid-flight through Azure (before the re-removal batch). */
   const [aiFixing, setAiFixing] = React.useState(false);
+  // Mirrors verifyingRef for rendering. The sweep drives the progress bar and holds the pool,
+  // so it is a visible working phase and must be stoppable — the Stop button renders on this.
+  const [verifying, setVerifying] = React.useState(false);
   /** The removal run's line. Owned by runBatchInner alone — see exportProgress. */
   const [progress, setProgress] = React.useState<{ pct: number; text: string } | null>(null);
   /** The Azure phase's own progress line — it may run concurrently with a removal batch. */
@@ -602,6 +629,14 @@ export default function BgRemover() {
   // They need re-removal, which wants the same GPU workers the batch is saturating — so they
   // wait here and the batch drains them before it releases the lock.
   const deferredReRemovalRef = React.useRef<BgItem[]>([]);
+  // The post-batch verify sweep: its own abort (Cancel stops it; a starting batch pre-empts
+  // it) and its own lock — it must never overlap itself, and it yields the workers to any
+  // batch immediately.
+  const verifyAbortRef = React.useRef<AbortController | null>(null);
+  const verifyingRef = React.useRef(false);
+  // A sweep that was owed while another was still unwinding. Without it, a batch short enough
+  // to finish before the pre-empted sweep unwinds leaves the queue with no sweep at all.
+  const verifyPendingRef = React.useRef(false);
   // Every id that has been through an AI edit once, manual or auto. The auto-fix watcher never
   // resends one: an image that comes back still flagged after its regeneration would otherwise
   // cycle through Azure forever, spending money on an image the model cannot fix.
@@ -633,6 +668,11 @@ export default function BgRemover() {
       // The AI phase can outlive the page too — without this, in-flight Azure requests keep
       // running (and spending) after navigation, then respawn the disposed worker pool.
       aiAbortRef.current?.abort();
+      // Same for the verify sweep, and for the same reason: between items it is awaiting a
+      // decode rather than the pool, so disposePool's orphan rejection never reaches it — it
+      // would walk on after navigation and call ensurePool(), respawning the very workers
+      // being torn down two lines below and reloading BiRefNet into them.
+      verifyAbortRef.current?.abort();
       // Snapshot BEFORE the teardown below, then hand back every decoded original: releaseItem
       // revokes those blob: URLs and clearPreviews closes the cached bitmaps, so a snapshot that
       // kept them would revive a queue of broken images. `original` re-decodes from `source` on
@@ -677,6 +717,9 @@ export default function BgRemover() {
   const spec = BG_MODELS[modelId];
   // The sidecar model has no worker path, and neither does a browser without OffscreenCanvas.
   const usePool = isPoolSupported() && !spec.server;
+  // The verify sweep always infers with the checker model, so its poolability is the
+  // checker's question, never the selected batch model's.
+  const verifyViaPool = isPoolSupported() && !BG_MODELS[VERIFY_MODEL_ID].server;
   const modelReady = isModelLoaded(modelId) || loadedModels.includes(modelId);
   // Resolved fresh each render: any load completing bumps loadedModels, which re-renders.
   // Batches run in the pool, so its workers are the ones that know the real backend; the
@@ -800,6 +843,21 @@ export default function BgRemover() {
     [],
   );
 
+  // The same atomicity for a measurement that describes ONE cutout. A verdict is only true of
+  // the blob it was computed from, and the source check above cannot stand in for that: undo
+  // of a redo restores the very same source object, so a stale write passes the source test
+  // while the cutout underneath it has been swapped.
+  const patchItemIfCutout = React.useCallback(
+    (id: number, cutout: BgCutout, patch: Partial<BgItem>) => {
+      setItems((prev) =>
+        prev.map((item) =>
+          item.id === id && item.cutout === cutout ? { ...item, ...patch } : item,
+        ),
+      );
+    },
+    [],
+  );
+
   const handleAdd = React.useCallback((drafts: BgItemDraft[]) => {
     setItems((prev) => [...prev, ...createItems(drafts, nextItemId(prev))]);
   }, []);
@@ -811,6 +869,44 @@ export default function BgRemover() {
   const [csvInfo, setCsvInfo] = React.useState<CsvInfo | null>(
     () => readSession(BG_SESSION)?.csvInfo ?? null,
   );
+
+  // ---- Row context for the AI edit ----
+  // Items carry only the cell they were imported from ({row, column}); the fields that cell sat
+  // next to live in the sheet's text. Re-parsing it here is what turns a queued picture back
+  // into the row that describes it. Keyed on the text alone, so a column remap — which rebuilds
+  // csvInfo — does not re-parse, and a replaced sheet can never be read against stale rows.
+  const csvText = csvInfo?.text ?? null;
+  const csvRecords = React.useMemo(() => (csvText ? parseCSV(csvText).records : []), [csvText]);
+  const promptColumns = React.useMemo(() => csvInfo?.promptColumns ?? [], [csvInfo]);
+
+  /**
+   * What one image is actually sent with: the AI-edit prompt, plus the picked cells of the CSV
+   * row it came from. Assembled by the same rule Generate uses (lib/row-prompt.ts), so a column
+   * reads the same way in both products.
+   *
+   * Pictures added as files or pastes have no row, and a row that has been through an AI edit
+   * still has one — the cell stays on the item when its source is swapped — so a second edit
+   * quotes the same fields the first one did.
+   */
+  const rowPromptFor = React.useCallback(
+    (item: BgItem, base: string): string => {
+      if (!promptColumns.length || !item.csv) return base;
+      const record = csvRecords[item.csv.row];
+      if (!record) return base;
+      return buildRowPrompt(base, promptColumns, record, undefined, AI_ROW_HEADING);
+    },
+    [csvRecords, promptColumns],
+  );
+
+  /** Just the appended block, for the dialog's preview — '' when nothing would be appended. */
+  const rowContextFor = React.useCallback(
+    (item: BgItem): string => {
+      const withRow = rowPromptFor(item, '');
+      return withRow.startsWith('---\n') ? withRow.slice(4) : '';
+    },
+    [rowPromptFor],
+  );
+
   /**
    * A name-column change is a pure rename, so it must never go through replaceCsvItems: that
    * path keys membership off the source kind, and an AI edit has already swapped the source to
@@ -1027,6 +1123,7 @@ export default function BgRemover() {
             text: csvInfo.text,
             nameColumn: csvInfo.nameColumn,
             imageColumns: csvInfo.imageColumns,
+            promptColumns: csvInfo.promptColumns,
           }
         : null,
     );
@@ -1041,6 +1138,10 @@ export default function BgRemover() {
         headers: imported.headers,
         imageColumns: imported.imageColumns,
         nameColumn: imported.titleColumn,
+        // Opt-in, and empty on purpose: the AI-edit prompt ships tuned for packshots, and
+        // quietly appending a sheet's worth of SKU codes and links to it would change what
+        // every existing user's flagged-image fix sends the moment they drop a CSV.
+        promptColumns: [],
         rowCount: imported.rowCount,
       });
       replaceCsvItems(imported.drafts);
@@ -1078,12 +1179,23 @@ export default function BgRemover() {
     [handleCsv],
   );
 
-  function updateCsvMapping(next: { nameColumn?: string; imageColumns?: string[] }) {
+  function updateCsvMapping(next: {
+    nameColumn?: string;
+    imageColumns?: string[];
+    promptColumns?: string[];
+  }) {
     if (!csvInfo) return;
     const nameColumn = next.nameColumn ?? csvInfo.nameColumn;
     const imageColumns = next.imageColumns ?? csvInfo.imageColumns;
+    const promptColumns = next.promptColumns ?? csvInfo.promptColumns;
+    // Prompt columns change nothing about WHICH rows are queued or what they are called, so
+    // they take the cheap path out: no re-parse, no rename, no replace.
+    if (next.nameColumn === undefined && next.imageColumns === undefined) {
+      setCsvInfo({ ...csvInfo, promptColumns });
+      return;
+    }
     const imported = draftsFromCsv(csvInfo.text, { nameColumn: nameColumn || null, imageColumns });
-    setCsvInfo({ ...csvInfo, nameColumn, imageColumns });
+    setCsvInfo({ ...csvInfo, nameColumn, imageColumns, promptColumns });
     // Only an image-column change alters WHICH rows are queued; renaming must not go near the
     // replace path, which would reorder the queue and duplicate every AI-edited row.
     if (next.imageColumns === undefined) renameCsvItems(imported.drafts);
@@ -1113,6 +1225,7 @@ export default function BgRemover() {
               text: csvInfo.text,
               nameColumn: csvInfo.nameColumn,
               imageColumns: csvInfo.imageColumns,
+              promptColumns: csvInfo.promptColumns,
             }
           : undefined,
         onSkip: (skipped) => {
@@ -1168,6 +1281,8 @@ export default function BgRemover() {
               ...(r.regions?.length ? { regionReport: r.regions } : null),
               ...(r.removedRegions !== undefined ? { removedRegions: r.removedRegions } : null),
               ...(r.originalInk ? { originalInk: r.originalInk } : null),
+              ...(r.components?.length ? { originalComponents: r.components } : null),
+              ...(r.verify ? { verify: r.verify } : null),
               // A file written before the evidence was saved cannot be re-judged on anything but
               // its bounding box, so its rows are marked rather than quietly presented as clean.
               ...(restored.qualitySignals || !r.cutout ? null : { qualityUnknown: true }),
@@ -1223,6 +1338,7 @@ export default function BgRemover() {
       model: result.model,
       removedRegions: result.removedRegions,
       originalInk: result.originalInk,
+      originalComponents: result.originalComponents,
       // The main-thread engine does not run band detection; the pooled worker path does.
       bands: [],
       regionReport: result.regionReport,
@@ -1316,6 +1432,16 @@ export default function BgRemover() {
         removedRegions: produced.removedRegions,
         regionReport: produced.regionReport,
         originalInk: produced.originalInk,
+        originalComponents: produced.originalComponents,
+        bands: produced.bands,
+        // A fresh matte invalidates any earlier cross-check — the verdict described a cutout
+        // that no longer exists. Cleared here, re-earned by the next verify sweep if the new
+        // evidence is still ambiguous.
+        verify: undefined,
+        // This row's evidence is no longer missing: the patch above writes the complete set
+        // from a live run. Leaving the mark set would keep the row permanently out of the
+        // verify band and out of the clean cohorts, for a file it no longer resembles.
+        qualityUnknown: undefined,
         error: undefined,
       },
       (live) => ({ status: live.cutout ? 'done' : 'ready', original: null }),
@@ -1406,6 +1532,10 @@ export default function BgRemover() {
     // The ref, not `busy`: the AI-edit flow calls this after an await, when its closure's
     // `busy` no longer reflects whether a batch is running.
     if (runningRef.current || exporting || warming || !targets.length) return;
+    // A batch owns the workers; a verify sweep in flight yields immediately. Whatever it had
+    // not yet checked stays unverified (verify absent), so the sweep after THIS batch picks
+    // those same items up again — nothing is silently dropped.
+    verifyAbortRef.current?.abort();
     const ctrl = new AbortController();
     abortRef.current = ctrl;
     runningRef.current = true;
@@ -1451,6 +1581,136 @@ export default function BgRemover() {
       runningRef.current = false;
       setRunning(false);
       abortRef.current = null;
+    }
+    // After the lock releases, never inside it: the sweep wants the same workers the batch
+    // was saturating, and a cancelled run should not spend more inference on a queue the
+    // user just stopped.
+    if (!ctrl.signal.aborted) void runVerifySweep();
+  }
+
+  /**
+   * Second-model cross-check over the ambiguous band (quality.needsVerify): re-runs each
+   * item's ORIGINAL through BiRefNet and compares mattes. Disagreement flags the item (and
+   * with Auto AI-fix on, routes it to Azure like any other flag); agreement quietly retires
+   * the ambiguity. One item at a time on purpose — sequential submission keeps the second
+   * model resident in a single pool worker instead of doubling weights across both.
+   */
+  async function runVerifySweep() {
+    if (!verifyPass || runningRef.current) return;
+    if (verifyingRef.current) {
+      // A previous sweep is still unwinding (its decode takes no signal, so an abort only
+      // lands at the next pool call). Remember that a sweep is owed, or this one vanishes.
+      verifyPendingRef.current = true;
+      return;
+    }
+    // The lock is taken BEFORE the yield below so a second post-batch call cannot interleave
+    // through the await; every exit from here on goes through the finally.
+    verifyingRef.current = true;
+    setVerifying(true);
+    const ctrl = new AbortController();
+    verifyAbortRef.current = ctrl;
+    let checked = 0;
+    let disagreements = 0;
+    try {
+      // itemsRef lags the commit by one flush (see its declaration) and this runs
+      // synchronously after the batch lock releases — the LAST item's evidence has not
+      // reached the ref yet, so reading it now silently drops that item from the sweep. One
+      // macrotask puts the read after React's commit and the ref-sync effect. (Found live: a
+      // fixture measured survival 0.71 — squarely in the verify band — and the sweep never
+      // saw it.)
+      await new Promise((r) => setTimeout(r, 0));
+      if (runningRef.current) return;
+      // Already-flagged items are excluded HERE, not in needsVerify: a flag routes to AI-fix
+      // regardless of what a second model thinks, so the inference buys no routing change —
+      // but needsVerify itself stays a pure ambiguity test so other callers can compose it.
+      const targets = itemsRef.current.filter(
+        (item) =>
+          needsVerify(item) && canRetry(item) && assessQuality(item).level === 'ok',
+      );
+      if (!targets.length) return;
+      for (const item of targets) {
+        // A batch starting mid-sweep aborts ctrl; re-check both anyway — abort() and the
+        // runningRef flip are separate writes and this loop must lose every race.
+        if (ctrl.signal.aborted || runningRef.current) break;
+        setProgress({
+          pct: (checked / targets.length) * 100,
+          text: `Verifying ${checked + 1} of ${targets.length} uncertain cutout${targets.length === 1 ? '' : 's'} (${BG_MODELS[VERIFY_MODEL_ID].label})…`,
+        });
+        let original: HTMLImageElement | null = null;
+        const cutout = item.cutout;
+        if (!cutout) continue;
+        try {
+          original = await decodeOriginal(item);
+          const shared = {
+            model: VERIFY_MODEL_ID,
+            // The check compares SHAPES at 512px — refine and the zoom pass sharpen edges
+            // that comparison cannot see, at double the cost.
+            refine: false,
+            zoomPass: false,
+            // Deliberately UNFILTERED, whatever the page's current switch says. The filter is
+            // a second heuristic on top of the matte, and running it here would make the check
+            // answer "do the two models plus two filter passes agree?" — a marketing banner
+            // that RMBG isolated and the filter correctly dropped comes back fused to the
+            // product under BiRefNet's softer matte, and the item gets flagged for a
+            // disagreement that is really a filter difference. The primary's own filtered
+            // areas are excluded from the comparison instead (see filteredRects).
+            productOnly: false,
+            signal: ctrl.signal,
+            onLoadProgress: setDownload,
+          };
+          // Poolability follows the CHECKER, not the page's selected model: with the server
+          // model picked, usePool is false and this would run BiRefNet uncapped on the main
+          // thread, freezing the UI once per item with no Stop to reach.
+          const produced: PoolCutout = verifyViaPool
+            ? await poolRemoveBackground(original, shared)
+            : await toCutout(await removeBackground(original, shared));
+          setDownload(null);
+          const verify = await compareCutouts(
+            cutout.blob,
+            produced.blob,
+            VERIFY_MODEL_ID,
+            filteredRects(item),
+          );
+          checked++;
+          if (!verify.agree) disagreements++;
+          // Checked against the CUTOUT, atomically with the write: an undo that lands while
+          // BiRefNet works restores the same source object, so a source test would pass while
+          // the blob this verdict measured is already gone.
+          patchItemIfCutout(item.id, cutout, { verify });
+        } catch (e) {
+          if (isAbortError(e)) break;
+          // One failed check must not end the sweep — and no toast per miss: verify is a
+          // background pass, its silence is the point. The item stays unverified, so the
+          // next sweep retries it.
+          console.warn(`verify skipped for ${item.name}:`, errorMessage(e));
+        } finally {
+          if (original) releaseOriginal({ ...item, original });
+        }
+      }
+      // Only when the sweep actually finished on its own terms. A pre-empted one writing
+      // "Verified 2 — all agreed" with a full bar lands on the progress line the batch that
+      // pre-empted it is about to use, and reads as that batch having finished.
+      if (checked > 0 && !ctrl.signal.aborted && !runningRef.current) {
+        const done = `Verified ${checked} uncertain cutout${checked === 1 ? '' : 's'}`;
+        setProgress({
+          pct: 100,
+          text: disagreements
+            ? `${done} — ${disagreements} disagreement${disagreements === 1 ? '' : 's'} flagged.`
+            : `${done} — all agreed.`,
+        });
+      }
+    } finally {
+      verifyingRef.current = false;
+      setVerifying(false);
+      verifyAbortRef.current = null;
+      setDownload(null);
+      // A sweep that was pre-empted mid-flight left ambiguous items unchecked, and the batch
+      // that pre-empted it already ran its own tail call — which found the lock held and did
+      // nothing. Without this the queue silently loses that sweep entirely.
+      if (verifyPendingRef.current && !runningRef.current) {
+        verifyPendingRef.current = false;
+        void runVerifySweep();
+      }
     }
   }
 
@@ -1514,7 +1774,10 @@ export default function BgRemover() {
             signal,
             endpoint: azureEndpoint,
             apiKey: azureKey,
-            prompt,
+            // Assembled per item, not per batch: the prompt is shared, the row is not. A batch
+            // that built one string up front would send the first flagged image's fields with
+            // every other image in the wave.
+            prompt: rowPromptFor(item, prompt),
             // quality: suite-wide, from Settings → Quality.
             // The focus crop makes the reference non-square; without an explicit size the
             // edits endpoint mirrors that aspect and returns rectangular images.
@@ -1540,8 +1803,9 @@ export default function BgRemover() {
         status: 'ready',
         error: undefined,
         durationMs: undefined,
-        // Undo restores the pre-edit input AND its cutout in one step.
-        prev: { source: item.source, cutout: item.cutout },
+        // Undo restores the pre-edit input AND its cutout in one step — with the evidence
+        // that was measured from that cutout, not the AI run's.
+        prev: { source: item.source, cutout: item.cutout, ...cutoutEvidence(item) },
         // Write-once: a second edit finds this already set and keeps the imported image rather
         // than promoting the first AI output to "the original". `prev` holds one step only, so
         // without this nothing in the item still pointed at the CSV picture after two edits.
@@ -1687,7 +1951,7 @@ export default function BgRemover() {
       status: 'ready',
       error: undefined,
       durationMs: undefined,
-      prev: { source: item.source, cutout: item.cutout },
+      prev: { source: item.source, cutout: item.cutout, ...cutoutEvidence(item) },
     };
     patchItem(item.id, reset);
     void runBatch([reset], 'Redoing', overrides);
@@ -1706,6 +1970,17 @@ export default function BgRemover() {
       durationMs: undefined,
       original: null,
       prev: undefined,
+      // The evidence comes back with the cutout it was measured from. Restoring the picture
+      // and leaving the replacement run's numbers behind is how a good cutout ends up wearing
+      // a bad one's flags — and how a cross-check verdict for a discarded matte would keep
+      // the restored one out of the verify band forever. Explicit undefined clears them when
+      // the snapshot has none (an item redone before this shipped).
+      removedRegions: item.prev.removedRegions,
+      regionReport: item.prev.regionReport,
+      originalInk: item.prev.originalInk,
+      originalComponents: item.prev.originalComponents,
+      verify: item.prev.verify,
+      bands: item.prev.bands,
     });
   }
 
@@ -1736,7 +2011,7 @@ export default function BgRemover() {
       status: 'ready' as const,
       error: undefined,
       durationMs: undefined,
-      prev: { source: it.source, cutout: it.cutout },
+      prev: { source: it.source, cutout: it.cutout, ...cutoutEvidence(it) },
     }));
     for (const r of resets) dropPreview(r.id);
     setItems((prev) => prev.map((it) => resets.find((r) => r.id === it.id) ?? it));
@@ -1801,6 +2076,7 @@ export default function BgRemover() {
   function handleCancel() {
     abortRef.current?.abort();
     aiAbortRef.current?.abort();
+    verifyAbortRef.current?.abort();
     // from_pretrained takes no signal, so a download in flight runs to completion and the abort
     // only lands at the next checkpoint. Say so, or a 452 MB fetch looks like a hung button.
     if (stage === 'loading') {
@@ -2161,27 +2437,19 @@ export default function BgRemover() {
               </Select>
             </Field>
             <Field>
-              <FieldLabel>Image URL columns</FieldLabel>
-              {csvInfo.headers.map((header) => (
-                <Field key={header} orientation="horizontal">
-                  <Checkbox
-                    id={`csv-img-${header}`}
-                    checked={csvInfo.imageColumns.includes(header)}
-                    disabled={busy}
-                    onCheckedChange={(checked) =>
-                      updateCsvMapping({
-                        imageColumns:
-                          checked === true
-                            ? [...csvInfo.imageColumns, header]
-                            : csvInfo.imageColumns.filter((column) => column !== header),
-                      })
-                    }
-                  />
-                  <FieldLabel htmlFor={`csv-img-${header}`} className="font-normal">
-                    {header}
-                  </FieldLabel>
-                </Field>
-              ))}
+              <FieldLabel htmlFor="csv-img-cols">
+                <Hint hint="Every http(s) URL in these columns becomes its own queue item. Changing them re-imports the CSV's rows; images added as files or pastes are untouched.">
+                  Image URL columns
+                </Hint>
+              </FieldLabel>
+              <ColumnPicker
+                id="csv-img-cols"
+                columns={csvInfo.headers}
+                selected={csvInfo.imageColumns}
+                onChange={(next) => updateCsvMapping({ imageColumns: next })}
+                disabled={busy}
+                placeholder="None — no rows will be imported"
+              />
             </Field>
           </div>
           </PanelSection>
@@ -2231,6 +2499,23 @@ export default function BgRemover() {
             disabled={busy}
             skills={{ list: skills, activeId: aiSkillId, onSelect: (sk) => setAiPrompt(sk.content) }}
           />
+          {csvInfo && (
+            <Field>
+              <FieldLabel htmlFor="bg-ai-prompt-cols">
+                <Hint hint="Each picked cell is appended to the prompt as `header: value`, so the model is told what the picture shows instead of inferring it from pixels. Blank cells are skipped, and images that didn't come from the CSV are sent with the prompt alone.">
+                  Send CSV columns
+                </Hint>
+              </FieldLabel>
+              <ColumnPicker
+                id="bg-ai-prompt-cols"
+                columns={csvInfo.headers}
+                selected={promptColumns}
+                onChange={(next) => updateCsvMapping({ promptColumns: next })}
+                disabled={busy}
+                placeholder="None — the prompt goes out alone"
+              />
+            </Field>
+          )}
           <Field orientation="horizontal">
             <Checkbox
               id="bg-ai-focus-crop"
@@ -2280,6 +2565,13 @@ export default function BgRemover() {
             >
               <Switch checked={autoAiFix} onCheckedChange={setAutoAiFix} disabled={!aiReady} />
               Auto
+            </label>
+            <label
+              className="flex items-center gap-1.5 text-xs text-muted-foreground"
+              title={`After each batch, re-check cutouts with ambiguous evidence against ${BG_MODELS[VERIFY_MODEL_ID].label} and flag the ones the two models disagree on. Local and free — only the uncertain few are checked.`}
+            >
+              <Switch checked={verifyPass} onCheckedChange={setVerifyPass} />
+              Verify
             </label>
           </Field>
         </FieldGroup>
@@ -2428,7 +2720,7 @@ export default function BgRemover() {
             ? 'All images cut out'
             : 'Nothing queued'}
       </Button>
-      {(running || aiFixing) && (
+      {(running || aiFixing || verifying) && (
         <Button variant="outline" onClick={handleCancel}>
           <CircleStopIcon data-icon="inline-start" />
           Stop
@@ -2719,7 +3011,7 @@ export default function BgRemover() {
                       right. The filter and sort controls used to be nine identically-shaped
                       pills spread over three rows, where nothing but the label said which of
                       them changed the order and which changed the contents. */}
-                  <div className="mb-3 flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
+                  <CanvasToolbar>
                     <QueueFilters
                       filter={queueFilter}
                       onFilterChange={changeQueueFilter}
@@ -2749,7 +3041,7 @@ export default function BgRemover() {
                         }
                       />
                     </div>
-                  </div>
+                  </CanvasToolbar>
                   <VirtualGrid
                     items={displayItems}
                     scrollRef={removeScrollRef}
@@ -2858,6 +3150,10 @@ export default function BgRemover() {
             ? 'Send to Azure GPT-Image with this prompt; the result replaces this image'
             : 'Set the Azure endpoint + key in Settings (gear in the rail) first',
           defaultPrompt: aiPrompt,
+          // The dialog edits the prompt; the row block is appended by the page. Passing it down
+          // is what keeps the dialog honest — otherwise the one screen that shows the prompt in
+          // full would be showing something other than what gets sent.
+          rowContext: compareItem ? rowContextFor(compareItem) : '',
           onEdit: (item, prompt) => void handleAiEdit(item, prompt),
         }}
         busy={busy}

@@ -16,8 +16,8 @@
 // batches). v1 files still load exactly as before.
 
 import { buildZipStream, readZipIndex, type ZipStreamEntry } from '../zip';
-import type { BgCutout, BgItem, BgItemSource, CsvOrigin } from './batch';
-import type { InkFootprint, RegionReport } from './regions';
+import type { BgCutout, BgItem, BgItemSource, BgVerify, CsvOrigin } from './batch';
+import type { InkFootprint, OriginalComponentReport, RegionReport } from './regions';
 import { ANCHORS, DEFAULT_SAFE_AREA, type SafeAreaConfig, type SubjectBounds } from './safe-area';
 
 export const PROJECT_EXTENSION = '.zesku';
@@ -110,6 +110,10 @@ interface ManifestItem {
   residueFraction?: number;
   /** The original's pre-matte footprint — what the coverage-collapse check reads. */
   originalInk?: InkFootprint;
+  /** v2-additive: per-element survival of the original's ink against the pre-filter matte. */
+  components?: OriginalComponentReport[];
+  /** v2-additive: the second-model cross-check verdict, when the verify sweep ran one. */
+  verify?: BgVerify;
 }
 
 /** Where the CSV text lives and how its columns were mapped; the text itself is a zip entry. */
@@ -117,6 +121,8 @@ interface ManifestCsv {
   fileName: string;
   nameColumn: string;
   imageColumns: string[];
+  /** v2-additive: columns sent with the AI-edit prompt. Absent on files saved before it. */
+  promptColumns?: string[];
   path: string;
 }
 
@@ -145,6 +151,11 @@ export interface ProjectCsv {
   /** Column that names each image; '' means names come from the URL's filename. */
   nameColumn: string;
   imageColumns: string[];
+  /**
+   * Columns whose cells ride along with the AI-edit prompt. Optional: sheets saved before this
+   * existed reopen sending nothing extra, which is exactly what they were sent with.
+   */
+  promptColumns?: string[];
 }
 
 /**
@@ -176,6 +187,7 @@ function parseRegions(raw: unknown[]): RegionReport[] {
       dominantBin: Math.round(num(r.dominantBin, -1)),
       removed: r.removed === true,
       ...(r.flagged === true ? { flagged: true } : null),
+      ...(r.guarded === true ? { guarded: true } : null),
     });
   }
   return out;
@@ -189,6 +201,83 @@ function packRegions(regions: RegionReport[]): RegionReport[] {
     paletteCoverage: r3(region.paletteCoverage),
     fillRatio: r3(region.fillRatio),
   }));
+}
+
+/**
+ * Trimmed for the manifest. No rounding happens here: measureComponentSurvival already
+ * quantises every ratio at the source, precisely so the numbers a verdict is computed from
+ * cannot change across a save. Rounding again here would reintroduce the drift that removes.
+ */
+function packComponents(components: OriginalComponentReport[]): OriginalComponentReport[] {
+  return components.map((c) => ({
+    bounds: c.bounds,
+    areaFraction: c.areaFraction,
+    survival: c.survival,
+    edgeContact: c.edgeContact,
+    chroma: c.chroma,
+    flatness: c.flatness,
+    gradSamples: c.gradSamples,
+    lostChroma: c.lostChroma,
+    lostBelow: c.lostBelow,
+    lostFlatness: c.lostFlatness,
+    lostGradSamples: c.lostGradSamples,
+  }));
+}
+
+/** Field-by-field, like parseRegions — a wrong-typed survival would clear a verdict silently. */
+function parseComponents(raw: unknown[]): OriginalComponentReport[] {
+  const out: OriginalComponentReport[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue;
+    const c = entry as Partial<OriginalComponentReport>;
+    const bounds = parseBounds(c.bounds ?? null);
+    if (!bounds) continue;
+    const survival = num(c.survival, NaN);
+    const areaFraction = num(c.areaFraction, NaN);
+    if (!Number.isFinite(survival) || !Number.isFinite(areaFraction)) continue;
+    out.push({
+      bounds,
+      areaFraction,
+      survival,
+      edgeContact: Math.round(num(c.edgeContact, 0)),
+      chroma: num(c.chroma, 0),
+      flatness: num(c.flatness, 0),
+      // Absent on files written before texture sampling was recorded. 0 is the honest
+      // default: it reads as "smoothness was never measured", which is what those files
+      // mean, and the shadow gate refuses to suppress on unmeasured texture.
+      gradSamples: Math.round(num(c.gradSamples, 0)),
+      lostChroma: num(c.lostChroma, 0),
+      lostBelow: num(c.lostBelow, 0),
+      lostFlatness: num(c.lostFlatness, 0),
+      // Absent on files written before the removed background's texture was recorded. 0 reads
+      // as "never measured", and the variation gate refuses to act on unmeasured texture.
+      lostGradSamples: Math.round(num(c.lostGradSamples, 0)),
+    });
+  }
+  return out;
+}
+
+/**
+ * All four fields or nothing: a verify verdict with a defaulted value would be an invented
+ * one. `agree` is validated like the rest rather than coerced with `=== true` — coercing it
+ * turns a truncated record into a permanent "the two models disagree" flag sitting next to a
+ * printed 95% overlap, and because a stored verdict closes needsVerify, nothing would ever
+ * re-check it. Rejecting instead leaves verify absent, which reopens the door.
+ */
+function parseVerify(raw: unknown): BgVerify | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const v = raw as Partial<BgVerify>;
+  const iou = num(v.iou, NaN);
+  const disputedFraction = num(v.disputedFraction, NaN);
+  if (
+    typeof v.model !== 'string' ||
+    typeof v.agree !== 'boolean' ||
+    !Number.isFinite(iou) ||
+    !Number.isFinite(disputedFraction)
+  ) {
+    return null;
+  }
+  return { model: v.model, iou, disputedFraction, agree: v.agree };
 }
 
 function originOf(source: BgItemSource): string {
@@ -311,6 +400,19 @@ export async function saveProject(
             },
           }
         : null),
+      ...(item.originalComponents?.length
+        ? { components: packComponents(item.originalComponents) }
+        : null),
+      ...(item.verify
+        ? {
+            verify: {
+              model: item.verify.model,
+              iou: Math.round(item.verify.iou * 1000) / 1000,
+              disputedFraction: Math.round(item.verify.disputedFraction * 1000) / 1000,
+              agree: item.verify.agree,
+            },
+          }
+        : null),
       ...(item.csv ? { csv: { row: item.csv.row, column: item.csv.column } } : null),
       // Only a URL survives the round trip: an original that was a dropped FILE is already
       // embedded under originals/ when the save includes them, and re-embedding it a second
@@ -340,6 +442,7 @@ export async function saveProject(
       fileName: csv.fileName,
       nameColumn: csv.nameColumn,
       imageColumns: [...csv.imageColumns],
+      ...(csv.promptColumns?.length ? { promptColumns: [...csv.promptColumns] } : null),
       path: CSV_ENTRY,
     };
   }
@@ -374,6 +477,8 @@ export interface RestoredItem {
   regions?: RegionReport[];
   removedRegions?: number;
   originalInk?: InkFootprint;
+  components?: OriginalComponentReport[];
+  verify?: BgVerify;
 }
 
 export interface RestoredProject {
@@ -530,6 +635,11 @@ export async function loadProject(file: File): Promise<RestoredProject> {
         Number.isFinite(num(rec.originalInk.ink, NaN))
           ? { originalInk: { bbox: num(rec.originalInk.bbox, 0), ink: num(rec.originalInk.ink, 0) } }
           : null),
+        ...(Array.isArray(rec.components) ? { components: parseComponents(rec.components) } : null),
+        ...(() => {
+          const verify = parseVerify(rec.verify);
+          return verify ? { verify } : null;
+        })(),
       });
     }
   }
@@ -593,6 +703,11 @@ export async function loadProject(file: File): Promise<RestoredProject> {
             nameColumn: typeof c.nameColumn === 'string' ? c.nameColumn : '',
             imageColumns: Array.isArray(c.imageColumns)
               ? c.imageColumns.filter((column): column is string => typeof column === 'string' && !!column)
+              : [],
+            // Absent means "send the prompt alone" — the same thing every pre-promptColumns
+            // file was actually sent with, so an old project reopens sending what it always did.
+            promptColumns: Array.isArray(c.promptColumns)
+              ? c.promptColumns.filter((column): column is string => typeof column === 'string' && !!column)
               : [],
           };
         }

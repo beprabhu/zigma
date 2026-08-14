@@ -282,12 +282,23 @@ function RegionTable({ regions }: { regions: RegionReport[] }) {
                     'py-1',
                     r.removed
                       ? 'text-destructive'
-                      : r.flagged
+                      : r.flagged || r.guarded
                         ? 'text-amber-600 dark:text-amber-400'
                         : 'text-muted-foreground',
                   )}
+                  title={
+                    r.guarded
+                      ? 'Measured as a graphic panel, but kept: it is large and central, where the filter protects possible second products.'
+                      : undefined
+                  }
                 >
-                  {r.removed ? 'removed' : r.flagged ? 'kept · graphic?' : 'kept'}
+                  {r.removed
+                    ? 'removed'
+                    : r.guarded
+                      ? 'kept · panel, spared'
+                      : r.flagged
+                        ? 'kept · graphic?'
+                        : 'kept'}
                 </td>
               </tr>
             ))}
@@ -298,6 +309,129 @@ function RegionTable({ regions }: { regions: RegionReport[] }) {
         <p className="text-[11px] text-muted-foreground">
           Only one region: the strip is connected to the product in the matte, so no
           region-based filter can separate them.
+        </p>
+      )}
+      {/* A silent top-8 cut reads as "this is all of it". On a badge-heavy shot the removals
+          alone fill the table and every leftover speck the matte kept falls off the bottom —
+          the exact rows you would want when a cutout has visible debris in it. */}
+      {regions.length > sorted.length && (
+        <p className="text-[11px] text-muted-foreground">
+          {regions.length - sorted.length} smaller region
+          {regions.length - sorted.length === 1 ? '' : 's'} not shown (
+          {regions.filter((r) => !r.removed).length - sorted.filter((r) => !r.removed).length} kept
+          ).
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Per-element survival of the ORIGINAL's ink against the pre-filter matte, plus the verify
+ * verdict when the sweep ran one. Same contract as the region table above: a heuristic that
+ * cannot be inspected cannot be tuned, and these are the numbers threshold work needs.
+ */
+function ComponentTable({ item }: { item: BgItem }) {
+  const components = item.originalComponents ?? [];
+  if (!components.length && !item.verify) return null;
+  const shown = components.slice(0, 8);
+  const hiddenComponents = components.length - shown.length;
+  return (
+    <div className="min-w-0 space-y-1.5">
+      <div className="text-xs font-medium">Original elements</div>
+      {shown.length > 0 && (
+        <div className="min-w-0 overflow-x-auto">
+          <table className="w-full min-w-96 text-left text-[11px] tabular-nums">
+            <thead className="text-muted-foreground">
+              <tr>
+                <th className="py-1 pr-3 font-normal">element</th>
+                <th className="py-1 pr-3 font-normal" title="Share of the original canvas this element's ink covers">size</th>
+                <th className="py-1 pr-3 font-normal" title="Share of the element's pixels the matte kept, before the product-only filter">survival</th>
+                <th className="py-1 pr-3 font-normal" title="Frame edges touched (0-4); backgrounds span 2+, a banner reaches 1">edges</th>
+                <th className="py-1 pr-3 font-normal" title="Mean colour saturation of the original pixels; a shadow is ~0">chroma</th>
+                <th className="py-1 pr-3 font-normal" title="Mean local variation of the original pixels; a shadow is smooth. '—' means too thin to sample, which is NOT the same as smooth">detail</th>
+                <th className="py-1 font-normal" title="What the element lost: colour of the dropped pixels, and whether they sat below what survived (a shadow does)">lost</th>
+              </tr>
+            </thead>
+            <tbody>
+              {shown.map((c, i) => (
+                <tr key={i} className="border-t">
+                  <td className="py-1 pr-3 text-muted-foreground">
+                    {c.bounds.w}&times;{c.bounds.h}
+                  </td>
+                  <td className="py-1 pr-3">{(c.areaFraction * 100).toFixed(1)}%</td>
+                  <td
+                    className={cn(
+                      'py-1 pr-3',
+                      c.survival <= 0.1
+                        ? 'text-destructive'
+                        : c.survival < 0.9
+                          ? 'text-amber-600 dark:text-amber-400'
+                          : undefined,
+                    )}
+                  >
+                    {(c.survival * 100).toFixed(0)}%
+                  </td>
+                  <td className="py-1 pr-3">{c.edgeContact}</td>
+                  <td className="py-1 pr-3">{c.chroma.toFixed(0)}</td>
+                  <td className="py-1 pr-3">
+                    {c.gradSamples > 0 ? c.flatness.toFixed(1) : <span className="text-muted-foreground">—</span>}
+                  </td>
+                  <td className="py-1 text-muted-foreground">
+                    {c.survival >= 0.999
+                      ? '—'
+                      : `chroma ${c.lostChroma.toFixed(0)}, ${
+                          c.lostBelow > 0.01 ? 'below' : c.lostBelow < -0.01 ? 'above' : 'level'
+                        }`}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {/* Bands run between the two tables above — after survival is measured, before the
+          region report — so without this line a masked strip shows as "100% survived" in one
+          table and is absent from the other, with nothing saying where it went. */}
+      {(item.bands?.length ?? 0) > 0 && (
+        <p className="text-[11px] text-amber-600 dark:text-amber-400">
+          {item.bands!.length} flat edge strip{item.bands!.length === 1 ? '' : 's'} masked out (
+          {item.bands!.map((b) => `${b.width}×${b.height}`).join(', ')}) — removed after the
+          matte, so they appear in neither table above.
+        </p>
+      )}
+      {hiddenComponents > 0 && (
+        <p className="text-[11px] text-muted-foreground">
+          {hiddenComponents} smaller element{hiddenComponents === 1 ? '' : 's'} not shown.
+        </p>
+      )}
+      {item.verify && (
+        <p
+          className={cn(
+            'text-[11px]',
+            item.verify.agree ? 'text-muted-foreground' : 'text-amber-600 dark:text-amber-400',
+          )}
+        >
+          Cross-check ({item.verify.model}): mask overlap {(item.verify.iou * 100).toFixed(0)}%
+          {item.verify.agree
+            ? ' — the second model agrees with this cutout.'
+            : ` — the models dispute ${(item.verify.disputedFraction * 100).toFixed(0)}% of the frame.`}
+        </p>
+      )}
+      {/* The residue measurement drives a flag but was displayed nowhere — a flagged image
+          whose visible tables all look perfect reads as a bug in the flag. 0.1% precision
+          because the bar is 1%. */}
+      {item.cutout?.residueFraction !== undefined && item.cutout.residueFraction > 0 && (
+        <p
+          className={cn(
+            'text-[11px]',
+            item.cutout.residueFraction >= 0.01
+              ? 'text-amber-600 dark:text-amber-400'
+              : 'text-muted-foreground',
+          )}
+        >
+          Faint residue outside the subject: {(item.cutout.residueFraction * 100).toFixed(1)}% of
+          the canvas{item.cutout.residueFraction >= 0.01 ? ' — above the flag bar (1%)' : ''}.
         </p>
       )}
     </div>
@@ -365,6 +499,8 @@ export interface CompareDialogProps {
     ready: boolean;
     hint: string;
     defaultPrompt: string;
+    /** The CSV row block the page appends to whatever is typed above; '' when there is none. */
+    rowContext?: string;
     onEdit: (item: BgItem, prompt: string) => void;
   };
   /** A run is in progress; redo stays visible but disabled. */
@@ -452,6 +588,8 @@ function CompareView({
     ready: boolean;
     hint: string;
     defaultPrompt: string;
+    /** The CSV row block the page appends to whatever is typed above; '' when there is none. */
+    rowContext?: string;
     onEdit: (item: BgItem, prompt: string) => void;
   };
   busy?: boolean;
@@ -672,6 +810,9 @@ function CompareView({
         <RegionTable regions={item.regionReport} />
       )}
 
+      {/* Same tie-to-cutout rule as the region table above. */}
+      {item.cutout && <ComponentTable item={item} />}
+
       {aiEdit && canRetry(item) && (
         <Collapsible className="rounded-lg border">
           {/* Chevron rotation: a static rule in base.css keys off Base UI's data-panel-open
@@ -698,9 +839,18 @@ function CompareView({
                 aria-label="Prompt for this image"
                 className="text-xs"
               />
+              {aiEdit.rowContext && (
+                // Read-only: these cells come from the CSV, and editing them here would edit
+                // one send rather than the sheet. The picker in the AI edit panel is where they
+                // are chosen; this is only the proof of what goes out with them.
+                <pre className="max-h-28 overflow-auto rounded-md bg-muted/50 p-2 text-[11px] whitespace-pre-wrap text-muted-foreground">
+                  {aiEdit.rowContext}
+                </pre>
+              )}
               <div className="flex flex-wrap items-center gap-2">
                 <p className="mr-auto text-xs text-muted-foreground">
                   Applies to this image only — the default prompt stays unchanged.
+                  {aiEdit.rowContext ? ' The CSV row above is appended to it.' : ''}
                 </p>
                 {promptEdited && (
                   <Button

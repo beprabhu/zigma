@@ -9,7 +9,8 @@ import { detectImageColumns, detectTitleColumn, parseCSV } from '@/lib/csv';
 import type { LoadProgress } from './engine';
 import { TRANSPARENT, type SubjectBounds } from './safe-area';
 import { isHeicFile } from './heic';
-import type { InkFootprint, RegionReport } from './regions';
+import type { InkFootprint, OriginalComponentReport, RegionReport } from './regions';
+import type { DetectedBand } from './bands';
 
 export type BgItemStatus =
   | 'ready'
@@ -33,6 +34,22 @@ export type BgItemSource =
 /** Whether "remove background again" is possible — archived items have no original to re-run. */
 export function canRetry(item: BgItem): boolean {
   return item.source.kind !== 'archived';
+}
+
+/**
+ * The measurements that describe an item's CURRENT cutout, for the undo slot. Everything a
+ * quality verdict reads lives here, so restoring a cutout can restore the evidence that was
+ * taken from it instead of leaving the replacement run's numbers attached to it.
+ */
+export function cutoutEvidence(item: BgItem): Omit<NonNullable<BgItem['prev']>, 'source' | 'cutout'> {
+  return {
+    removedRegions: item.removedRegions,
+    regionReport: item.regionReport,
+    originalInk: item.originalInk,
+    originalComponents: item.originalComponents,
+    verify: item.verify,
+    bands: item.bands,
+  };
 }
 
 /**
@@ -129,6 +146,22 @@ export interface BgCutout {
   residueFraction?: number;
 }
 
+/**
+ * What the second-model cross-check concluded. Stored on the item (and persisted) rather than
+ * recomputed: the check costs a full BiRefNet inference, and "was already checked" must survive
+ * a reload or the sweep would re-bill every ambiguous item on every visit.
+ */
+export interface BgVerify {
+  /** The checker model's id ('birefnet' today; stored so a future switch stays auditable). */
+  model: string;
+  /** Alpha-mask IoU between the primary cutout and the checker's, 0..1. */
+  iou: number;
+  /** Share of the frame the two mattes dispute (symmetric difference / canvas). */
+  disputedFraction: number;
+  /** iou >= the agreement bar at the time of the check. Disagreement flags the item. */
+  agree: boolean;
+}
+
 export interface BgItem {
   id: number;
   /** Export filename stem, pre-sanitising. From the CSV title column or the file name. */
@@ -159,7 +192,23 @@ export interface BgItem {
    * regenerated file becomes the new input), so undo must restore both halves together.
    * Overwritten by the next redo, cleared by undo itself.
    */
-  prev?: { source: BgItemSource; cutout: BgCutout | null };
+  /**
+   * The evidence travels WITH the cutout it describes. Restoring a cutout without its
+   * measurements pairs the old picture with the new run's numbers: undo a redo that ate a
+   * badge and the good cutout inherits the bad one's survival scores, wearing a vanished-
+   * element flag for something that never vanished — and the same for a cross-check verdict
+   * that measured a matte the user just threw away.
+   */
+  prev?: {
+    source: BgItemSource;
+    cutout: BgCutout | null;
+    removedRegions?: number;
+    regionReport?: RegionReport[];
+    originalInk?: InkFootprint;
+    originalComponents?: OriginalComponentReport[];
+    verify?: BgVerify;
+    bands?: DetectedBand[];
+  };
   /**
    * The source this item was FIRST imported with, captured once and immutable from then on.
    * Reference only — nothing runs inference on it, and it is deliberately not part of the undo
@@ -187,6 +236,29 @@ export interface BgItem {
    * side that still remembered them was the original.
    */
   originalInk?: InkFootprint;
+  /**
+   * The original's ink, per connected element, with how much of each the PRE-filter matte kept.
+   * The finer-grained sibling of originalInk: the footprint answers "is most of the picture
+   * gone?", this answers "is THIS badge / THIS second item / THIS side of the product gone?" —
+   * the Ezee incident (navy badge + banner erased inside the matte) moved no whole-canvas
+   * number at all. Absent on rows from files predating the measurement; checks reading it
+   * simply cannot fire there, same rule as every other piece of evidence.
+   */
+  originalComponents?: OriginalComponentReport[];
+  /**
+   * Second-model cross-check verdict, written by the verify sweep for items whose evidence was
+   * ambiguous (see quality.needsVerify). Its presence — agree or not — also marks the item as
+   * already verified, so the sweep never re-pays for it.
+   */
+  verify?: BgVerify;
+  /**
+   * Flat edge strips masked out of the matte (lib/bg/bands.ts). The one removal the pipeline
+   * performed no record of: bands run AFTER component survival is measured and BEFORE the
+   * region report is built, so a masked strip shows survival 100% in the element table while
+   * appearing in neither the kept nor the removed regions — a 4.5%-of-canvas "200 g" badge
+   * vanished exactly this way, leaving the two tables silently contradicting each other.
+   */
+  bands?: DetectedBand[];
   /** Set for items imported from a CSV; absent for dropped files and pasted images. */
   csv?: CsvOrigin;
   /**

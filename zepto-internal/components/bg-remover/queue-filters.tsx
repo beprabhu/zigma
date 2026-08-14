@@ -12,7 +12,7 @@
 // row, whatever the vocabulary grows to, above a grid that runs to five figures.
 
 import {
-  CircleAlertIcon, LayersIcon, OctagonAlertIcon, SparklesIcon, TriangleAlertIcon,
+  CircleAlertIcon, CircleCheckIcon, LayersIcon, OctagonAlertIcon, SparklesIcon, TriangleAlertIcon,
   type LucideIcon,
 } from 'lucide-react';
 
@@ -47,6 +47,12 @@ const FILTER_META: Record<QueueFilter, FilterMeta> = {
     label: 'All',
     icon: LayersIcon,
     hint: 'Every image in the queue, however it arrived and whatever state it is in.',
+  },
+  'clean': {
+    label: 'Clean',
+    icon: CircleCheckIcon,
+    iconClassName: 'text-emerald-500',
+    hint: 'Finished cutouts the quality check is happy with — the ones that need no further work. Exported images stay here: this asks how an image came out, not where it went. Rows restored from a project with no saved evidence are left out, since nothing was measured on them.',
   },
   'flagged': {
     label: 'Flagged',
@@ -188,7 +194,7 @@ export function QueueFilters({
                 // Without it the trailing number is read as a second, nameless label.
                 aria-label={`${label}, ${formatCount(count)} image${count === 1 ? '' : 's'}`}
               >
-                {/* Tinted on every row, not just the active one: five of them read top to bottom
+                {/* Tinted on every row, not just the active one: they read top to bottom
                     as a legend for the marks the grid puts on the tiles themselves — the same
                     amber, the same destructive red. */}
                 <Icon className={iconClassName} />

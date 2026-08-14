@@ -4,7 +4,8 @@
 // fields. Text-to-image, so it uses Azure's generations endpoint (via /api/generate's
 // `mode: 'generations'`) rather than the edits endpoint the other two products drive.
 //
-// The prompt rule lives in lib/gen.ts and is surfaced verbatim in every cell and dialog: the
+// The prompt rule lives in lib/row-prompt.ts (Cleanup sends row context the same way) and is
+// surfaced verbatim in every cell and dialog: the
 // product's whole value is "these columns, under this brief", so hiding the assembled string
 // would make a bad result impossible to diagnose.
 
@@ -16,6 +17,7 @@ import {
 
 import { Button } from '@/components/ui/button';
 import { ClearAllButton, SelectionBar, useGridSelection } from '@/components/selection';
+import { ColumnPicker } from '@/components/column-picker';
 import { Checkbox } from '@/components/ui/checkbox';
 import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
@@ -32,14 +34,12 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Spinner } from '@/components/ui/spinner';
 import { Textarea } from '@/components/ui/textarea';
 
-import { Canvas, LeftPanel, PanelSection, RightPanel, StudioShell } from '@/components/pane-layout';
+import { Canvas, CanvasToolbar, LeftPanel, PanelSection, RightPanel, StudioShell } from '@/components/pane-layout';
 import { GenDialog, GenGrid } from '@/components/image-generator/gen-grid';
 
 import { detectTitleColumn, parseCSV, type CsvRecord } from '@/lib/csv';
-import {
-  PROMPT_WARN_CHARS, buildRowPrompt, createGenItems, genFileStem, isPromptEmpty,
-  type GenItem,
-} from '@/lib/gen';
+import { createGenItems, genFileStem, type GenItem } from '@/lib/gen';
+import { PROMPT_WARN_CHARS, buildRowPrompt, isPromptEmpty } from '@/lib/row-prompt';
 import { callAzureGenerate, mockGenerate } from '@/lib/pipeline';
 import { readParallel } from '@/lib/rate';
 import { canvasToPngBlob, mapWithLimit, pickSave, releaseCanvas, saveTo } from '@/lib/bg/batch';
@@ -198,6 +198,20 @@ export default function ImageGenerator() {
   const mock = typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('mock');
   const busy = running || exporting;
   const excludedSet = React.useMemo(() => new Set(excluded), [excluded]);
+  // The picker speaks inclusion, the state speaks exclusion. Storing what is NOT sent is what
+  // makes a freshly dropped CSV send everything by default, and a re-dropped sheet with a new
+  // column send that column too rather than silently dropping it for being unheard-of.
+  const includedColumns = React.useMemo(
+    () => headers.filter((header) => !excludedSet.has(header)),
+    [headers, excludedSet],
+  );
+  const setIncludedColumns = React.useCallback(
+    (next: string[]) => {
+      const keep = new Set(next);
+      setExcluded(headers.filter((header) => !keep.has(header)));
+    },
+    [headers],
+  );
 
   const promptFor = React.useCallback(
     (item: GenItem) => buildRowPrompt(brief, headers, item.record, excludedSet),
@@ -267,10 +281,6 @@ export default function ImageGenerator() {
         name: (next ? it.record[next] : '')?.trim() || `Row ${i + 1}`,
       })),
     );
-  }
-
-  function toggleColumn(header: string, include: boolean) {
-    setExcluded((prev) => (include ? prev.filter((h) => h !== header) : [...prev, header]));
   }
 
   // ---- Generation --------------------------------------------------------
@@ -651,24 +661,17 @@ export default function ImageGenerator() {
                   </Field>
 
                   <Field>
-                    <FieldLabel>Send in the prompt</FieldLabel>
-                    <div className="flex flex-col gap-2">
-                      {headers.map((h) => (
-                        <Field key={h} orientation="horizontal">
-                          <Checkbox
-                            id={`gen-col-${h}`}
-                            checked={!excludedSet.has(h)}
-                            disabled={busy}
-                            onCheckedChange={(checked) => toggleColumn(h, checked === true)}
-                          />
-                          <FieldLabel htmlFor={`gen-col-${h}`} className="min-w-0 font-normal">
-                            <span className="block truncate">{h}</span>
-                          </FieldLabel>
-                        </Field>
-                      ))}
-                    </div>
+                    <FieldLabel htmlFor="gen-prompt-cols">Send in the prompt</FieldLabel>
+                    <ColumnPicker
+                      id="gen-prompt-cols"
+                      columns={headers}
+                      selected={includedColumns}
+                      onChange={setIncludedColumns}
+                      disabled={busy}
+                      placeholder="No columns — the brief goes out alone"
+                    />
                     <FieldDescription>
-                      Untick anything the model should not see — internal IDs, statuses, links.
+                      Unpick anything the model should not see — internal IDs, statuses, links.
                     </FieldDescription>
                   </Field>
                 </FieldGroup>
@@ -722,7 +725,7 @@ export default function ImageGenerator() {
           ) : (
             <>
               {/* Grid toolbar: count on the left, whole-run reset on the right. */}
-              <div className="mb-2 flex items-center justify-between gap-2">
+              <CanvasToolbar className="justify-between">
                 <span className="text-xs text-muted-foreground">
                   {sel.active
                     ? `${sel.checked.size} of ${items.length} selected`
@@ -741,7 +744,7 @@ export default function ImageGenerator() {
                     </>
                   }
                 />
-              </div>
+              </CanvasToolbar>
               <GenGrid
                 items={items}
                 promptFor={promptFor}

@@ -34,8 +34,9 @@
 
 import * as React from 'react';
 
-import type { BgItem, CsvOrigin } from './batch';
-import type { InkFootprint, RegionReport } from './regions';
+import type { BgItem, BgVerify, CsvOrigin } from './batch';
+import type { InkFootprint, OriginalComponentReport, RegionReport } from './regions';
+import type { DetectedBand } from './bands';
 import type { ProjectCsv } from './project';
 import type { SubjectBounds } from './safe-area';
 
@@ -93,6 +94,12 @@ export interface AutosaveRecord {
   residueFraction?: number;
   /** The original's pre-matte footprint — what the coverage-collapse check reads. */
   originalInk?: InkFootprint;
+  /** Per-element survival of the original's ink against the pre-filter matte. */
+  components?: OriginalComponentReport[];
+  /** Second-model cross-check verdict; in the SIGNATURE (unlike batch) — see signatureOf. */
+  verify?: BgVerify;
+  /** Flat edge strips masked from the matte — the removal nothing else records. */
+  bands?: DetectedBand[];
 }
 
 /** The stored sheet. Same shape a .zesku carries, plus when this copy was written. */
@@ -226,6 +233,10 @@ function parseCsvMeta(v: unknown): AutosaveCsv | null {
     imageColumns: Array.isArray(c.imageColumns)
       ? c.imageColumns.filter((column): column is string => typeof column === 'string' && !!column)
       : [],
+    // Absent = nothing rode along with the AI-edit prompt, which is what pre-field records sent.
+    promptColumns: Array.isArray(c.promptColumns)
+      ? c.promptColumns.filter((column): column is string => typeof column === 'string' && !!column)
+      : [],
     savedAt: typeof c.savedAt === 'number' && Number.isFinite(c.savedAt) ? c.savedAt : 0,
   };
 }
@@ -243,6 +254,7 @@ export function saveAutosaveCsv(csv: ProjectCsv, savedAt: number = Date.now()): 
       text: csv.text,
       nameColumn: csv.nameColumn,
       imageColumns: [...csv.imageColumns],
+      promptColumns: [...(csv.promptColumns ?? [])],
       savedAt,
     }),
   ).then(() => undefined);
@@ -324,6 +336,8 @@ function sameCsv(a: ProjectCsv | null, b: ProjectCsv | null): boolean {
     a.nameColumn === b.nameColumn &&
     a.imageColumns.length === b.imageColumns.length &&
     a.imageColumns.every((column, i) => column === b.imageColumns[i]) &&
+    (a.promptColumns ?? []).length === (b.promptColumns ?? []).length &&
+    (a.promptColumns ?? []).every((column, i) => column === (b.promptColumns ?? [])[i]) &&
     a.text === b.text
   );
 }
@@ -391,6 +405,9 @@ function recordOf(item: BgItem, savedAt: number): AutosaveRecord | null {
       ? { residueFraction: item.cutout.residueFraction }
       : null),
     ...(item.originalInk ? { originalInk: item.originalInk } : null),
+    ...(item.originalComponents?.length ? { components: item.originalComponents } : null),
+    ...(item.verify ? { verify: item.verify } : null),
+    ...(item.bands?.length ? { bands: item.bands } : null),
   };
 }
 
@@ -420,6 +437,7 @@ interface Signature {
   cutout: Blob | null;
   source: Blob | null;
   name: string;
+  verify: BgVerify | null;
 }
 
 function signatureOf(item: BgItem): Signature {
@@ -427,6 +445,12 @@ function signatureOf(item: BgItem): Signature {
     cutout: item.cutout?.blob ?? null,
     source: item.source.kind === 'file' && item.source.regenerated ? item.source.file : null,
     name: item.name,
+    // Unlike batch, verify EARNS its rewrite: it is written once per item by the verify sweep,
+    // strictly after the cutout exists, and only for the small ambiguous band — so the cost is
+    // one record re-put per verified item, not a queue-wide rewrite. Identity comparison is
+    // safe for the same reason as the blobs: the sweep writes a fresh object exactly once, and
+    // a {...item} rebuild upstream carries the same reference through.
+    verify: item.verify ?? null,
   };
 }
 
@@ -727,7 +751,17 @@ export function useAutosave(items: BgItem[], opts: AutosaveOptions = {}): Autosa
         seen.add(item.id);
         const sig = signatureOf(item);
         const prev = known.get(item.id);
-        if (prev && prev.cutout === sig.cutout && prev.source === sig.source && prev.name === sig.name) {
+        if (
+          prev &&
+          prev.cutout === sig.cutout &&
+          prev.source === sig.source &&
+          prev.name === sig.name &&
+          // By identity like the blobs — the sweep writes a fresh object exactly once per
+          // item. Skipping this comparison is how the first live verify verdict silently
+          // never reached disk: the record's savedAt moved for other reasons while verify
+          // stayed null across reloads.
+          prev.verify === sig.verify
+        ) {
           continue;
         }
         const record = recordOf(item, savedAt);

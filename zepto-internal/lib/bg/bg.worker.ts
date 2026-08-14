@@ -12,8 +12,9 @@ import { BG_MODELS, type BgBackend, type BgModelId } from './engine';
 import { refineAlpha, type RefineMode } from './refine';
 import { detectBands, maskBands, type DetectedBand } from './bands';
 import {
-  analyzeRegions, keepProductRegions, measureFaintResidue, measureInkFootprint,
-  type InkFootprint, type RegionReport,
+  analyzeRegions, keepProductRegions, labelInkComponents, measureComponentSurvival,
+  measureFaintResidue, measureInkFootprint,
+  type InkFootprint, type OriginalComponentReport, type RegionReport,
 } from './regions';
 import { subjectBounds, type SubjectBounds } from './safe-area';
 import { MAX_EDGE, PAD_FRACTION, STORE_TYPE } from './constants';
@@ -60,6 +61,8 @@ export type WorkerResponse =
       /** What the ORIGINAL covered, measured before the matte was applied — the only side that
        *  still remembers objects the model deleted outright. */
       originalInk: InkFootprint;
+      /** Per-element survival of the original's ink islands against the PRE-filter matte. */
+      originalComponents: OriginalComponentReport[];
       /** Flat edge strips masked from the source before region analysis. */
       bands: DetectedBand[];
       width: number;
@@ -157,6 +160,16 @@ function drawToCanvas(bitmap: ImageBitmap, maxEdge: number): OffscreenCanvas {
   if (!c2d) throw new Error('OffscreenCanvas 2D context unavailable');
   c2d.imageSmoothingEnabled = true;
   c2d.imageSmoothingQuality = 'high';
+  // Flatten onto WHITE before anything reads these pixels. A fresh canvas is transparent
+  // BLACK, and the processor hands the model three channels with alpha dropped — so every
+  // already-transparent PNG arrived at the model as a product floating on a black field, and
+  // a soft drop shadow baked into the source as semi-transparent black (measured: RGB 0,0,0
+  // at alpha 140) arrived as solid black. The model then keeps it, which is where the black
+  // smear under a cutout came from. White is also what the rest of the pipeline assumes: the
+  // padded-retry canvas below already fills white, and both ink measures treat near-white as
+  // background, so a flattened shadow reads as the light grey it actually is.
+  c2d.fillStyle = '#fff';
+  c2d.fillRect(0, 0, width, height);
   c2d.drawImage(bitmap, 0, 0, width, height);
   return canvas;
 }
@@ -180,6 +193,8 @@ async function remove(req: WorkerRemoveRequest): Promise<void> {
   // the original by, and the pristine RGB every attempt below starts from.
   const basePixels = base2d.getImageData(0, 0, outW, outH);
   const originalInk = measureInkFootprint(basePixels);
+  // Labelled once from the pristine original; every attempt below measures against this map.
+  const inkMap = labelInkComponents(basePixels);
 
   const infer = async (img: RawImage, w: number, h: number): Promise<RawImage> => {
     const { pixel_values } = await processor(img);
@@ -196,6 +211,7 @@ async function remove(req: WorkerRemoveRequest): Promise<void> {
     regionReport: RegionReport[];
     bands: DetectedBand[];
     residueFraction: number;
+    originalComponents: OriginalComponentReport[];
   }
 
   /**
@@ -280,6 +296,11 @@ async function remove(req: WorkerRemoveRequest): Promise<void> {
       refineAlpha(pixels, outW, outH, { modelId: req.modelId, mode: req.refineMode });
     }
 
+    // Survival is measured HERE — post-refine, pre-filter — and nowhere later: the product-only
+    // filter is about to delete panels on purpose, and those deletions are already evidenced in
+    // the region report. Only what the MODEL erased should read as a lost element.
+    const originalComponents = measureComponentSurvival(inkMap, pixels);
+
     // Runs after refinement, before the bbox: dropping a panel has to shrink the bounds too, or
     // tile fit keeps scaling the product down to leave room for something that is no longer there.
     let removedRegions = 0;
@@ -320,7 +341,7 @@ async function remove(req: WorkerRemoveRequest): Promise<void> {
     // Ghosted overlay graphics live below the alpha threshold where nothing else can see them.
     const residueFraction = measureFaintResidue(pixels, bounds);
 
-    return { pixels, bounds, removedRegions, regionReport, bands, residueFraction };
+    return { pixels, bounds, removedRegions, regionReport, bands, residueFraction, originalComponents };
   };
 
   /**
@@ -381,6 +402,7 @@ async function remove(req: WorkerRemoveRequest): Promise<void> {
     regionReport: result.regionReport,
     residueFraction: result.residueFraction,
     originalInk,
+    originalComponents: result.originalComponents,
     bands: result.bands,
     width: outW,
     height: outH,

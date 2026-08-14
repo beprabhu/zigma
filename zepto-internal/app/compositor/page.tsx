@@ -28,7 +28,7 @@ import { CsvDropzone, CsvFileTile } from '@/components/csv-dropzone';
 import { SessionHeader, type SessionChip } from '@/components/session-header';
 import { TileGrid, TileDialog } from '@/components/tile-grid';
 import { ClearAllButton, SelectionBar, useGridSelection } from '@/components/selection';
-import { Canvas, LeftPanel, PanelSection, RightPanel, StudioShell } from '@/components/pane-layout';
+import { Canvas, CanvasToolbar, LeftPanel, PanelSection, RightPanel, StudioShell } from '@/components/pane-layout';
 import { useProcessing } from '@/components/process-panel';
 import { BudgetControls } from '@/components/budget-controls';
 import { MdFileIcon, MdFileTile } from '@/components/md-file-tile';
@@ -819,8 +819,8 @@ export default function Compositor() {
               </Empty>
             ) : (
               <>
-                {/* Grid toolbar: count on the left, whole-run reset on the right. */}
-                <div className="mb-2 flex items-center justify-between gap-2">
+                  {/* Grid toolbar: count on the left, whole-run reset on the right. */}
+                <CanvasToolbar className="justify-between">
                   <span className="text-xs text-muted-foreground">
                     {sel.active
                       ? `${sel.checked.size} of ${items.length} selected`
@@ -839,7 +839,7 @@ export default function Compositor() {
                       </>
                     }
                   />
-                </div>
+                </CanvasToolbar>
                 <TileGrid
                   items={items}
                   template={template}

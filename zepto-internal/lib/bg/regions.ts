@@ -71,6 +71,14 @@ export interface RegionReport {
   /** Analysis-only runs (Product only OFF): the classifier would drop this region, but nothing
    *  was deleted. Quality triage flags these; the dialog table shows "kept · graphic?". */
   flagged?: boolean;
+  /**
+   * The classifier condemned this region as artwork and the protected-companion guard spared
+   * it anyway (non-edge and at least a quarter of the anchor). Distinct from `flagged`: that
+   * one means "the filter was off and would have dropped this", while this means "the filter
+   * was ON and deliberately did not". Both need a human, for opposite reasons — this one is
+   * how a kept marketing banner announces itself.
+   */
+  guarded?: boolean;
 }
 
 export interface ProductFilterResult {
@@ -517,6 +525,8 @@ export function keepProductRegions(
   const dropFlags = new Array<boolean>(measure.length).fill(false);
   // Which drops were size-only verdicts — the only ones the bridge rescue may reconsider.
   const speckFlags = new Array<boolean>(measure.length).fill(false);
+  // Which regions measured as artwork but were spared by the protected-companion guard.
+  const guardedFlags = new Array<boolean>(measure.length).fill(false);
   for (let i = 0; i < measure.length; i++) {
     const m = measure[i];
     const { acc, fillRatio, grad, coverage, colors } = m;
@@ -564,6 +574,13 @@ export function keepProductRegions(
     const protectedCompanion =
       !isAnchor && !acc.edge && acc.area >= anchor.acc.area * PROTECTED_COMPANION_FRACTION;
     dropFlags[i] = !isAnchor && !protectedCompanion && (graphic || speck);
+    // The veto is right and the silence was wrong. When the guard saves a region the palette
+    // evidence had condemned, that disagreement is the most informative thing the pass knows
+    // about the image — and it was being discarded, so a kept marketing banner (measured 99%
+    // palette / 12 colours / fill 1.00, a third of the anchor, floating clear of the frame)
+    // came out of the filter indistinguishable from product. Recorded here so triage can say
+    // "this looks like artwork and was deliberately spared"; nothing about the drop changes.
+    guardedFlags[i] = !isAnchor && protectedCompanion && graphic;
     // A speck that ALSO measured graphic is still rescue-eligible: at speck size the palette
     // statistics rest on a handful of stride samples, too little to condemn on.
     speckFlags[i] = !isAnchor && speck;
@@ -717,6 +734,7 @@ export function keepProductRegions(
       touchesEdge: acc.edge,
       dominantBin,
       removed: dropFlags[i],
+      ...(guardedFlags[i] ? { guarded: true as const } : null),
     });
   }
 
@@ -797,6 +815,286 @@ export function measureInkFootprint(pixels: ImageData): InkFootprint {
   }
   if (maxX < 0) return { bbox: 0, ink: 0 };
   return { bbox: ((maxX - minX + 1) * (maxY - minY + 1)) / n, ink: ink / n };
+}
+
+/** One connected piece of the ORIGINAL's ink, with how much of it survived the matte. */
+export interface OriginalComponentReport {
+  /** Bounding box in the measured coordinate space (the original's, possibly downscaled). */
+  bounds: SubjectBounds;
+  /** The component's ink pixels as a share of the whole canvas (not of its bbox). */
+  areaFraction: number;
+  /** Share of this component's ink the PRE-filter matte kept (alpha > threshold). */
+  survival: number;
+  /**
+   * How many distinct frame edges (0-4) the component touches. A COUNT, not a boolean, because
+   * the two things that touch edges are opposites: a full-bleed background spans the frame
+   * (2-4 edges) while a composited banner merely reaches one — and a vanished banner is
+   * exactly what this measurement exists to catch. The distinction stays a quality.ts knob.
+   */
+  edgeContact: number;
+  /** Mean chroma (max−min channel, 0-255) over the component's ORIGINAL pixels. A detached
+   *  drop shadow is neutral (~0); a navy badge is saturated. */
+  chroma: number;
+  /** Mean local luma gradient (0-255, strided sample) over the ORIGINAL pixels. A shadow is
+   *  smooth; printed artwork and photography are not. Same measure as RegionReport.flatness. */
+  flatness: number;
+  /**
+   * How many interior texture samples `flatness` rests on. 0 means UNMEASURED, not smooth —
+   * a component thinner than the sample stride collects none. Without this the two are
+   * indistinguishable and every thin neutral element (a hairline rule, a clear glass's
+   * outline — the "one glass of six" case this whole measurement exists for) reads as a
+   * perfectly smooth shadow and gets suppressed. The region classifier already refuses to
+   * act on unmeasured texture for the same reason; this is that guard's data.
+   */
+  gradSamples: number;
+  /**
+   * Mean chroma of the pixels this component LOST — the ones the matte dropped. The scalar
+   * survival says how much went; this says what kind of thing went. A grounded product's
+   * fused cast shadow and a mirror reflection are neutral (~0-15); an eaten strip of printed
+   * packaging is not. 0 when the component lost nothing.
+   */
+  lostChroma: number;
+  /**
+   * Where the lost ink sat relative to the kept ink, as a fraction of canvas height:
+   * (lost centroid y − kept centroid y) / height. Positive means the loss was BELOW what
+   * survived, which is where shadows and reflections live. 0 when nothing was lost or
+   * nothing survived.
+   */
+  lostBelow: number;
+  /**
+   * Mean local luma gradient over the pixels this component LOST — how textured the removed
+   * material was. The whole-component `flatness` cannot answer this: it averages the product's
+   * own surface in with the background. A studio backdrop is smooth whatever its tint (a pair
+   * of gym gloves on grey seamless measured chroma 1 and a near-flat field), while a wooden
+   * floor, a tiled cloth or a printed pattern carries real texture. 0 when nothing was lost.
+   */
+  lostFlatness: number;
+  /** How many interior samples `lostFlatness` rests on. 0 means UNMEASURED, not smooth. */
+  lostGradSamples: number;
+}
+
+/** Labelled ink components of one original — built once, measured against every attempt. */
+export interface InkComponentMap {
+  width: number;
+  height: number;
+  /** Per-pixel component id; 0 = background/no ink. Ids are 1-based indices into components+1. */
+  labels: Int32Array;
+  /**
+   * Per-pixel chroma of the ORIGINAL, kept for ink pixels only. Held here rather than read
+   * back off the matte because on the server path the matte's RGB is dead under alpha 0 —
+   * the browser's premultiplied canvas zeroes it — and the lost pixels are exactly the ones
+   * at alpha 0. The original is the only side that still remembers their colour.
+   */
+  chroma: Uint8Array;
+  /** Per-pixel luma of the ORIGINAL, ink pixels only — same reason as `chroma`: the matte's
+   *  RGB is dead under alpha 0 on the server path, which is exactly where lost pixels are. */
+  luma: Uint8Array;
+  /** Indexed by (label - 1). edges is a bitmask: 1 left, 2 top, 4 right, 8 bottom. */
+  components: {
+    x0: number; y0: number; x1: number; y1: number;
+    area: number; edges: number; chromaSum: number; gradSum: number; gradSamples: number;
+  }[];
+}
+
+/**
+ * Connected-components the ORIGINAL's ink (same definition as measureInkFootprint: visible and
+ * not near-white), so survival can be asked per OBJECT instead of per canvas. The coverage-
+ * collapse check compares bounding boxes and therefore only notices when most of the picture is
+ * gone; the Ezee incident — a navy badge and banner erased inside the matte while the product
+ * kept the frame's full extent — moved the bbox ratio not at all. Each composited element is its
+ * own ink island on a catalogue field, and an island's survival is measurable exactly.
+ *
+ * Built from the original alone, ONCE per image, then measured against each matte attempt —
+ * the labelling is the expensive half and it never changes between attempts.
+ */
+export function labelInkComponents(pixels: ImageData): InkComponentMap {
+  const { width: w, height: h, data } = pixels;
+  const n = w * h;
+  const labels = new Int32Array(n);
+  const chroma = new Uint8Array(n);
+  const luma = new Uint8Array(n);
+  const components: InkComponentMap['components'] = [];
+  if (!n) return { width: w, height: h, labels, chroma, luma, components };
+
+  // Ink mask first: the flood below then never re-tests colour, only this byte.
+  const ink = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    const p = i * 4;
+    if (data[p + 3] < 32) continue; // transparent = background
+    if (data[p] > 240 && data[p + 1] > 240 && data[p + 2] > 240) continue; // near-white
+    ink[i] = 1;
+    const r = data[p], g = data[p + 1], b = data[p + 2];
+    const hi = r > g ? (r > b ? r : b) : g > b ? g : b;
+    const lo = r < g ? (r < b ? r : b) : g < b ? g : b;
+    chroma[i] = hi - lo;
+    luma[i] = (r * 0.299 + g * 0.587 + b * 0.114) | 0;
+  }
+
+  const stack = new Int32Array(n);
+  for (let start = 0; start < n; start++) {
+    if (!ink[start] || labels[start]) continue;
+    const id = components.length + 1;
+    let top = 0;
+    stack[top++] = start;
+    labels[start] = id;
+    let x0 = w, y0 = h, x1 = -1, y1 = -1, area = 0, edges = 0, chromaSum = 0;
+    while (top > 0) {
+      const i = stack[--top];
+      const x = i % w;
+      const y = (i / w) | 0;
+      area++;
+      if (x < x0) x0 = x;
+      if (x > x1) x1 = x;
+      if (y < y0) y0 = y;
+      if (y > y1) y1 = y;
+      if (x === 0) edges |= 1;
+      if (y === 0) edges |= 2;
+      if (x === w - 1) edges |= 4;
+      if (y === h - 1) edges |= 8;
+      chromaSum += chroma[i];
+      // 4-connectivity, matching the region pass — a diagonal-only "bridge" between two
+      // composited elements is JPEG ringing, not a join.
+      if (x > 0 && ink[i - 1] && !labels[i - 1]) { labels[i - 1] = id; stack[top++] = i - 1; }
+      if (x < w - 1 && ink[i + 1] && !labels[i + 1]) { labels[i + 1] = id; stack[top++] = i + 1; }
+      if (y > 0 && ink[i - w] && !labels[i - w]) { labels[i - w] = id; stack[top++] = i - w; }
+      if (y < h - 1 && ink[i + w] && !labels[i + w]) { labels[i + w] = id; stack[top++] = i + w; }
+    }
+    components.push({ x0, y0, x1, y1, area, edges, chromaSum, gradSum: 0, gradSamples: 0 });
+  }
+
+  // Texture pass, strided like the region classifier's: a detached drop shadow that the model
+  // correctly deletes must be tellable apart from a deleted badge, and the tell is the original
+  // pixels — a shadow is neutral AND smooth, artwork is saturated or textured. Chroma came free
+  // in the flood above; the gradient needs neighbours, so it samples here.
+  //
+  // INTERIOR samples only — all three points must carry the same label. A sample straddling
+  // the component's boundary measures the jump into the background, and for a small component
+  // the perimeter dominates the mean: a perfectly smooth shadow measured ~19 with boundary
+  // samples counted (fixture-verified) and 0 without, so the boundary would have defeated the
+  // suppression gate for exactly the components it exists to suppress.
+  for (let y = 0; y < h - TEXTURE_STRIDE; y += TEXTURE_STRIDE) {
+    for (let x = 0; x < w - TEXTURE_STRIDE; x += TEXTURE_STRIDE) {
+      const i = y * w + x;
+      const id = labels[i];
+      if (!id || labels[i + TEXTURE_STRIDE] !== id || labels[i + w * TEXTURE_STRIDE] !== id) {
+        continue;
+      }
+      const p = i * 4;
+      const lum = data[p] * 0.299 + data[p + 1] * 0.587 + data[p + 2] * 0.114;
+      const pr = (i + TEXTURE_STRIDE) * 4;
+      const pd = (i + w * TEXTURE_STRIDE) * 4;
+      const lumR = data[pr] * 0.299 + data[pr + 1] * 0.587 + data[pr + 2] * 0.114;
+      const lumD = data[pd] * 0.299 + data[pd + 1] * 0.587 + data[pd + 2] * 0.114;
+      const c = components[id - 1];
+      c.gradSum += Math.abs(lum - lumR) + Math.abs(lum - lumD);
+      c.gradSamples++;
+    }
+  }
+  return { width: w, height: h, labels, chroma, luma, components };
+}
+
+/** Number of set bits in the 4-bit edge mask. */
+function edgeCount(mask: number): number {
+  return (mask & 1) + ((mask >> 1) & 1) + ((mask >> 2) & 1) + ((mask >> 3) & 1);
+}
+
+/** Floor under which an original component is JPEG noise, not an element worth tracking. */
+const COMPONENT_MIN_AREA_FRACTION = 0.002;
+/** Report cap: past this many elements the original is a collage and per-element evidence
+ *  stops being readable — keep the largest, which are the ones a verdict would ever cite. */
+const COMPONENT_MAX_REPORTED = 24;
+
+/**
+ * How much of each original component the matte kept. MUST be measured against the PRE-filter
+ * matte (the alpha as the model produced it, before detectBands/keepProductRegions delete
+ * panels): the product-only filter removes badges DELIBERATELY and evidences them in the region
+ * report, so a post-filter measurement would re-report every correct panel drop as a vanished
+ * element. Measured pre-filter, a low survival can only mean the MODEL itself erased content —
+ * the one event that previously left no evidence on either side.
+ */
+export function measureComponentSurvival(
+  map: InkComponentMap,
+  matte: ImageData,
+  alphaThreshold = 128,
+): OriginalComponentReport[] {
+  const { width: w, height: h, labels, chroma, luma, components } = map;
+  if (matte.width !== w || matte.height !== h || !components.length) return [];
+  const count = components.length;
+  const survived = new Int32Array(count);
+  // Lost-pixel accumulators. The survival scalar says how MUCH a component lost; these say
+  // what KIND of thing it lost, which is the difference between a correctly-dropped cast
+  // shadow and a strip of eaten packaging. Neither is inferable from survival alone.
+  const lostChromaSum = new Float64Array(count);
+  const lostCount = new Int32Array(count);
+  const lostYSum = new Float64Array(count);
+  const keptYSum = new Float64Array(count);
+  const data = matte.data;
+  const n = w * h;
+  for (let i = 0; i < n; i++) {
+    const id = labels[i];
+    if (!id) continue;
+    const k = id - 1;
+    const y = (i / w) | 0;
+    if (data[i * 4 + 3] > alphaThreshold) {
+      survived[k]++;
+      keptYSum[k] += y;
+    } else {
+      lostCount[k]++;
+      lostChromaSum[k] += chroma[i];
+      lostYSum[k] += y;
+    }
+  }
+  // Texture of what was LOST, strided and interior-only like the whole-component pass: all
+  // three sample points must belong to the same component AND all be lost, so the measure
+  // never straddles the boundary between kept product and removed background — that jump is
+  // the biggest gradient in the image and would make every smooth backdrop look textured.
+  const lostGradSum = new Float64Array(count);
+  const lostGradSamples = new Int32Array(count);
+  const isLost = (i: number) => data[i * 4 + 3] <= alphaThreshold;
+  for (let y = 0; y < h - TEXTURE_STRIDE; y += TEXTURE_STRIDE) {
+    for (let x = 0; x < w - TEXTURE_STRIDE; x += TEXTURE_STRIDE) {
+      const i = y * w + x;
+      const id = labels[i];
+      if (!id) continue;
+      const right = i + TEXTURE_STRIDE;
+      const down = i + w * TEXTURE_STRIDE;
+      if (labels[right] !== id || labels[down] !== id) continue;
+      if (!isLost(i) || !isLost(right) || !isLost(down)) continue;
+      const k = id - 1;
+      lostGradSum[k] += Math.abs(luma[i] - luma[right]) + Math.abs(luma[i] - luma[down]);
+      lostGradSamples[k]++;
+    }
+  }
+
+  const canvas = n || 1;
+  // Rounded HERE, not at save time: every threshold that reads these is a plain <= / <
+  // against a value expressible at this precision, so a component measured at 0.5496 live
+  // and reloaded as 0.550 would land on the other side of the erosion ceiling — the same
+  // image judged differently before and after a save. Quantising at the source makes the
+  // live numbers and the persisted ones the same numbers by construction.
+  const r3 = (v: number) => Math.round(v * 1000) / 1000;
+  const r1 = (v: number) => Math.round(v * 10) / 10;
+  return components
+    .map((c, i) => {
+      const lost = lostCount[i];
+      const kept = survived[i];
+      return {
+        bounds: { x: c.x0, y: c.y0, w: c.x1 - c.x0 + 1, h: c.y1 - c.y0 + 1 },
+        areaFraction: Math.round((c.area / canvas) * 1e4) / 1e4,
+        survival: c.area ? r3(kept / c.area) : 0,
+        edgeContact: edgeCount(c.edges),
+        chroma: c.area ? r1(c.chromaSum / c.area) : 0,
+        flatness: c.gradSamples ? r1(c.gradSum / (2 * c.gradSamples)) : 0,
+        gradSamples: c.gradSamples,
+        lostChroma: lost ? r1(lostChromaSum[i] / lost) : 0,
+        lostBelow: lost && kept ? r3((lostYSum[i] / lost - keptYSum[i] / kept) / h) : 0,
+        lostFlatness: lostGradSamples[i] ? r1(lostGradSum[i] / (2 * lostGradSamples[i])) : 0,
+        lostGradSamples: lostGradSamples[i],
+      };
+    })
+    .filter((c) => c.areaFraction >= COMPONENT_MIN_AREA_FRACTION)
+    .sort((a, b) => b.areaFraction - a.areaFraction)
+    .slice(0, COMPONENT_MAX_REPORTED);
 }
 
 export function measureFaintResidue(

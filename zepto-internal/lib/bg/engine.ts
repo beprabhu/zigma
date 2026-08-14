@@ -10,7 +10,8 @@ import type { PreTrainedModel, Processor, RawImage, Tensor } from '@huggingface/
 
 import { refineAlpha, type RefineMode } from './refine';
 import {
-  analyzeRegions, keepProductRegions, measureInkFootprint, type InkFootprint, type RegionReport,
+  analyzeRegions, keepProductRegions, labelInkComponents, measureComponentSurvival,
+  measureInkFootprint, type InkFootprint, type OriginalComponentReport, type RegionReport,
 } from './regions';
 import { PAD_FRACTION } from './constants';
 import { subjectBounds } from './safe-area';
@@ -160,9 +161,56 @@ export interface RemoveResult {
   regionReport: RegionReport[];
   /** The original's content footprint, from before the matte — see regions.measureInkFootprint. */
   originalInk: InkFootprint;
+  /** Per-element survival of the original's ink islands against the PRE-filter matte. */
+  originalComponents: OriginalComponentReport[];
 }
 
 export type BgSource = Blob | HTMLImageElement | HTMLCanvasElement | ImageBitmap;
+
+/**
+ * Edge cap for the main-thread survival measurement. The worker measures at the pooled
+ * MAX_EDGE cap off the main thread; the two engine paths run UNCAPPED on the main thread,
+ * where a 4000px original would cost a ~64 MB label map and a visible jank. Survival and area
+ * are fractions — scale-robust — so the measurement runs at a bounded edge and only the bounds
+ * are mapped back to the full-resolution space everything else reports in.
+ */
+const COMPONENT_MEASURE_EDGE = 1024;
+
+/** ImageData downscaled by `scale` (1 = the data itself, untouched). */
+function scaleImageData(pixels: ImageData, scale: number): ImageData {
+  if (scale >= 1) return pixels;
+  const src = document.createElement('canvas');
+  src.width = pixels.width;
+  src.height = pixels.height;
+  src.getContext('2d')!.putImageData(pixels, 0, 0);
+  const w = Math.max(1, Math.round(pixels.width * scale));
+  const h = Math.max(1, Math.round(pixels.height * scale));
+  const dst = document.createElement('canvas');
+  dst.width = w;
+  dst.height = h;
+  const c2d = dst.getContext('2d')!;
+  c2d.imageSmoothingEnabled = true;
+  c2d.drawImage(src, 0, 0, w, h);
+  return c2d.getImageData(0, 0, w, h);
+}
+
+/** Component bounds mapped from the measurement space back to full resolution. */
+function unscaleComponents(
+  reports: OriginalComponentReport[],
+  scale: number,
+): OriginalComponentReport[] {
+  if (scale >= 1) return reports;
+  const f = 1 / scale;
+  return reports.map((r) => ({
+    ...r,
+    bounds: {
+      x: Math.round(r.bounds.x * f),
+      y: Math.round(r.bounds.y * f),
+      w: Math.round(r.bounds.w * f),
+      h: Math.round(r.bounds.h * f),
+    },
+  }));
+}
 
 interface LoadedModel {
   spec: BgModelSpec;
@@ -310,7 +358,13 @@ async function toCanvas(source: BgSource): Promise<HTMLCanvasElement> {
   const canvas = document.createElement('canvas');
   canvas.width = width;
   canvas.height = height;
-  canvas.getContext('2d')!.drawImage(drawable, 0, 0);
+  const c2d = canvas.getContext('2d')!;
+  // Same reason as the worker's drawToCanvas: a fresh canvas is transparent BLACK and the
+  // model is handed RGB with alpha dropped, so a transparent PNG would be inferred as a
+  // product on a black field and any baked semi-transparent shadow as solid black.
+  c2d.fillStyle = '#fff';
+  c2d.fillRect(0, 0, width, height);
+  c2d.drawImage(drawable, 0, 0);
   if (source instanceof ImageBitmap || source instanceof Blob) {
     (drawable as ImageBitmap).close?.();
   }
@@ -351,9 +405,10 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
   if (spec.server) {
     // Measured from the SOURCE: the server hands back an already-matted RGBA, and by then the
     // question "what did the original cover?" is unanswerable from anything it returns.
-    const originalInk = measureInkFootprint(
-      sourceCanvas.getContext('2d')!.getImageData(0, 0, width, height),
-    );
+    const sourcePixels = sourceCanvas.getContext('2d')!.getImageData(0, 0, width, height);
+    const originalInk = measureInkFootprint(sourcePixels);
+    const measureScale = Math.min(1, COMPONENT_MEASURE_EDGE / Math.max(width, height));
+    const inkMap = labelInkComponents(scaleImageData(sourcePixels, measureScale));
     const blob = await canvasToBlob(sourceCanvas);
     const res = await fetch('/api/remove-hq', { method: 'POST', body: blob, signal });
     if (!res.ok) {
@@ -368,6 +423,16 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
       opts.onStage?.('refining');
       refineAlpha(pixels, outCanvas.width, outCanvas.height, { modelId: id, mode: refineMode });
     }
+    // Pre-filter, like the worker: what the SERVER MODEL erased, before deliberate panel
+    // drops muddy the question. Guarded on dimensions — the sidecar may return a resized
+    // frame, and survival against a mismatched label map would be garbage, not evidence.
+    const originalComponents =
+      outCanvas.width === width && outCanvas.height === height
+        ? unscaleComponents(
+            measureComponentSurvival(inkMap, scaleImageData(pixels, measureScale)),
+            measureScale,
+          )
+        : [];
     // After refinement, before anything reads the matte: dropping a panel must shrink the
     // bounds too, or tile fit keeps reserving room for something that is no longer there.
     const filtered = productOnly ? keepProductRegions(pixels) : null;
@@ -386,6 +451,7 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
       removedRegions,
       regionReport,
       originalInk,
+      originalComponents,
     };
   }
 
@@ -398,6 +464,10 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
   // the original by, and the pristine RGB every attempt below starts from.
   const basePixels = baseCanvas.getContext('2d')!.getImageData(0, 0, outW, outH);
   const originalInk = measureInkFootprint(basePixels);
+  // Labelled once from the pristine original; every attempt below measures against this map.
+  // Downscaled: this path runs uncapped on the main thread (see COMPONENT_MEASURE_EDGE).
+  const measureScale = Math.min(1, COMPONENT_MEASURE_EDGE / Math.max(outW, outH));
+  const inkMap = labelInkComponents(scaleImageData(basePixels, measureScale));
 
   const infer = async (img: RawImage, w: number, h: number): Promise<RawImage> => {
     const { pixel_values } = await processor!(img);
@@ -413,6 +483,7 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
     pixels: ImageData;
     removedRegions: number;
     regionReport: RegionReport[];
+    originalComponents: OriginalComponentReport[];
   }
 
   /**
@@ -512,11 +583,18 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
       throwIfAborted(signal);
       refineAlpha(pixels, outW, outH, { modelId: id, mode: refineMode });
     }
+    // Post-refine, pre-filter — same contract as the worker: only model-erased content may
+    // read as a lost element, never a deliberate panel drop.
+    const originalComponents = unscaleComponents(
+      measureComponentSurvival(inkMap, scaleImageData(pixels, measureScale)),
+      measureScale,
+    );
     const browserFiltered = productOnly ? keepProductRegions(pixels) : null;
     return {
       pixels,
       removedRegions: browserFiltered?.removed ?? 0,
       regionReport: browserFiltered ? browserFiltered.regions : analyzeRegions(pixels),
+      originalComponents,
     };
   };
 
@@ -580,6 +658,7 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
     backend,
     removedRegions: result.removedRegions,
     regionReport: result.regionReport,
+    originalComponents: result.originalComponents,
   };
 }
 

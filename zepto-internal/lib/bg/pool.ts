@@ -18,7 +18,7 @@ import {
 } from './engine';
 import type { RefineMode } from './refine';
 import type { SubjectBounds } from './safe-area';
-import type { InkFootprint, RegionReport } from './regions';
+import type { InkFootprint, OriginalComponentReport, RegionReport } from './regions';
 import type { DetectedBand } from './bands';
 import type { WorkerRequest, WorkerResponse } from './bg.worker';
 import { MAX_EDGE } from './constants';
@@ -40,6 +40,8 @@ export interface PoolCutout {
   residueFraction: number;
   /** The original's content footprint, from before the matte — see regions.measureInkFootprint. */
   originalInk: InkFootprint;
+  /** Per-element survival of the original's ink islands against the PRE-filter matte. */
+  originalComponents: OriginalComponentReport[];
   /** Flat edge strips masked from the source. */
   bands: DetectedBand[];
   width: number;
@@ -168,6 +170,7 @@ function handleMessage(slot: Slot, msg: WorkerResponse) {
         regionReport: msg.regionReport,
         residueFraction: msg.residueFraction,
         originalInk: msg.originalInk,
+        originalComponents: msg.originalComponents,
         bands: msg.bands,
         width: msg.width,
         height: msg.height,

@@ -1,8 +1,8 @@
-// Image Generator: turning one CSV row + one Markdown brief into one Azure prompt.
+// Image Generator: the queue item a CSV row becomes, and the naming around it.
 //
-// The whole product hangs off buildRowPrompt. It is pure and has no DOM or network in it, so
-// the assembly rule can be reasoned about (and shown to the user verbatim) without running a
-// batch — a prompt you cannot inspect is a prompt you cannot debug.
+// The prompt rule itself lives in lib/row-prompt.ts — Cleanup sends row context with its
+// AI-edit prompt the same way, and one assembly rule for both is what keeps the two previews
+// honest about each other.
 
 import type { CsvRecord } from './csv';
 
@@ -30,46 +30,6 @@ export interface GenItem {
    */
   prev?: { image: HTMLImageElement; sentPrompt?: string; durationMs?: number };
 }
-
-/** Separates the brief from the row block. Visible in the preview, so it is part of the API. */
-const ROW_HEADING = 'Generate an image for this row:';
-
-/**
- * brief + the row's cells, each labelled with its column header.
- *
- * Column names are sent, not just values: "subject: a diya lamp" carries intent that a bare
- * "a diya lamp" loses, and the header is the only place that intent is written down. Blank
- * cells are dropped rather than sent as `use:` with nothing after it, which reads to the model
- * as an instruction to leave that aspect empty.
- */
-export function buildRowPrompt(
-  brief: string,
-  headers: string[],
-  record: CsvRecord,
-  excluded: ReadonlySet<string> = new Set(),
-): string {
-  const rowBlock = headers
-    .filter((header) => !excluded.has(header))
-    .map((header) => [header, (record[header] ?? '').trim()] as const)
-    .filter(([, value]) => value.length > 0)
-    .map(([header, value]) => `${header}: ${value}`)
-    .join('\n');
-
-  const parts: string[] = [];
-  const trimmedBrief = brief.trim();
-  if (trimmedBrief) parts.push(trimmedBrief);
-  if (rowBlock) parts.push(`---\n${ROW_HEADING}\n${rowBlock}`);
-  return parts.join('\n\n');
-}
-
-/** Rows with nothing to say produce nothing to send — caught before a request is spent. */
-export function isPromptEmpty(prompt: string): boolean {
-  return prompt.trim().length === 0;
-}
-
-// Azure rejects oversized prompts outright; warn well before that so a long brief is caught
-// while it is still editable rather than N failed requests later.
-export const PROMPT_WARN_CHARS = 30_000;
 
 export function createGenItems(
   records: CsvRecord[],

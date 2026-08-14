@@ -151,6 +151,40 @@ export function PanelSection({
   );
 }
 
+/**
+ * The grid's toolbar row — filters, counts, Clear all — pinned to the canvas's top edge.
+ *
+ * It scrolled away with the grid before, which on a 8,000-image queue meant the filter you set
+ * two screens ago was unreachable without scrolling back to the top, and the count line (the one
+ * thing that says how much of the queue you are looking at) was visible only while looking at
+ * the part that needs it least. Frosted rather than opaque: the tiles stay legible as they pass
+ * under it, so the bar reads as a layer over the canvas instead of a lid on it.
+ *
+ * The negative margins undo Canvas's own p-4 so the bar spans the full width and covers the
+ * padding above it — without them, cells scroll through a 16px gap on either side of it.
+ */
+export function CanvasToolbar({
+  children,
+  className,
+}: {
+  children: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <div
+      className={cn(
+        // -top-4 pairs with -mt-4: sticky pins the MARGIN box, so with top-0 a negative margin
+        // parks the bar 16px down and cells scroll through the strip above it.
+        'sticky -top-4 z-20 -mx-4 -mt-4 mb-3 flex flex-wrap items-center justify-between gap-x-3 gap-y-2',
+        'border-b border-border/60 bg-background/70 px-4 pt-4 pb-3 backdrop-blur-md',
+        className,
+      )}
+    >
+      {children}
+    </div>
+  );
+}
+
 export function LeftPanel(props: PanelProps) {
   return <Panel side="left" {...props} className={cn('lg:w-[320px] lg:shrink-0', props.className)} />;
 }
