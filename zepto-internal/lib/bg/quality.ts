@@ -89,6 +89,9 @@ const REMOVED_SUBSTANTIAL_ANCHOR_FRACTION = 0.12;
  */
 const COLLAPSE_MAX_RATIO = 0.35;
 const COLLAPSE_MIN_ORIGINAL_BBOX = 0.2;
+/** Above this ink share the original is a full-bleed scene, not a figure on white, and its
+ *  footprint no longer says where the product was. */
+const COLLAPSE_MAX_ORIGINAL_INK = 0.85;
 /** Faint out-of-bbox coverage (measureFaintResidue) above this share of the canvas reads as
  *  ghosted overlay graphics or a stray soft shadow. Kept high on purpose: matte edges always
  *  bleed a little, and a flag that fires on every soft-edged cutout teaches people to ignore it. */
@@ -122,8 +125,13 @@ export function assessQuality(item: BgItem): QualityAssessment {
     (bounds.y <= EDGE_SLACK ? 1 : 0) +
     (bounds.x + bounds.w >= width - EDGE_SLACK ? 1 : 0) +
     (bounds.y + bounds.h >= height - EDGE_SLACK ? 1 : 0);
-  if (flushEdges > 0 && bboxFraction >= TINY_SUBJECT_FRACTION) {
-    reasons.push('Subject is flush with the frame edge — likely cropped mid-product');
+  // Two edges or more: a subject flush against a SINGLE edge is ordinary framing in this
+  // catalogue (a pouch matted to the top of its frame, a bottle grounded on the bottom) and
+  // fired on 44% of a golden-set run — while a subject pinned against two or more edges really
+  // is overflowing its frame. Measured: half the flush flags were single-edge, and every one
+  // inspected was benign.
+  if (flushEdges >= 2 && bboxFraction >= TINY_SUBJECT_FRACTION) {
+    reasons.push('Subject is flush with the frame edges — likely cropped mid-product');
   }
 
   // The one question no cutout-side check can answer: is most of the picture simply gone?
@@ -133,11 +141,24 @@ export function assessQuality(item: BgItem): QualityAssessment {
   // the ratio meaningless) and thresholded so a full-bleed lifestyle shot with a legitimately
   // small product does not fire it.
   if (item.originalInk && item.originalInk.bbox >= COLLAPSE_MIN_ORIGINAL_BBOX) {
-    const ratio = bboxFraction / item.originalInk.bbox;
-    if (ratio < COLLAPSE_MAX_RATIO) {
-      reasons.push(
-        'Cutout covers a fraction of what the original did — parts of the product may have vanished',
-      );
+    // Two gates, both learned from real false fires. A busy-background original (a lifestyle
+    // shot on a marble counter) has ink everywhere, so its footprint stops approximating
+    // "where the product was" — two perfect pourers measured 0.32 against it. And panels the
+    // product-only filter removed were part of the original's ink, so without subtracting them
+    // every big-badge shot reads as collapsed — the large-removed check already speaks for
+    // those pixels, and one deliberate flag beats two accidental ones.
+    const removedShare =
+      (item.regionReport ?? []).reduce((sum, r) => (r.removed ? sum + r.area : sum), 0) /
+      (item.cutout.width * item.cutout.height);
+    const expected = item.originalInk.bbox - removedShare;
+    const busyBackground = item.originalInk.ink > COLLAPSE_MAX_ORIGINAL_INK;
+    if (!busyBackground && expected >= COLLAPSE_MIN_ORIGINAL_BBOX) {
+      const ratio = bboxFraction / expected;
+      if (ratio < COLLAPSE_MAX_RATIO) {
+        reasons.push(
+          'Cutout covers a fraction of what the original did — parts of the product may have vanished',
+        );
+      }
     }
   }
 
