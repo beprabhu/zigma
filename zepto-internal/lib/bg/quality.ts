@@ -15,6 +15,7 @@
 // counts it, the predicate that hides tiles, and the button that acts on them.
 
 import type { BgItem } from './batch';
+import type { RegionReport } from './regions';
 
 export type QualityLevel = 'ok' | 'warn' | 'bad';
 
@@ -43,6 +44,26 @@ const EDGE_SLACK = 1;
  *  them means the matte kept a scene prop (a bowl of beans beside the drink) or a second
  *  product. Measured on a real miss: the prop was 3.5% of the canvas, far above any speck. */
 const SUBSTANTIAL_REGION_FRACTION = 0.01;
+/**
+ * Companion test, measured against the LARGEST kept region instead of the canvas. "Is this a
+ * separate object?" is a question about size relative to the product, and the canvas-relative
+ * bar above only answers it when the shot is tightly cropped. On a padded catalogue frame a
+ * genuine second object measures like noise: a vacuum's crevice tool came in around 1% of the
+ * canvas (borderline) and its brush head at 0.7% (invisible), while both are 15-20% of the
+ * vacuum — obviously separate objects to anyone looking. The coconut-water case is the same
+ * shape one size down: a detached coconut chunk at 0.16% of canvas, ~2% of the bottle.
+ *
+ * Sits five times above the region pass's own speck bar (minAreaFraction 0.001 of the largest
+ * region, lib/bg/regions.ts) so matte debris that survived filtering does not re-enter here as
+ * a "companion", and roughly half the coconut chunk's measured share so the bar is not resting
+ * on the exact case that motivated it. On a product covering a fifth of the frame the smallest
+ * thing that fires is about a 20x20px blob — big enough to name when you look at the tile.
+ *
+ * Both misses were measured off screenshots, not off a stored regionReport. If a real batch
+ * proves this noisy, raise it rather than adding a second condition — the canvas-relative bar
+ * beside it already covers the large-companion end.
+ */
+const COMPANION_MIN_ANCHOR_FRACTION = 0.005;
 /** Faint out-of-bbox coverage (measureFaintResidue) above this share of the canvas reads as
  *  ghosted overlay graphics or a stray soft shadow. Kept high on purpose: matte edges always
  *  bleed a little, and a flag that fires on every soft-edged cutout teaches people to ignore it. */
@@ -96,9 +117,21 @@ export function assessQuality(item: BgItem): QualityAssessment {
   // Two or more meaningfully-sized kept regions = the matte kept something besides the product:
   // a scene prop (bean bowl beside a drink) or a second item. An accessory set trips this too —
   // acceptable, the flag means "look", not "reject".
+  //
+  // Two views of "meaningfully-sized", because neither denominator catches both misses. Against
+  // the CANVAS, a prop in a tight crop is unmissable but a real accessory in a padded frame is
+  // not. Against the largest kept region, a small companion is unmissable but a genuinely huge
+  // second object can drag the comparison the other way when the two are close in size — that
+  // one the canvas view already has. Either signal firing is enough; the count reported is
+  // whichever view saw more, so the reason never undercounts what the user is about to look at.
   const substantial = kept.filter((r) => r.area / canvasArea >= SUBSTANTIAL_REGION_FRACTION);
-  if (substantial.length >= 2) {
-    reasons.push(`${substantial.length} separate objects kept — a scene prop may have survived the cutout`);
+  const anchor = kept.reduce<RegionReport | null>((max, r) => (!max || r.area > max.area ? r : max), null);
+  const companions = anchor
+    ? kept.filter((r) => r !== anchor && r.area >= anchor.area * COMPANION_MIN_ANCHOR_FRACTION)
+    : [];
+  if (substantial.length >= 2 || companions.length > 0) {
+    const objects = Math.max(substantial.length, companions.length + 1);
+    reasons.push(`${objects} separate objects kept — a scene prop or accessory may have survived the cutout`);
   }
 
   // Analysis-only runs (Product only OFF) mark would-drop regions instead of deleting them.

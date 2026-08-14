@@ -54,6 +54,7 @@ import {
   CompareDialog, CutoutImage, SourceImage, backdropStyle, statusLine,
 } from '@/components/bg-remover/bg-queue-list';
 import { ImageDropzone, type CsvPayload } from '@/components/bg-remover/image-dropzone';
+import { CsvFileTile } from '@/components/csv-dropzone';
 import { SafeAreaControls } from '@/components/bg-remover/safe-area-controls';
 import { TilePreview } from '@/components/bg-remover/tile-preview';
 import { VirtualGrid } from '@/components/bg-remover/virtual-grid';
@@ -234,6 +235,8 @@ interface CsvInfo {
   headers: string[];
   imageColumns: string[];
   nameColumn: string;
+  /** Optional: a session revived from before this field existed simply shows no row badge. */
+  rowCount?: number;
 }
 
 function itemFromAutosave(record: AutosaveRecord, id: number): BgItem {
@@ -384,7 +387,7 @@ export default function BgRemover() {
    * second copy of the column list that could disagree with the text it came from.
    */
   const csvInfoFromSheet = React.useCallback((sheet: ProjectCsv) => {
-    const { headers } = draftsFromCsv(sheet.text, {
+    const { headers, rowCount } = draftsFromCsv(sheet.text, {
       nameColumn: sheet.nameColumn || null,
       imageColumns: sheet.imageColumns,
     });
@@ -394,6 +397,7 @@ export default function BgRemover() {
       headers,
       imageColumns: sheet.imageColumns,
       nameColumn: sheet.nameColumn,
+      rowCount,
     };
   }, []);
 
@@ -1036,6 +1040,7 @@ export default function BgRemover() {
         headers: imported.headers,
         imageColumns: imported.imageColumns,
         nameColumn: imported.titleColumn,
+        rowCount: imported.rowCount,
       });
       replaceCsvItems(imported.drafts);
       if (!imported.drafts.length) {
@@ -1043,6 +1048,33 @@ export default function BgRemover() {
       }
     },
     [replaceCsvItems, seedSessionName],
+  );
+
+  /** The CSV tile's ✕ — drops the mapping AND the URL rows it imported. AI-edited rows have
+      moved to a file source and survive, same population rule replaceCsvItems lives by. */
+  const removeCsv = React.useCallback(() => {
+    replaceCsvItems([]);
+    setCsvInfo(null);
+  }, [replaceCsvItems]);
+
+  /** The CSV tile's body click — same parse-and-hand-over path as a drop on the ImageDropzone. */
+  const replaceCsv = React.useCallback(
+    async (file: File) => {
+      let text: string;
+      try {
+        text = await file.text();
+      } catch (e) {
+        toast.error(`Could not read ${file.name}: ${errorMessage(e)}`);
+        return;
+      }
+      const imported = draftsFromCsv(text);
+      if (!imported.headers.length) {
+        toast.error(`${file.name} does not look like a CSV.`);
+        return;
+      }
+      handleCsv({ fileName: file.name, text, imported });
+    },
+    [handleCsv],
   );
 
   function updateCsvMapping(next: { nameColumn?: string; imageColumns?: string[] }) {
@@ -1752,6 +1784,11 @@ export default function BgRemover() {
       dropPreview(it.id);
     }
     setItems([]);
+    // The whole-run reset takes the CSV mapping with it — a "cleared" queue that still showed
+    // a loaded sheet and its column pickers read as a bug, and the next run's images would
+    // inherit a mapping meant for rows that no longer exist. (Compose and Generate's clearAll
+    // already work this way.)
+    setCsvInfo(null);
     setSelectedId(null);
     setCompareId(null);
     gridSel.clear();
@@ -2063,8 +2100,34 @@ export default function BgRemover() {
         <ImageDropzone onAdd={handleAdd} onCsv={handleCsv} onProject={(file) => void handleProject(file)} itemCount={items.length} disabled={busy} />
     </PanelSection>
         {csvInfo && (
-          <PanelSection title={<>Columns — {csvInfo.fileName}</>}>
+          <PanelSection title="CSV">
           <div className="space-y-4">
+            {/* The loaded sheet as the suite's file card (same shape as the prompt tiles):
+                click to replace, ✕ to remove. Removal takes the imported URL rows with it —
+                cutouts among them included — so it confirms first. */}
+            <CsvFileTile
+              name={csvInfo.fileName}
+              description={csvInfo.headers.join(', ')}
+              badge={
+                csvInfo.rowCount !== undefined
+                  ? `${csvInfo.rowCount.toLocaleString()} row${csvInfo.rowCount === 1 ? '' : 's'}`
+                  : 'CSV'
+              }
+              onReplace={(file) => void replaceCsv(file)}
+              onRemove={removeCsv}
+              disabled={busy}
+              removeConfirm={{
+                title: 'Remove the CSV?',
+                description: (
+                  <>
+                    Removes the column mapping and every image imported from{' '}
+                    {csvInfo.fileName}, including finished cutouts that haven&rsquo;t been
+                    exported. Images added as files stay. Your CSV on disk is untouched — drop
+                    it again to rebuild the rows.
+                  </>
+                ),
+              }}
+            />
             <Field>
               <FieldLabel htmlFor="csv-name-col">
                 <Hint hint="Names the previews and exported files. Safe to change any time — finished rows are renamed in place and their cutouts are kept.">
@@ -2676,7 +2739,8 @@ export default function BgRemover() {
                           <>
                             Removes all {items.length.toLocaleString()} image
                             {items.length === 1 ? '' : 's'}, including finished cutouts that
-                            haven&rsquo;t been exported. Your source files on disk are untouched.
+                            haven&rsquo;t been exported{csvInfo ? ', and unloads the CSV' : ''}.
+                            Your source files on disk are untouched.
                           </>
                         }
                       />

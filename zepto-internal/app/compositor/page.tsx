@@ -24,7 +24,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 
 import { TemplateEditor } from '@/components/template-editor';
-import { CsvDropzone } from '@/components/csv-dropzone';
+import { CsvDropzone, CsvFileTile } from '@/components/csv-dropzone';
 import { SessionHeader, type SessionChip } from '@/components/session-header';
 import { TileGrid, TileDialog } from '@/components/tile-grid';
 import { ClearAllButton, SelectionBar, useGridSelection } from '@/components/selection';
@@ -694,11 +694,37 @@ export default function Compositor() {
               </TemplateEditor>
             </PanelSection>
           <PanelSection title="CSV file">
-              <CsvDropzone fileName={fileName} rowCount={records.length} onFile={handleFile} />
+              {/* Same slot convention as prompts: empty invites a drop, loaded shows the file
+                  card (click to replace, ✕ to remove). Removing IS clearing the run — every
+                  queue row came from this sheet — so it goes through clearAll's confirm copy. */}
+              {fileName ? (
+                <CsvFileTile
+                  name={fileName}
+                  description={headers.join(', ')}
+                  badge={`${records.length.toLocaleString()} row${records.length === 1 ? '' : 's'}`}
+                  onReplace={handleFile}
+                  onRemove={clearAll}
+                  disabled={running}
+                  removeConfirm={{
+                    title: 'Remove the CSV?',
+                    description: (
+                      <>
+                        Clears all {items.length} row{items.length === 1 ? '' : 's'}
+                        {doneCount > 0 && <> and the {doneCount} generated tile{doneCount === 1 ? '' : 's'} (not exported anywhere yet)</>}
+                        . Your CSV file on disk is untouched — drop it again to rebuild the queue.
+                      </>
+                    ),
+                  }}
+                />
+              ) : (
+                <CsvDropzone fileName={null} rowCount={0} onFile={handleFile} />
+              )}
             </PanelSection>
 
+          {/* The tile above carries the file name; repeating it in this title just made two
+              rows disagree about truncation. */}
           {headers.length > 0 && (
-            <PanelSection title={`Columns — ${fileName ?? ''}`}>
+            <PanelSection title="Columns">
                 <FieldGroup className="gap-4">
                   <Field>
                     <FieldLabel>Image URL columns</FieldLabel>

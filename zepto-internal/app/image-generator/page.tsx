@@ -20,6 +20,7 @@ import { Checkbox } from '@/components/ui/checkbox';
 import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog';
+import { CsvFileIcon, CsvFileTile } from '@/components/csv-dropzone';
 import { MdFileIcon, MdFileTile } from '@/components/md-file-tile';
 import { createEta } from '@/lib/eta';
 import { matchSkill, useSkills } from '@/lib/skills';
@@ -507,6 +508,7 @@ export default function ImageGenerator() {
           {briefLabel ?? 'no brief'}
         </span>
         <span className={cn('rounded-md border px-2 py-0.5', csvName && 'border-primary text-foreground')}>
+          <CsvFileIcon className="mr-1 inline size-3" />
           {csvName ? `${csvName} — ${records.length} rows` : 'no CSV'}
         </span>
       </span>
@@ -567,7 +569,35 @@ export default function ImageGenerator() {
           }
         >
           <PanelSection title="Input" hint={<>One image per CSV row. Each prompt is the brief followed by that row&rsquo;s
-                fields, labelled with their column names.</>}>{dropzone}</PanelSection>
+                fields, labelled with their column names.</>}>
+            <div className="space-y-3">
+              {dropzone}
+              {/* Loaded CSV as the suite's file card, matching the brief tile below: click to
+                  replace, ✕ to remove. Rows (and their generated images) leave with the sheet,
+                  so removal goes through the same confirm copy as Clear all — the brief stays. */}
+              {csvName && (
+                <CsvFileTile
+                  name={csvName}
+                  description={headers.join(', ')}
+                  badge={`${records.length.toLocaleString()} row${records.length === 1 ? '' : 's'}`}
+                  onReplace={(file) => handleFiles([file])}
+                  onRemove={clearAll}
+                  disabled={busy}
+                  removeConfirm={{
+                    title: 'Remove the CSV?',
+                    description: (
+                      <>
+                        Clears all {items.length} row{items.length === 1 ? '' : 's'}
+                        {doneCount > 0 && <> and the {doneCount} generated image{doneCount === 1 ? '' : 's'} (not exported anywhere yet)</>}
+                        . The brief stays loaded; your CSV file on disk is untouched — drop it
+                        again to rebuild the rows.
+                      </>
+                    ),
+                  }}
+                />
+              )}
+            </div>
+          </PanelSection>
 
           <PanelSection title="Brief" hint="Leads every row's prompt. Drop a .md file or pick a saved skill; skills are managed in Settings.">
             {/* Same .md tile as the BG Remover's prompt: the brief is configuration, so the
@@ -593,7 +623,7 @@ export default function ImageGenerator() {
           </PanelSection>
 
           {headers.length > 0 && (
-            <PanelSection title={<>Columns — {csvName}</>} hint="Ticked columns are sent, each labelled with its header.">
+            <PanelSection title="Columns" hint="Ticked columns are sent, each labelled with its header.">
                 <FieldGroup className="gap-4">
                   <Field>
                     <FieldLabel htmlFor="gen-name-col">Name column</FieldLabel>
