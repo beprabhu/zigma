@@ -83,6 +83,10 @@ export interface ProductFilterResult {
 
 // Tuned against catalogue images with composited colour strips. A solid or gradient panel sits
 // near 0-1; product photography is comfortably above 4 even on smooth packaging.
+/** A non-edge region at or above this share of the anchor is protected from the product-only
+ *  drop whatever its palette says — see the guard in keepProductRegions. */
+const PROTECTED_COMPANION_FRACTION = 0.25;
+
 const DEFAULTS = {
   alphaThreshold: 128,
   flatness: 3,
@@ -548,7 +552,18 @@ export function keepProductRegions(
       (decisivePalette && fillRatio > RELAXED_RECTANGULARITY) ||
       (flatPalette && fillRatio > rectangularity) ||
       (smooth && fillRatio > rectangularity);
-    dropFlags[i] = !isAnchor && (graphic || speck);
+    // Size and placement outrank the graphic evidence for anything big and central. A plain
+    // white carton photographed beside its bottle measures EXACTLY like a panel (palette 81%,
+    // fill 0.98) and, being flat, loses the richness-weighted anchor race to the smaller but
+    // busier product — so the guard above structurally cannot protect it, and the filter was
+    // deleting regions LARGER than the one it kept. Genuine overlay panels in this catalogue
+    // either hug a frame edge (banners, strips) or stay badge-sized; a region a quarter of the
+    // anchor's area floating inside the composition is part of the shot. Measured on a golden
+    // run: ten such regions were being deleted (a nose strip, a serum's carton) while all six
+    // edge-hugging banners keep qualifying for the drop.
+    const protectedCompanion =
+      !isAnchor && !acc.edge && acc.area >= anchor.acc.area * PROTECTED_COMPANION_FRACTION;
+    dropFlags[i] = !isAnchor && !protectedCompanion && (graphic || speck);
     // A speck that ALSO measured graphic is still rescue-eligible: at speck size the palette
     // statistics rest on a handful of stride samples, too little to condemn on.
     speckFlags[i] = !isAnchor && speck;

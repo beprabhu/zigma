@@ -10,6 +10,17 @@
 export const MAX_EDGE = 2048;
 
 /**
+ * Tight-crop rescue. A product running edge to edge leaves the model almost no background to
+ * reference, and it inverts: the big flat area reads as background and only the high-contrast
+ * scraps survive (a red snack packet came back as its logo and a zigzag). Padding the input
+ * with a synthetic white margin hands the context back — measured on twenty real shredded
+ * mattes, a fifth of margin fully recovered seven and made none worse. Applied only when the
+ * original's ink nearly fills the frame; padding an already-loose crop just wastes resolution.
+ */
+export const PAD_TRIGGER_BBOX = 0.88;
+export const PAD_FRACTION = 0.2;
+
+/**
  * On-screen size for thumbnails, result cells and tile previews. Nothing displays a cutout at
  * full resolution, so keeping full-size pixels per queued image is pure waste.
  */

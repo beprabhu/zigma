@@ -16,7 +16,7 @@ import {
   type InkFootprint, type RegionReport,
 } from './regions';
 import { subjectBounds, type SubjectBounds } from './safe-area';
-import { MAX_EDGE, STORE_TYPE } from './constants';
+import { MAX_EDGE, PAD_FRACTION, PAD_TRIGGER_BBOX, STORE_TYPE } from './constants';
 
 export interface WorkerInitRequest {
   type: 'init';
@@ -171,11 +171,31 @@ async function remove(req: WorkerRemoveRequest): Promise<void> {
   ctx.postMessage({ type: 'stage', jobId: req.jobId, stage: 'inferring' } satisfies WorkerResponse);
   const { RawImage } = await loadLib();
 
-  const sourceCanvas = drawToCanvas(req.bitmap, req.maxEdge ?? MAX_EDGE);
+  const baseCanvas = drawToCanvas(req.bitmap, req.maxEdge ?? MAX_EDGE);
   req.bitmap.close();
+  const outW = baseCanvas.width;
+  const outH = baseCanvas.height;
+  const base2d = baseCanvas.getContext('2d')!;
+  // Read once, before anything touches the buffer: this is both the footprint the quality
+  // checks remember the original by, and the padding decision's input.
+  const basePixels = base2d.getImageData(0, 0, outW, outH);
+  const originalInk = measureInkFootprint(basePixels);
+  // Tight-crop rescue (see constants.ts): a subject running edge to edge starves the model of
+  // background and it inverts, keeping scraps. A synthetic white margin hands the context back;
+  // everything downstream still works in the ORIGINAL's coordinates because the matte is read
+  // back through the pad offset and the padded canvas never leaves this function.
+  const pad =
+    originalInk.bbox >= PAD_TRIGGER_BBOX ? Math.round(Math.max(outW, outH) * PAD_FRACTION) : 0;
+  let sourceCanvas = baseCanvas;
+  if (pad) {
+    sourceCanvas = new OffscreenCanvas(outW + pad * 2, outH + pad * 2);
+    const p2d = sourceCanvas.getContext('2d')!;
+    p2d.fillStyle = '#fff';
+    p2d.fillRect(0, 0, sourceCanvas.width, sourceCanvas.height);
+    p2d.drawImage(baseCanvas, pad, pad);
+  }
   const width = sourceCanvas.width;
   const height = sourceCanvas.height;
-  const source2d = sourceCanvas.getContext('2d')!;
   const image = RawImage.fromCanvas(sourceCanvas);
 
   const infer = async (img: RawImage, w: number, h: number): Promise<RawImage> => {
@@ -233,18 +253,21 @@ async function remove(req: WorkerRemoveRequest): Promise<void> {
     }
   }
 
-  const pixels = source2d.getImageData(0, 0, width, height);
-  // This is the one moment the buffer still holds the untouched original: the very next loop
-  // overwrites its alpha with the matte, after which "what did the original cover?" has no
-  // answer anywhere in the pipeline.
-  const originalInk = measureInkFootprint(pixels);
-  for (let i = 0; i < mask.data.length; i++) {
-    pixels.data[4 * i + 3] = mask.data[i];
+  // The matte is read back through the pad offset, so `pixels` — and every measurement, region,
+  // bound and byte after this line — lives in the original's coordinate space. Nothing
+  // downstream ever learns the inference ran on a larger canvas.
+  const pixels = basePixels;
+  for (let y = 0; y < outH; y++) {
+    const maskRow = (y + pad) * width + pad;
+    const pixelRow = y * outW;
+    for (let x = 0; x < outW; x++) {
+      pixels.data[4 * (pixelRow + x) + 3] = mask.data[maskRow + x];
+    }
   }
 
   if (req.refine) {
     ctx.postMessage({ type: 'stage', jobId: req.jobId, stage: 'refining' } satisfies WorkerResponse);
-    refineAlpha(pixels, width, height, { modelId: req.modelId, mode: req.refineMode });
+    refineAlpha(pixels, outW, outH, { modelId: req.modelId, mode: req.refineMode });
   }
 
   // Runs after refinement, before the bbox: dropping a panel has to shrink the bounds too, or
@@ -287,12 +310,12 @@ async function remove(req: WorkerRemoveRequest): Promise<void> {
   // Ghosted overlay graphics live below the alpha threshold where nothing else can see them.
   const residueFraction = measureFaintResidue(pixels, bounds);
 
-  source2d.putImageData(pixels, 0, 0);
+  base2d.putImageData(pixels, 0, 0);
 
   // Hand back only the compressed master. No preview is produced here: a batch of thousands
   // would hold one decoded bitmap each (~1 MB at 512px, so gigabytes at scale), which is what
   // exhausted memory. The main thread decodes previews on demand for what is on screen.
-  const blob = await sourceCanvas.convertToBlob({ type: STORE_TYPE, quality: 1 });
+  const blob = await baseCanvas.convertToBlob({ type: STORE_TYPE, quality: 1 });
 
   ctx.postMessage({
     type: 'done',
@@ -304,8 +327,8 @@ async function remove(req: WorkerRemoveRequest): Promise<void> {
     residueFraction,
     originalInk,
     bands,
-    width,
-    height,
+    width: outW,
+    height: outH,
     durationMs: performance.now() - started,
     backend,
   } satisfies WorkerResponse);

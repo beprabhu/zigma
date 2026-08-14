@@ -12,6 +12,7 @@ import { refineAlpha, type RefineMode } from './refine';
 import {
   analyzeRegions, keepProductRegions, measureInkFootprint, type InkFootprint, type RegionReport,
 } from './regions';
+import { PAD_FRACTION, PAD_TRIGGER_BBOX } from './constants';
 
 export type BgModelId = 'rmbg2' | 'rmbg' | 'birefnet' | 'ben2' | 'modnet';
 
@@ -338,9 +339,9 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
   const { spec, model, processor, backend } = await loadModel(id, opts.onLoadProgress);
   throwIfAborted(signal);
 
-  const sourceCanvas = await toCanvas(source);
-  const width = sourceCanvas.width;
-  const height = sourceCanvas.height;
+  let sourceCanvas = await toCanvas(source);
+  let width = sourceCanvas.width;
+  let height = sourceCanvas.height;
   if (!width || !height) throw new Error('Image has no dimensions');
 
   opts.onStage?.('inferring');
@@ -389,6 +390,29 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
 
   // ---- In-browser inference. ----
   const { RawImage } = await loadLib();
+  const baseCanvas = sourceCanvas;
+  const outW = width;
+  const outH = height;
+  // Read once, before anything touches the buffer: the footprint the quality checks remember
+  // the original by, and the padding decision's input.
+  const basePixels = baseCanvas.getContext('2d')!.getImageData(0, 0, outW, outH);
+  const originalInk = measureInkFootprint(basePixels);
+  // Tight-crop rescue, same as the worker (see constants.ts): the matte is read back through
+  // the pad offset below, so everything downstream stays in the original's coordinates.
+  const pad =
+    originalInk.bbox >= PAD_TRIGGER_BBOX ? Math.round(Math.max(outW, outH) * PAD_FRACTION) : 0;
+  if (pad) {
+    const padded = document.createElement('canvas');
+    padded.width = outW + pad * 2;
+    padded.height = outH + pad * 2;
+    const p2d = padded.getContext('2d')!;
+    p2d.fillStyle = '#fff';
+    p2d.fillRect(0, 0, padded.width, padded.height);
+    p2d.drawImage(baseCanvas, pad, pad);
+    sourceCanvas = padded;
+    width = padded.width;
+    height = padded.height;
+  }
   // fromCanvas reads the pixels directly — encoding to a PNG blob and decoding it again
   // costs hundreds of milliseconds of pure CPU on a large image and produces identical data.
   const image = RawImage.fromCanvas(sourceCanvas);
@@ -461,16 +485,19 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
   throwIfAborted(signal);
 
   const canvas = document.createElement('canvas');
-  canvas.width = width;
-  canvas.height = height;
+  canvas.width = outW;
+  canvas.height = outH;
   const ctx = canvas.getContext('2d')!;
-  ctx.drawImage(sourceCanvas, 0, 0);
-  const pixels = ctx.getImageData(0, 0, width, height);
-  // The one moment this buffer still holds the untouched original — the next loop replaces its
-  // alpha with the matte, and nothing downstream remembers what the picture used to cover.
-  const originalInk = measureInkFootprint(pixels);
-  for (let i = 0; i < mask.data.length; i++) {
-    pixels.data[4 * i + 3] = mask.data[i];
+  ctx.drawImage(baseCanvas, 0, 0);
+  // The matte is read back through the pad offset, so `pixels` and everything after it live in
+  // the original's coordinate space — the padded canvas never leaves this function.
+  const pixels = basePixels;
+  for (let y = 0; y < outH; y++) {
+    const maskRow = (y + pad) * width + pad;
+    const pixelRow = y * outW;
+    for (let x = 0; x < outW; x++) {
+      pixels.data[4 * (pixelRow + x) + 3] = mask.data[maskRow + x];
+    }
   }
 
   if (refine) {
@@ -478,7 +505,7 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
     // Yield once so a pending status paint lands before this blocks the main thread.
     await new Promise((r) => setTimeout(r, 0));
     throwIfAborted(signal);
-    refineAlpha(pixels, width, height, { modelId: id, mode: refineMode });
+    refineAlpha(pixels, outW, outH, { modelId: id, mode: refineMode });
   }
   const browserFiltered = productOnly ? keepProductRegions(pixels) : null;
   const removedRegions = browserFiltered?.removed ?? 0;
@@ -490,8 +517,8 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
     canvas,
     pixels,
     originalInk,
-    width,
-    height,
+    width: outW,
+    height: outH,
     durationMs: performance.now() - started,
     model: id,
     backend,

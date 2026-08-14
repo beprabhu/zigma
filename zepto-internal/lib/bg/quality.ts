@@ -75,12 +75,13 @@ const COMPOSED_MIN_ANCHOR_FRACTION = 0.25;
  *  The measured failures held 3-10 pieces; the deliberate compositions never exceeded two. */
 const FRAGMENTED_MIN_PIECES = 3;
 /**
- * A removed region at or above this share of the kept anchor is too big to be a badge or a
- * text strip in any catalogue shot measured so far — real overlay panels came in under a tenth
- * of the product, while the misclassified nose strip was over a quarter of it. Paired with the
- * canvas-substantial bar so a huge removal next to a tiny anchor cannot hide behind the ratio.
+ * Mirrors the filter's own protection bar: a non-edge removal at or above this share of the
+ * anchor should be impossible once the guard is live, so seeing one means pre-guard data or a
+ * regression — either way, look. The extreme bar catches a removal well over half the product
+ * even when it touches an edge, where the guard deliberately still allows the drop.
  */
-const REMOVED_SUBSTANTIAL_ANCHOR_FRACTION = 0.12;
+const REMOVED_PROTECTED_FRACTION = 0.25;
+const REMOVED_EXTREME_FRACTION = 0.6;
 /**
  * Coverage collapse: the cutout's subject bbox under this fraction of the original's ink bbox
  * reads as vanished content. The glasses failure measured ~0.3 against an original at ~0.8;
@@ -219,19 +220,22 @@ export function assessQuality(item: BgItem): QualityAssessment {
     reasons.push('Faint semi-transparent residue outside the subject — ghosted graphics or a leftover shadow');
   }
 
-  // A single LARGE removed region is its own alarm, separate from the aggregate below: the
-  // product-only filter classifies on flatness and palette, and a real product part can score
-  // exactly like a badge — a plain white nose strip (351k px, three colours, no detail) was
-  // deleted as a "graphic panel" while the aggregate stayed far under the heavy-removal bar.
-  // Whatever the totals say, throwing away one piece a quarter the size of the product is
-  // something a person should look at.
+  // With the filter's protected-companion guard in place (lib/bg/regions.ts), a big CENTRAL
+  // region can no longer be dropped — so a removal that still looks like one is evidence of a
+  // guard violation: a record from before the guard existed, or a bug. Those must flag. What
+  // remains legitimately droppable is edge-hugging panels and badge-sized floaters, and those
+  // are the filter's bread and butter — flagging every banner it correctly removed taught
+  // people to ignore the flag (a deodorant with two clean panel removals wore a warning while
+  // its cutout was perfect). Only a removal bigger than well over half the product still earns
+  // a look regardless of where it sat.
   const anchorArea = anchor?.area ?? 0;
   const bigRemoved = regions.filter(
     (r) =>
       r.removed &&
       anchorArea > 0 &&
-      r.area >= anchorArea * REMOVED_SUBSTANTIAL_ANCHOR_FRACTION &&
-      r.area / canvasArea >= SUBSTANTIAL_REGION_FRACTION,
+      r.area / canvasArea >= SUBSTANTIAL_REGION_FRACTION &&
+      ((!r.touchesEdge && r.area >= anchorArea * REMOVED_PROTECTED_FRACTION) ||
+        r.area >= anchorArea * REMOVED_EXTREME_FRACTION),
   );
   if (bigRemoved.length > 0) {
     reasons.push(
