@@ -9,7 +9,7 @@ import { detectImageColumns, detectTitleColumn, parseCSV } from '@/lib/csv';
 import type { LoadProgress } from './engine';
 import { TRANSPARENT, type SubjectBounds } from './safe-area';
 import { isHeicFile } from './heic';
-import type { RegionReport } from './regions';
+import type { InkFootprint, RegionReport } from './regions';
 
 export type BgItemStatus =
   | 'ready'
@@ -180,6 +180,13 @@ export interface BgItem {
    * absent means the single implicit batch that every item is in today.
    */
   batch?: number;
+  /**
+   * What the ORIGINAL covered, measured just before the matte was applied. The one signal that
+   * survives when the model deletes objects outright: five of six transparent glasses vanished
+   * without leaving a region, a residue trace or anything else on the cutout side — the only
+   * side that still remembered them was the original.
+   */
+  originalInk?: InkFootprint;
   /** Set for items imported from a CSV; absent for dropped files and pasted images. */
   csv?: CsvOrigin;
   /**

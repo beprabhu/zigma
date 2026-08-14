@@ -10,6 +10,16 @@
 export const MAX_EDGE = 2048;
 
 /**
+ * Tight-crop rescue margin. A product running edge to edge leaves the model almost no
+ * background to reference and it inverts, keeping scraps — padding the input with a synthetic
+ * white margin hands the context back (measured: a fifth of margin fully recovered seven of
+ * twenty real shredded mattes and made none worse). Applied only as a RETRY after a matte comes
+ * out failed, never upfront: an ink-based trigger padded colored-background shots too, and the
+ * model outlined the whole picture as one object — a regression a user caught within the hour.
+ */
+export const PAD_FRACTION = 0.2;
+
+/**
  * On-screen size for thumbnails, result cells and tile previews. Nothing displays a cutout at
  * full resolution, so keeping full-size pixels per queued image is pure waste.
  */

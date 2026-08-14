@@ -83,6 +83,10 @@ export interface ProductFilterResult {
 
 // Tuned against catalogue images with composited colour strips. A solid or gradient panel sits
 // near 0-1; product photography is comfortably above 4 even on smooth packaging.
+/** A non-edge region at or above this share of the anchor is protected from the product-only
+ *  drop whatever its palette says — see the guard in keepProductRegions. */
+const PROTECTED_COMPANION_FRACTION = 0.25;
+
 const DEFAULTS = {
   alphaThreshold: 128,
   flatness: 3,
@@ -548,7 +552,18 @@ export function keepProductRegions(
       (decisivePalette && fillRatio > RELAXED_RECTANGULARITY) ||
       (flatPalette && fillRatio > rectangularity) ||
       (smooth && fillRatio > rectangularity);
-    dropFlags[i] = !isAnchor && (graphic || speck);
+    // Size and placement outrank the graphic evidence for anything big and central. A plain
+    // white carton photographed beside its bottle measures EXACTLY like a panel (palette 81%,
+    // fill 0.98) and, being flat, loses the richness-weighted anchor race to the smaller but
+    // busier product — so the guard above structurally cannot protect it, and the filter was
+    // deleting regions LARGER than the one it kept. Genuine overlay panels in this catalogue
+    // either hug a frame edge (banners, strips) or stay badge-sized; a region a quarter of the
+    // anchor's area floating inside the composition is part of the shot. Measured on a golden
+    // run: ten such regions were being deleted (a nose strip, a serum's carton) while all six
+    // edge-hugging banners keep qualifying for the drop.
+    const protectedCompanion =
+      !isAnchor && !acc.edge && acc.area >= anchor.acc.area * PROTECTED_COMPANION_FRACTION;
+    dropFlags[i] = !isAnchor && !protectedCompanion && (graphic || speck);
     // A speck that ALSO measured graphic is still rescue-eligible: at speck size the palette
     // statistics rest on a handful of stride samples, too little to condemn on.
     speckFlags[i] = !isAnchor && speck;
@@ -744,6 +759,46 @@ export function analyzeRegions(
  * icons, watermarks) or a stray soft shadow. Pixels in this band are invisible to both the
  * bbox scan and the region classifier (both gate on alpha > high), so nothing else can see them.
  */
+/** The original's content footprint, measured before the matte touches anything. */
+export interface InkFootprint {
+  /** Bounding box of non-background pixels, as a fraction of the canvas. */
+  bbox: number;
+  /** Non-background pixel count, as a fraction of the canvas. */
+  ink: number;
+}
+
+/**
+ * Measures what the ORIGINAL covers, so quality triage can ask the one question no cutout-side
+ * check can answer: is most of the picture simply gone? A set of six transparent glasses came
+ * back as one glass — the other five left no regions, no residue, nothing to inspect, because
+ * absent objects leave no evidence. The only side that still remembers them is the original.
+ *
+ * Background is near-white or transparent. Catalogue shots are white-field as a rule, and the
+ * check that consumes this is thresholded so a genuinely full-bleed original (ink ~1.0) cannot
+ * fire it against a legitimately small product.
+ */
+export function measureInkFootprint(pixels: ImageData): InkFootprint {
+  const { width: w, height: h, data } = pixels;
+  const n = w * h;
+  if (!n) return { bbox: 0, ink: 0 };
+  let minX = w, minY = h, maxX = -1, maxY = -1, ink = 0;
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      const i = (row + x) * 4;
+      if (data[i + 3] < 32) continue; // transparent = background
+      if (data[i] > 240 && data[i + 1] > 240 && data[i + 2] > 240) continue; // near-white
+      ink++;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
+  if (maxX < 0) return { bbox: 0, ink: 0 };
+  return { bbox: ((maxX - minX + 1) * (maxY - minY + 1)) / n, ink: ink / n };
+}
+
 export function measureFaintResidue(
   pixels: ImageData,
   bounds: SubjectBounds | null,

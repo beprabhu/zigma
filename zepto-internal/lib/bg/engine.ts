@@ -9,7 +9,11 @@
 import type { PreTrainedModel, Processor, RawImage, Tensor } from '@huggingface/transformers';
 
 import { refineAlpha, type RefineMode } from './refine';
-import { analyzeRegions, keepProductRegions, type RegionReport } from './regions';
+import {
+  analyzeRegions, keepProductRegions, measureInkFootprint, type InkFootprint, type RegionReport,
+} from './regions';
+import { PAD_FRACTION } from './constants';
+import { subjectBounds } from './safe-area';
 
 export type BgModelId = 'rmbg2' | 'rmbg' | 'birefnet' | 'ben2' | 'modnet';
 
@@ -154,6 +158,8 @@ export interface RemoveResult {
   removedRegions: number;
   /** Per-region measurements behind that decision. */
   regionReport: RegionReport[];
+  /** The original's content footprint, from before the matte — see regions.measureInkFootprint. */
+  originalInk: InkFootprint;
 }
 
 export type BgSource = Blob | HTMLImageElement | HTMLCanvasElement | ImageBitmap;
@@ -343,6 +349,11 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
 
   // ---- Server model: post the encoded image, get a finished RGBA PNG back. ----
   if (spec.server) {
+    // Measured from the SOURCE: the server hands back an already-matted RGBA, and by then the
+    // question "what did the original cover?" is unanswerable from anything it returns.
+    const originalInk = measureInkFootprint(
+      sourceCanvas.getContext('2d')!.getImageData(0, 0, width, height),
+    );
     const blob = await canvasToBlob(sourceCanvas);
     const res = await fetch('/api/remove-hq', { method: 'POST', body: blob, signal });
     if (!res.ok) {
@@ -374,14 +385,19 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
       backend,
       removedRegions,
       regionReport,
+      originalInk,
     };
   }
 
   // ---- In-browser inference. ----
   const { RawImage } = await loadLib();
-  // fromCanvas reads the pixels directly — encoding to a PNG blob and decoding it again
-  // costs hundreds of milliseconds of pure CPU on a large image and produces identical data.
-  const image = RawImage.fromCanvas(sourceCanvas);
+  const baseCanvas = sourceCanvas;
+  const outW = width;
+  const outH = height;
+  // Read once, before anything touches the buffer — the footprint the quality checks remember
+  // the original by, and the pristine RGB every attempt below starts from.
+  const basePixels = baseCanvas.getContext('2d')!.getImageData(0, 0, outW, outH);
+  const originalInk = measureInkFootprint(basePixels);
 
   const infer = async (img: RawImage, w: number, h: number): Promise<RawImage> => {
     const { pixel_values } = await processor!(img);
@@ -393,95 +409,177 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
     return await RawImage.fromTensor(matte.mul(255).to('uint8')).resize(w, h);
   };
 
-  const mask = await infer(image, width, height);
-  throwIfAborted(signal);
+  interface MatteAttempt {
+    pixels: ImageData;
+    removedRegions: number;
+    regionReport: RegionReport[];
+  }
 
-  if (zoomPass) {
-    opts.onStage?.('zooming');
-    try {
-      let x0 = width;
-      let x1 = 0;
-      let y0 = height;
-      let y1 = 0;
-      for (let y = 0; y < height; y++) {
-        for (let x = 0; x < width; x++) {
-          if (mask.data[y * width + x] > 128) {
-            if (x < x0) x0 = x;
-            if (x > x1) x1 = x;
-            if (y < y0) y0 = y;
-            if (y > y1) y1 = y;
-          }
-        }
-      }
-      const bw = x1 - x0;
-      const bh = y1 - y0;
-      // Only zoom when it meaningfully increases resolution.
-      if (bw > 40 && bh > 40 && (bw < width * 0.9 || bh < height * 0.9)) {
-        const pad = Math.round(Math.max(bw, bh) * 0.08);
-        x0 = Math.max(0, x0 - pad);
-        y0 = Math.max(0, y0 - pad);
-        x1 = Math.min(width - 1, x1 + pad);
-        y1 = Math.min(height - 1, y1 + pad);
-        const cw = x1 - x0 + 1;
-        const ch = y1 - y0 + 1;
-        const crop = document.createElement('canvas');
-        crop.width = cw;
-        crop.height = ch;
-        crop.getContext('2d')!.drawImage(sourceCanvas, x0, y0, cw, ch, 0, 0, cw, ch);
-        const cropImg = RawImage.fromCanvas(crop);
-        const mask2 = await infer(cropImg, cw, ch);
-        // Fuse: the zoom pass only refines where pass 1 was uncertain. Where pass 1 is
-        // confident (near 0 or 255) its decision stands — the cropped view can misjudge
-        // large context (e.g. thin frames).
-        for (let y = 0; y < ch; y++) {
-          for (let x = 0; x < cw; x++) {
-            const i = (y0 + y) * width + (x0 + x);
-            const a1 = mask.data[i];
-            if (a1 > 30 && a1 < 225) {
-              mask.data[i] = (a1 + mask2.data[y * cw + x]) >> 1;
+  /**
+   * One full matte at a given pad — same contract as the worker's: the padded canvas never
+   * leaves this closure, and everything returned lives in the original's coordinates.
+   */
+  const attempt = async (pad: number): Promise<MatteAttempt> => {
+    let inferCanvas = baseCanvas;
+    if (pad) {
+      const padded = document.createElement('canvas');
+      padded.width = outW + pad * 2;
+      padded.height = outH + pad * 2;
+      const p2d = padded.getContext('2d')!;
+      p2d.fillStyle = '#fff';
+      p2d.fillRect(0, 0, padded.width, padded.height);
+      p2d.drawImage(baseCanvas, pad, pad);
+      inferCanvas = padded;
+    }
+    const iw = inferCanvas.width;
+    const ih = inferCanvas.height;
+    // fromCanvas reads the pixels directly — encoding to a PNG blob and decoding it again
+    // costs hundreds of milliseconds of pure CPU on a large image and produces identical data.
+    const image = RawImage.fromCanvas(inferCanvas);
+
+    const mask = await infer(image, iw, ih);
+    throwIfAborted(signal);
+
+    if (zoomPass) {
+      opts.onStage?.('zooming');
+      try {
+        let x0 = iw;
+        let x1 = 0;
+        let y0 = ih;
+        let y1 = 0;
+        for (let y = 0; y < ih; y++) {
+          for (let x = 0; x < iw; x++) {
+            if (mask.data[y * iw + x] > 128) {
+              if (x < x0) x0 = x;
+              if (x > x1) x1 = x;
+              if (y < y0) y0 = y;
+              if (y > y1) y1 = y;
             }
           }
         }
+        const bw = x1 - x0;
+        const bh = y1 - y0;
+        // Only zoom when it meaningfully increases resolution.
+        if (bw > 40 && bh > 40 && (bw < iw * 0.9 || bh < ih * 0.9)) {
+          const zpad = Math.round(Math.max(bw, bh) * 0.08);
+          x0 = Math.max(0, x0 - zpad);
+          y0 = Math.max(0, y0 - zpad);
+          x1 = Math.min(iw - 1, x1 + zpad);
+          y1 = Math.min(ih - 1, y1 + zpad);
+          const cw = x1 - x0 + 1;
+          const ch = y1 - y0 + 1;
+          const crop = document.createElement('canvas');
+          crop.width = cw;
+          crop.height = ch;
+          crop.getContext('2d')!.drawImage(inferCanvas, x0, y0, cw, ch, 0, 0, cw, ch);
+          const cropImg = RawImage.fromCanvas(crop);
+          const mask2 = await infer(cropImg, cw, ch);
+          // Fuse: the zoom pass only refines where pass 1 was uncertain. Where pass 1 is
+          // confident (near 0 or 255) its decision stands — the cropped view can misjudge
+          // large context (e.g. thin frames).
+          for (let y = 0; y < ch; y++) {
+            for (let x = 0; x < cw; x++) {
+              const i = (y0 + y) * iw + (x0 + x);
+              const a1 = mask.data[i];
+              if (a1 > 30 && a1 < 225) {
+                mask.data[i] = (a1 + mask2.data[y * cw + x]) >> 1;
+              }
+            }
+          }
+        }
+      } catch (e) {
+        if ((e as Error)?.name === 'AbortError') throw e;
+        console.warn('zoom pass skipped:', e);
       }
-    } catch (e) {
-      if ((e as Error)?.name === 'AbortError') throw e;
-      console.warn('zoom pass skipped:', e);
     }
+    throwIfAborted(signal);
+
+    // A fresh pristine copy per attempt: the alpha write mutates it, and a retry must start
+    // from the original RGB, not the previous attempt's leavings.
+    const pixels = new ImageData(new Uint8ClampedArray(basePixels.data), outW, outH);
+    for (let y = 0; y < outH; y++) {
+      const maskRow = (y + pad) * iw + pad;
+      const pixelRow = y * outW;
+      for (let x = 0; x < outW; x++) {
+        pixels.data[4 * (pixelRow + x) + 3] = mask.data[maskRow + x];
+      }
+    }
+
+    if (refine) {
+      opts.onStage?.('refining');
+      // Yield once so a pending status paint lands before this blocks the main thread.
+      await new Promise((r) => setTimeout(r, 0));
+      throwIfAborted(signal);
+      refineAlpha(pixels, outW, outH, { modelId: id, mode: refineMode });
+    }
+    const browserFiltered = productOnly ? keepProductRegions(pixels) : null;
+    return {
+      pixels,
+      removedRegions: browserFiltered?.removed ?? 0,
+      regionReport: browserFiltered ? browserFiltered.regions : analyzeRegions(pixels),
+    };
+  };
+
+  /**
+   * The two failure shapes a padded retry can rescue, judged SEPARATELY because a rescue can
+   * legitimately resemble the other failure: a shredded full-bleed packet, correctly re-matted,
+   * comes back as one region covering nearly the whole frame — exactly the shape of a
+   * whole-frame keep. A retry therefore only has to stop exhibiting the failure that sent it
+   * back, not look pristine by every measure. (And padding is a RETRY, never a first move: an
+   * upfront ink-based trigger made the model outline entire colored-background shots as one
+   * object — a user caught that regression within the hour.)
+   */
+  const looksWholeFrame = (a: MatteAttempt): boolean => {
+    const b = subjectBounds(a.pixels);
+    if (!b) return true;
+    const bboxFraction = (b.w * b.h) / (outW * outH);
+    const kept = a.regionReport.filter((r) => !r.removed);
+    return bboxFraction > 0.97 && a.removedRegions === 0 && kept.length <= 1;
+  };
+  const looksShredded = (a: MatteAttempt): boolean => {
+    const canvasArea = outW * outH;
+    if (!subjectBounds(a.pixels)) return true;
+    const kept = a.regionReport.filter((r) => !r.removed);
+    const substantial = kept.filter((r) => r.area / canvasArea >= 0.01);
+    const anchor = kept.reduce<RegionReport | null>(
+      (max, r) => (!max || r.area > max.area ? r : max),
+      null,
+    );
+    const total = kept.reduce((sum, r) => sum + r.area, 0);
+    const dominance = anchor && total ? anchor.area / total : 1;
+    return substantial.length >= 3 && dominance < 0.6;
+  };
+
+  let result = await attempt(0);
+  const shredded = looksShredded(result);
+  if (shredded || looksWholeFrame(result)) {
+    throwIfAborted(signal);
+    opts.onStage?.('inferring');
+    const retry = await attempt(Math.round(Math.max(outW, outH) * PAD_FRACTION));
+    const cured = shredded
+      ? !looksShredded(retry)
+      : !looksWholeFrame(retry) && !looksShredded(retry);
+    if (cured) result = retry;
   }
-  throwIfAborted(signal);
 
   const canvas = document.createElement('canvas');
-  canvas.width = width;
-  canvas.height = height;
+  canvas.width = outW;
+  canvas.height = outH;
   const ctx = canvas.getContext('2d')!;
-  ctx.drawImage(sourceCanvas, 0, 0);
-  const pixels = ctx.getImageData(0, 0, width, height);
-  for (let i = 0; i < mask.data.length; i++) {
-    pixels.data[4 * i + 3] = mask.data[i];
-  }
-
-  if (refine) {
-    opts.onStage?.('refining');
-    // Yield once so a pending status paint lands before this blocks the main thread.
-    await new Promise((r) => setTimeout(r, 0));
-    throwIfAborted(signal);
-    refineAlpha(pixels, width, height, { modelId: id, mode: refineMode });
-  }
-  const browserFiltered = productOnly ? keepProductRegions(pixels) : null;
-  const removedRegions = browserFiltered?.removed ?? 0;
-  const regionReport = browserFiltered ? browserFiltered.regions : analyzeRegions(pixels);
-  ctx.putImageData(pixels, 0, 0);
+  ctx.putImageData(result.pixels, 0, 0);
 
   opts.onStage?.('done');
   return {
     canvas,
-    pixels,
-    width,
-    height,
+    pixels: result.pixels,
+    originalInk,
+    width: outW,
+    height: outH,
     durationMs: performance.now() - started,
     model: id,
     backend,
-    removedRegions,
-    regionReport,
+    removedRegions: result.removedRegions,
+    regionReport: result.regionReport,
   };
 }
+

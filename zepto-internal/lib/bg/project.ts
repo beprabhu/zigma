@@ -17,7 +17,7 @@
 
 import { buildZipStream, readZipIndex, type ZipStreamEntry } from '../zip';
 import type { BgCutout, BgItem, BgItemSource, CsvOrigin } from './batch';
-import type { RegionReport } from './regions';
+import type { InkFootprint, RegionReport } from './regions';
 import { ANCHORS, DEFAULT_SAFE_AREA, type SafeAreaConfig, type SubjectBounds } from './safe-area';
 
 export const PROJECT_EXTENSION = '.zesku';
@@ -108,6 +108,8 @@ interface ManifestItem {
   regions?: RegionReport[];
   removedRegions?: number;
   residueFraction?: number;
+  /** The original's pre-matte footprint — what the coverage-collapse check reads. */
+  originalInk?: InkFootprint;
 }
 
 /** Where the CSV text lives and how its columns were mapped; the text itself is a zip entry. */
@@ -301,6 +303,14 @@ export async function saveProject(
       ...(saved?.residueFraction !== undefined
         ? { residueFraction: Math.round(saved.residueFraction * 1e5) / 1e5 }
         : null),
+      ...(item.originalInk
+        ? {
+            originalInk: {
+              bbox: Math.round(item.originalInk.bbox * 1000) / 1000,
+              ink: Math.round(item.originalInk.ink * 1000) / 1000,
+            },
+          }
+        : null),
       ...(item.csv ? { csv: { row: item.csv.row, column: item.csv.column } } : null),
       // Only a URL survives the round trip: an original that was a dropped FILE is already
       // embedded under originals/ when the save includes them, and re-embedding it a second
@@ -363,6 +373,7 @@ export interface RestoredItem {
   batch?: number;
   regions?: RegionReport[];
   removedRegions?: number;
+  originalInk?: InkFootprint;
 }
 
 export interface RestoredProject {
@@ -512,6 +523,12 @@ export async function loadProject(file: File): Promise<RestoredProject> {
         ...(Array.isArray(rec.regions) ? { regions: parseRegions(rec.regions) } : null),
         ...(Number.isFinite(num(rec.removedRegions, NaN))
           ? { removedRegions: Math.round(num(rec.removedRegions, 0)) }
+          : null),
+        ...(rec.originalInk &&
+        typeof rec.originalInk === 'object' &&
+        Number.isFinite(num(rec.originalInk.bbox, NaN)) &&
+        Number.isFinite(num(rec.originalInk.ink, NaN))
+          ? { originalInk: { bbox: num(rec.originalInk.bbox, 0), ink: num(rec.originalInk.ink, 0) } }
           : null),
       });
     }

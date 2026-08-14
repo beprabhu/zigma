@@ -35,7 +35,7 @@
 import * as React from 'react';
 
 import type { BgItem, CsvOrigin } from './batch';
-import type { RegionReport } from './regions';
+import type { InkFootprint, RegionReport } from './regions';
 import type { ProjectCsv } from './project';
 import type { SubjectBounds } from './safe-area';
 
@@ -91,6 +91,8 @@ export interface AutosaveRecord {
   regions?: RegionReport[];
   removedRegions?: number;
   residueFraction?: number;
+  /** The original's pre-matte footprint — what the coverage-collapse check reads. */
+  originalInk?: InkFootprint;
 }
 
 /** The stored sheet. Same shape a .zesku carries, plus when this copy was written. */
@@ -388,6 +390,7 @@ function recordOf(item: BgItem, savedAt: number): AutosaveRecord | null {
     ...(item.cutout?.residueFraction !== undefined
       ? { residueFraction: item.cutout.residueFraction }
       : null),
+    ...(item.originalInk ? { originalInk: item.originalInk } : null),
   };
 }
 
