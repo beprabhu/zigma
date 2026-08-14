@@ -10,14 +10,13 @@
 export const MAX_EDGE = 2048;
 
 /**
- * Tight-crop rescue. A product running edge to edge leaves the model almost no background to
- * reference, and it inverts: the big flat area reads as background and only the high-contrast
- * scraps survive (a red snack packet came back as its logo and a zigzag). Padding the input
- * with a synthetic white margin hands the context back — measured on twenty real shredded
- * mattes, a fifth of margin fully recovered seven and made none worse. Applied only when the
- * original's ink nearly fills the frame; padding an already-loose crop just wastes resolution.
+ * Tight-crop rescue margin. A product running edge to edge leaves the model almost no
+ * background to reference and it inverts, keeping scraps — padding the input with a synthetic
+ * white margin hands the context back (measured: a fifth of margin fully recovered seven of
+ * twenty real shredded mattes and made none worse). Applied only as a RETRY after a matte comes
+ * out failed, never upfront: an ink-based trigger padded colored-background shots too, and the
+ * model outlined the whole picture as one object — a regression a user caught within the hour.
  */
-export const PAD_TRIGGER_BBOX = 0.88;
 export const PAD_FRACTION = 0.2;
 
 /**
