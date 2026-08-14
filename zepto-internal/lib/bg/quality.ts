@@ -74,6 +74,13 @@ const COMPOSED_MIN_ANCHOR_FRACTION = 0.25;
 /** This many canvas-substantial pieces cannot be a composed pair any more — the matte shattered.
  *  The measured failures held 3-10 pieces; the deliberate compositions never exceeded two. */
 const FRAGMENTED_MIN_PIECES = 3;
+/**
+ * A removed region at or above this share of the kept anchor is too big to be a badge or a
+ * text strip in any catalogue shot measured so far — real overlay panels came in under a tenth
+ * of the product, while the misclassified nose strip was over a quarter of it. Paired with the
+ * canvas-substantial bar so a huge removal next to a tiny anchor cannot hide behind the ratio.
+ */
+const REMOVED_SUBSTANTIAL_ANCHOR_FRACTION = 0.12;
 /** Faint out-of-bbox coverage (measureFaintResidue) above this share of the canvas reads as
  *  ghosted overlay graphics or a stray soft shadow. Kept high on purpose: matte edges always
  *  bleed a little, and a flag that fires on every soft-edged cutout teaches people to ignore it. */
@@ -166,6 +173,26 @@ export function assessQuality(item: BgItem): QualityAssessment {
   // Ghosted overlays live below the alpha threshold, invisible to every check above.
   if ((item.cutout.residueFraction ?? 0) >= RESIDUE_MIN_FRACTION) {
     reasons.push('Faint semi-transparent residue outside the subject — ghosted graphics or a leftover shadow');
+  }
+
+  // A single LARGE removed region is its own alarm, separate from the aggregate below: the
+  // product-only filter classifies on flatness and palette, and a real product part can score
+  // exactly like a badge — a plain white nose strip (351k px, three colours, no detail) was
+  // deleted as a "graphic panel" while the aggregate stayed far under the heavy-removal bar.
+  // Whatever the totals say, throwing away one piece a quarter the size of the product is
+  // something a person should look at.
+  const anchorArea = anchor?.area ?? 0;
+  const bigRemoved = regions.filter(
+    (r) =>
+      r.removed &&
+      anchorArea > 0 &&
+      r.area >= anchorArea * REMOVED_SUBSTANTIAL_ANCHOR_FRACTION &&
+      r.area / canvasArea >= SUBSTANTIAL_REGION_FRACTION,
+  );
+  if (bigRemoved.length > 0) {
+    reasons.push(
+      `${bigRemoved.length} large region${bigRemoved.length === 1 ? '' : 's'} filtered out — check it wasn't part of the product`,
+    );
   }
 
   // Weighted by pixels when the report allows it: counting REGIONS reads seven dust specks
