@@ -29,6 +29,7 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
 import { Spinner } from '@/components/ui/spinner';
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { cn } from '@/lib/utils';
 import { usePreview } from '@/lib/bg/preview-store';
 import {
@@ -41,8 +42,10 @@ import {
   exportFileName,
   flattenOnBackground,
   formatDuration,
+  importedSource,
   type BgCutout,
   type BgItem,
+  type BgItemSource,
   type BgItemStatus,
 } from '@/lib/bg/batch';
 import { TRANSPARENT } from '@/lib/bg/safe-area';
@@ -146,17 +149,31 @@ export function PreviewCanvas({ source, max, className }: PreviewCanvasProps) {
 }
 
 /**
- * The item's original image: the proxy URL for a remote image (same bytes the engine will see,
- * and same-origin so nothing taints a canvas), the decoded element's own object URL for a local
- * file that a run has already touched, or a temporary object URL for one that has not.
- * src is assigned imperatively so the object URL has a real lifetime to be revoked against.
+ * Draws one BgItemSource and nothing else: the proxy URL for a remote image (same bytes the
+ * engine will see, and same-origin so nothing taints a canvas), or a temporary object URL for a
+ * local file. src is assigned imperatively so the object URL has a real lifetime to be revoked
+ * against.
  *
  * The url branch comes FIRST on purpose: lib/pipeline.ts's loadImageFromUrl revokes its object
- * URL inside onload, so a remote item's `original.src` is a dead blob: URL by the time this runs.
+ * URL inside onload, so a remote item's decoded element holds a dead blob: URL by the time this
+ * runs.
+ *
+ * `decoded` is an optional shortcut past a second object URL for a file already in memory, and
+ * the caller must only pass an element decoded from THIS source. item.original does not qualify
+ * once an item has been AI-edited — it then holds the generated bitmap while the import it is
+ * being compared against is a different picture entirely, which is precisely how the compare
+ * dialog ended up showing the AI output in the pane captioned "Original".
  */
-export function SourceImage({ item, className }: { item: BgItem; className?: string }) {
+export function RawSourceImage({
+  source,
+  decoded,
+  className,
+}: {
+  source: BgItemSource;
+  decoded?: HTMLImageElement | null;
+  className?: string;
+}) {
   const ref = React.useRef<HTMLImageElement>(null);
-  const { original, source } = item;
 
   React.useEffect(() => {
     const img = ref.current;
@@ -165,8 +182,8 @@ export function SourceImage({ item, className }: { item: BgItem; className?: str
       img.src = `/api/fetch-image?url=${encodeURIComponent(source.url)}`;
       return;
     }
-    if (original) {
-      img.src = original.src;
+    if (decoded) {
+      img.src = decoded.src;
       return;
     }
     if (source.kind === 'file') {
@@ -174,7 +191,7 @@ export function SourceImage({ item, className }: { item: BgItem; className?: str
       img.src = url;
       return () => URL.revokeObjectURL(url);
     }
-  }, [original, source]);
+  }, [decoded, source]);
 
   // A restored project carries only the cutout — the original was never saved.
   if (source.kind === 'archived') {
@@ -188,9 +205,47 @@ export function SourceImage({ item, className }: { item: BgItem; className?: str
 }
 
 /**
+ * The image an item currently holds — after an AI edit that is the generated file, not the
+ * import. Passing item.original is safe here only because it is always the decode of that same
+ * current source; anything wanting the import must go through RawSourceImage directly.
+ */
+export function SourceImage({ item, className }: { item: BgItem; className?: string }) {
+  return <RawSourceImage source={item.source} decoded={item.original} className={className} />;
+}
+
+/**
  * Why each region survived or was dropped. A heuristic that cannot be inspected cannot be
  * tuned — and these numbers are what a bug report needs to be actionable.
  */
+/**
+ * Stands in for the cutout that is not there yet. The dialog opens for unfinished rows now, so
+ * this pane is legitimately empty across most of the queue's life — and the message has to name
+ * the actual state: telling someone to "run Remove backgrounds" while their batch is halfway
+ * through removing that very image is advice to do the thing already happening, and the modal
+ * covers the tile whose spinner would otherwise have said so.
+ */
+function EmptyCutout({ status }: { status: BgItemStatus }) {
+  const working = status === 'removing' || status === 'loading-model' || status === 'editing';
+  const message =
+    status === 'error'
+      ? 'Background removal failed — Redo below to try again.'
+      : status === 'cancelled'
+        ? 'Stopped before it finished — Redo to run it again.'
+        : status === 'editing'
+          ? 'Regenerating this image with the AI edit…'
+          : status === 'loading-model'
+            ? 'Loading the model…'
+            : status === 'removing'
+              ? 'Removing the background…'
+              : 'No cutout yet — run Remove backgrounds to create one.';
+  return (
+    <div className="flex max-w-56 flex-col items-center gap-2">
+      {working && <Spinner className="size-5 text-primary" />}
+      <p className="text-center text-xs text-balance text-muted-foreground">{message}</p>
+    </div>
+  );
+}
+
 function RegionTable({ regions }: { regions: RegionReport[] }) {
   if (!regions.length) return null;
   const sorted = [...regions].sort((a, b) => b.area - a.area).slice(0, 8);
@@ -256,10 +311,21 @@ export function describeRemovedRegions(item: BgItem): string {
   return ` · ${n} graphic element${n === 1 ? '' : 's'} removed`;
 }
 
+function describeSource(source: BgItemSource): string {
+  if (source.kind === 'file') return source.file.name;
+  if (source.kind === 'url') return source.url;
+  return `restored · ${source.label}`;
+}
+
+/**
+ * Provenance for the line under the dialog title. An AI-edited row shows both halves —
+ * "sku-ai-edit.png · from https://…" — because a generated filename answers none of the
+ * questions the row gets opened with, and the CSV cell it came from is otherwise unrecoverable.
+ */
 function sourceLabel(item: BgItem): string {
-  if (item.source.kind === 'file') return item.source.file.name;
-  if (item.source.kind === 'url') return item.source.url;
-  return `restored · ${item.source.label}`;
+  const current = describeSource(item.source);
+  const imported = importedSource(item);
+  return imported ? `${current} · from ${describeSource(imported)}` : current;
 }
 
 /**
@@ -405,7 +471,23 @@ function CompareView({
   const [redoModel, setRedoModel] = React.useState<string>(defaultModel ?? models?.[0]?.id ?? '');
   const [redoRefine, setRedoRefine] = React.useState<boolean>(defaultRefine ?? false);
 
-  const sourceUrl = item.source.kind === 'url' ? item.source.url : null;
+  // The import, when the item is no longer showing it — null for everything untouched by an AI
+  // edit, so every "original" affordance below simply disappears on an ordinary row.
+  const imported = importedSource(item);
+  // Which input the left pane draws. CompareView is keyed by item id, so each image opens on its
+  // import rather than inheriting whatever the previous row was left on.
+  const [showImported, setShowImported] = React.useState(true);
+
+  // Falls back to the import: an AI edit swaps `source` for a generated File, and the CSV URL
+  // then exists nowhere else on the item — which is why Copy URL and Open original vanished from
+  // exactly the rows whose provenance someone was trying to check.
+  const sourceUrl =
+    item.source.kind === 'url'
+      ? item.source.url
+      : item.originalSource?.kind === 'url'
+        ? item.originalSource.url
+        : null;
+  const urlFromImport = sourceUrl !== null && item.source.kind !== 'url';
 
   async function handleCopy() {
     if (!sourceUrl) return;
@@ -481,7 +563,7 @@ function CompareView({
               variant="ghost"
               size="icon-sm"
               className="shrink-0"
-              title="Copy image URL"
+              title={urlFromImport ? 'Copy the imported image URL' : 'Copy image URL'}
               onClick={() => void handleCopy()}
             >
               {copied ? <CheckIcon /> : <CopyIcon />}
@@ -493,7 +575,11 @@ function CompareView({
               variant="ghost"
               size="icon-sm"
               className="shrink-0"
-              title="Open the original image URL in a new tab"
+              title={
+                urlFromImport
+                  ? 'Open the imported image URL in a new tab — this row now holds an AI edit'
+                  : 'Open the original image URL in a new tab'
+              }
               nativeButton={false}
               render={<a href={sourceUrl} target="_blank" rel="noreferrer" />}
             >
@@ -509,25 +595,80 @@ function CompareView({
           inside its own container. */}
       <div className="grid min-w-0 gap-3 sm:grid-cols-2">
         <figure className="min-w-0 space-y-1.5">
-          <figcaption className="text-xs text-muted-foreground">Original</figcaption>
+          {/* min-h-7 on both captions so the toggle appearing over one pane does not push its
+              image box out of line with the other's. */}
+          <figcaption className="flex min-h-7 min-w-0 items-center text-xs text-muted-foreground">
+            {imported ? (
+              // An AI-edited row has three images and this dialog has two columns. A third
+              // column at sm:max-w-3xl leaves each image ~200px wide, which is under the size
+              // where the edge quality anyone opens this for is still visible — so the two
+              // inputs share the left pane and swap instead of shrinking.
+              //
+              // It opens on the import: that is what the caption has always promised, it is the
+              // only copy of it left once `prev` is spent, and the AI input is one click away
+              // for anyone checking what the removal actually ran on.
+              <ToggleGroup
+                size="sm"
+                variant="outline"
+                value={[showImported ? 'import' : 'current']}
+                // An empty array is the user re-pressing the active segment; ignoring it keeps
+                // the pane from going blank on a click that meant nothing.
+                onValueChange={(next) => next[0] && setShowImported(next[0] === 'import')}
+              >
+                <ToggleGroupItem value="import" title="The image this row was imported with">
+                  Original
+                </ToggleGroupItem>
+                <ToggleGroupItem
+                  value="current"
+                  title="The image the background removal is running on"
+                >
+                  {item.source.kind === 'file' && item.source.regenerated ? 'AI edit' : 'Current'}
+                </ToggleGroupItem>
+              </ToggleGroup>
+            ) : (
+              'Original'
+            )}
+          </figcaption>
           <div className="grid h-64 place-items-center overflow-hidden rounded-lg border bg-muted/40 p-2">
-            <SourceImage item={item} className="max-h-full max-w-full object-contain" />
+            {imported && showImported ? (
+              // Not SourceImage: item.original is the AI edit's decoded output on exactly the
+              // rows that reach this branch, and drawing it here is the bug this pane exists
+              // to fix.
+              <RawSourceImage source={imported} className="max-h-full max-w-full object-contain" />
+            ) : (
+              <SourceImage item={item} className="max-h-full max-w-full object-contain" />
+            )}
           </div>
         </figure>
         <figure className="min-w-0 space-y-1.5">
-          <figcaption className="text-xs text-muted-foreground">
+          <figcaption className="flex min-h-7 min-w-0 items-center text-xs text-muted-foreground">
             Background removed{background === TRANSPARENT ? '' : ` · on ${background}`}
           </figcaption>
           <div
-            className="grid h-64 place-items-center overflow-hidden rounded-lg border p-2"
-            style={backdropStyle(background)}
+            className={cn(
+              'grid h-64 place-items-center overflow-hidden rounded-lg border p-2',
+              // The export backdrop is only worth showing under an actual cutout. It is a
+              // user-chosen colour, so the empty-state text below would be painted onto it —
+              // white-on-white for the default light backdrop viewed in a dark theme, and the
+              // mirror of that for a dark custom hex. The pane then reads as blank, which is
+              // the exact failure this message exists to prevent.
+              !item.cutout && 'bg-muted/40',
+            )}
+            style={item.cutout ? backdropStyle(background) : undefined}
           >
-            <CutoutImage itemId={item.id} cutout={item.cutout} max={560} className="max-h-full max-w-full" />
+            {item.cutout ? (
+              <CutoutImage itemId={item.id} cutout={item.cutout} max={560} className="max-h-full max-w-full" />
+            ) : (
+              <EmptyCutout status={item.status} />
+            )}
           </div>
         </figure>
       </div>
 
-      {item.regionReport && item.regionReport.length > 0 && (
+      {/* Tied to the cutout it measures: the report is never cleared, so an AI edit or a failed
+          redo leaves last run's verdicts sitting under a pane that says there is no cutout —
+          two contradictory claims about a matte the user can no longer see or download. */}
+      {item.cutout && item.regionReport && item.regionReport.length > 0 && (
         <RegionTable regions={item.regionReport} />
       )}
 

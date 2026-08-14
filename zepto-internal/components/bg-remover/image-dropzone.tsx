@@ -20,7 +20,7 @@ import {
   type CsvImport,
 } from '@/lib/bg/batch';
 import { isHeicFile, normalizeHeicFiles } from '@/lib/bg/heic';
-import { isProjectFile, PROJECT_EXTENSION } from '@/lib/bg/project';
+import { PROJECT_EXTENSION, sniffProjectFile } from '@/lib/bg/project';
 
 export interface CsvPayload {
   fileName: string;
@@ -80,10 +80,15 @@ export function ImageDropzone({ onAdd, onCsv, onProject, itemCount, disabled = f
     async (files: File[]) => {
       if (!files.length) return;
       // A saved project restores a whole session; it outranks everything else in the drop.
-      const project = files.find(isProjectFile);
-      if (project && onProject) {
-        onProject(project);
-        return;
+      // Sniffed, not just extension-matched: an extension-stripped or .zip-renamed save must
+      // still open (sniffProjectFile reads 4 bytes at most — images and CSVs skip it by name).
+      if (onProject) {
+        for (const candidate of files) {
+          if (await sniffProjectFile(candidate)) {
+            onProject(candidate);
+            return;
+          }
+        }
       }
       // A CSV is a whole batch on its own, so it wins over anything else in the same drop.
       const csv = files.find(isCsvFile);
@@ -225,7 +230,7 @@ export function ImageDropzone({ onAdd, onCsv, onProject, itemCount, disabled = f
       <input
         ref={inputRef}
         type="file"
-        accept={`image/*,.heic,.heif,.csv,text/csv,${PROJECT_EXTENSION}`}
+        accept={`image/*,.heic,.heif,.csv,text/csv,${PROJECT_EXTENSION},.zip`}
         multiple
         hidden
         onChange={(e) => {

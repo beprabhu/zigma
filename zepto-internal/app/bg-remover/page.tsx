@@ -12,12 +12,17 @@ import {
   RefreshCwIcon,
   SaveIcon,
   TriangleAlertIcon,
+  SparklesIcon,
   WandSparklesIcon,
 } from 'lucide-react';
 import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog';
 import { MdFileIcon, MdFileTile } from '@/components/md-file-tile';
+import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
+  AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
 import { SessionHeader, type SessionChip } from '@/components/session-header';
 
 import { Badge } from '@/components/ui/badge';
@@ -63,10 +68,12 @@ import {
   type SafeAreaConfig,
 } from '@/lib/bg/safe-area';
 import {
-  SETUP_HINT, canRetry, canvasToPngBlob, canvasToPngBytes, createItems, describeDownload, draftsFromCsv, errorMessage,
+  SETUP_HINT, canRetry, canvasToPngBlob, canvasToPngBytes, createItems, csvCellKey, csvSourceUrl, describeDownload, draftsFromCsv, errorMessage,
   exportFileNames, flattenOnBackground, formatKb, isAbortError,
   decodeCutout, loadImageFromFile, looksLikeMissingWeights, mapWithLimit, needsCutout,
-  nextItemId, pickSave, previewScale, releaseCanvas, releaseItem, releaseOriginal, saveTo, withCutout,
+  nextItemId, pickSave, previewScale, releaseCanvas, releaseItem, releaseOriginal, sameCsvOrigin, saveTo, withCutout,
+  type CutoutItem,
+  type SaveDestination,
   type BgItem, type BgItemDraft, type BgItemSource, type BgItemStatus,
 } from '@/lib/bg/batch';
 import { useAutosave, type AutosaveRecord } from '@/lib/bg/autosave';
@@ -77,14 +84,27 @@ import {
   disposePool, getPoolBackend, isPoolSupported, poolRemoveBackground, warmPool,
   type PoolCutout,
 } from '@/lib/bg/pool';
-import { PROJECT_EXTENSION, loadProject, saveProject } from '@/lib/bg/project';
-import { assessQuality, countFlagged, sortByQuality } from '@/lib/bg/quality';
+import { PROJECT_EXTENSION, loadProject, saveProject, type ProjectCsv } from '@/lib/bg/project';
+import {
+  assessQuality, assessQueue, countQueueFilters, filterQueue, isAiGenerated, sortByQualityWith,
+  verdictLookup,
+  type QueueFilter, type QueueSort,
+} from '@/lib/bg/quality';
+import { QueueFilters } from '@/components/bg-remover/queue-filters';
+import { BatchList } from '@/components/bg-remover/batch-list';
+import {
+  DEFAULT_SEAL_SIZE, cleanUnexported, nextAllocation, planExport, planReexport, planSeal,
+  recordBatch, remainingUnexported, stampBatch, summarizeLedger,
+  type Allocation, type BatchRecord, type ExportPlan,
+} from '@/lib/bg/ledger';
 import { readParallel } from '@/lib/rate';
-import { DEFAULT_AI_PROMPT } from '@/lib/skills';
+import { createEta } from '@/lib/eta';
+import { DEFAULT_AI_PROMPT, matchSkill, useSkills } from '@/lib/skills';
 import { clearPreviews, dropPreview, usePreview } from '@/lib/bg/preview-store';
+import { readSession, restingStatus, saveSession, sessionKey } from '@/lib/bg/session-store';
 import { STORE_TYPE } from '@/lib/bg/constants';
 import { callAzure, loadImageFromUrl, mockComposite } from '@/lib/pipeline';
-import { buildZip, type ZipFileEntry } from '@/lib/zip';
+import { buildZipStream, type ZipStreamEntry } from '@/lib/zip';
 import { cn } from '@/lib/utils';
 import { usePersistedState } from '@/hooks/use-persisted-state';
 
@@ -186,6 +206,35 @@ async function cropToHero(item: BgItem, source: HTMLImageElement): Promise<HTMLI
 // Rebuilds a queue item from a crash-recovery record — the same shape project restore uses.
 // URL sources come back as URLs (redo works); AI-regenerated files come back as files (their
 // bytes were saved because they cost an Azure call); everything else is provenance-only.
+/**
+ * What survives a hop to another product. Not persistence — see lib/bg/session-store.ts; this
+ * only covers the route change the rail makes one click away, which used to take a half-finished
+ * batch with it. Run flags are deliberately absent: leaving aborts the batch, so coming back to
+ * a queue that claims to be running would be a lie.
+ */
+interface BgSession {
+  items: BgItem[];
+  sessionName: string;
+  selectedId: number | null;
+  queueFilter: QueueFilter;
+  queueSort: QueueSort;
+  ledger: BatchRecord[];
+  allocFloor: Allocation;
+  csvInfo: CsvInfo | null;
+  /** Ids already sent to Azure, so returning cannot re-buy an AI fix this session paid for. */
+  aiAttempted: number[];
+}
+
+const BG_SESSION = sessionKey<BgSession>('bg-remover');
+
+interface CsvInfo {
+  fileName: string;
+  text: string;
+  headers: string[];
+  imageColumns: string[];
+  nameColumn: string;
+}
+
 function itemFromAutosave(record: AutosaveRecord, id: number): BgItem {
   const source: BgItemSource = record.sourceUrl
     ? { kind: 'url', url: record.sourceUrl }
@@ -209,6 +258,14 @@ function itemFromAutosave(record: AutosaveRecord, id: number): BgItem {
     // A record without a cutout is an AI-regenerated source that crashed before re-removal —
     // it comes back queued, one "Remove backgrounds" away from where it left off.
     status: record.cutout ? 'done' : 'ready',
+    // Provenance has to come back with the row or a later remap has only the URL to go on, and
+    // one CSV row's images repeat across rows: two rows sharing a picture both took the first
+    // row's title, so restoring and then changing the name column mislabelled every duplicate.
+    ...(record.csv ? { csv: record.csv } : null),
+    ...(record.originalSourceUrl
+      ? { originalSource: { kind: 'url' as const, url: record.originalSourceUrl } }
+      : null),
+    ...(record.batch !== undefined ? { batch: record.batch } : null),
   };
 }
 
@@ -231,6 +288,9 @@ export default function BgRemover() {
   // Drops flat graphic panels (colour strips, badges) the matte kept as foreground. Off by
   // default: it is a heuristic, so it only ever runs where it was asked for.
   const [productOnly, setProductOnly] = usePersistedState('skuc_bgProductOnly', false);
+  // Continuously sends newly flagged cutouts through the AI edit, no button press per wave.
+  // Off by default: every send spends Azure money, so the standing order has to be explicit.
+  const [autoAiFix, setAutoAiFix] = usePersistedState('skuc_bgAutoAiFix', false);
   const [outputBg, setOutputBg] = usePersistedState('skuc_bgOutput', TRANSPARENT);
   // Save-project scope: embedding dropped files makes a .zesku self-contained (v2); off keeps
   // only cutouts + URLs for huge batches.
@@ -249,6 +309,11 @@ export default function BgRemover() {
   // default — with a bulk AI-fix button on the page, "no prompt" must never be a reachable state.
   const aiPrompt = storedAiPrompt.trim() ? storedAiPrompt : DEFAULT_AI_PROMPT;
   const promptCustomised = aiPrompt.trim() !== DEFAULT_AI_PROMPT.trim();
+  // Skill-driven, preset-style like Compose: the tile's caret menu derives which skill the
+  // current text equals; editing the text flips it to Custom without losing anything.
+  const { skills } = useSkills();
+  const aiSkillId = matchSkill(aiPrompt, skills);
+  const activeAiSkill = skills.find((sk) => sk.id === aiSkillId);
   // The AI-edit card shows the prompt as a compact .md tile; this opens its editor modal.
   const [promptEditorOpen, setPromptEditorOpen] = React.useState(false);
   // PNG file-size ceiling. Off by default: on, an export can lose colours or pixels, and that
@@ -278,7 +343,13 @@ export default function BgRemover() {
     : BUDGET_KB_DEFAULT;
 
   // ---- Queue ----
-  const [items, setItems] = React.useState<BgItem[]>([]);
+  // Seeded from the session store so a hop to another product and back returns the queue
+  // rather than an empty grid. readSession is a plain read, so StrictMode's second pass in dev
+  // gets the same snapshot instead of an emptied one.
+  const [items, setItems] = React.useState<BgItem[]>(() => readSession(BG_SESSION)?.items ?? []);
+  // Whether this mount inherited a live session rather than starting empty. Read once, before
+  // anything can add to the queue, because it decides how autosave treats the records on disk.
+  const adoptedSessionRef = React.useRef(items.length > 0);
   // Crash recovery: mirrors finished work into IndexedDB and offers the previous session back
   // after a crash. Declared against `items` so every mutation path syncs through one place.
   const {
@@ -286,55 +357,157 @@ export default function BgRemover() {
     restore: restoreAutosave,
     discard: discardAutosave,
     lastSavedAt: autosavedAt,
-  } = useAutosave(items);
+    failing: autosaveFailing,
+    saveCsv: autosaveCsv,
+  } = useAutosave(items, {
+    // A queue carried across a product switch is not a crash to recover from.
+    adopt: adoptedSessionRef.current,
+  });
+
+  /**
+   * Rebuilds the panel's CSV state from a saved sheet. `headers` is not stored — re-parsing the
+   * text is what the mapping UI needs anyway, and one parse on open is cheaper than carrying a
+   * second copy of the column list that could disagree with the text it came from.
+   */
+  const csvInfoFromSheet = React.useCallback((sheet: ProjectCsv) => {
+    const { headers } = draftsFromCsv(sheet.text, {
+      nameColumn: sheet.nameColumn || null,
+      imageColumns: sheet.imageColumns,
+    });
+    return {
+      fileName: sheet.fileName,
+      text: sheet.text,
+      headers,
+      imageColumns: sheet.imageColumns,
+      nameColumn: sheet.nameColumn,
+    };
+  }, []);
 
   // Figma-style "file name" for the session, shown in the panel header. Working state, not
   // decoration: it seeds the .zesku and export ZIP filenames. Auto-seeded from the first
   // CSV/project file dropped, but never over a name the user already typed.
-  const [sessionName, setSessionName] = React.useState('');
+  const [sessionName, setSessionName] = React.useState(() => readSession(BG_SESSION)?.sessionName ?? '');
   const sessionSlug = sessionName.trim().replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '');
   const seedSessionName = React.useCallback((fileName: string) => {
     setSessionName((prev) => (prev.trim() ? prev : fileName.replace(/\.[^.]+$/, '')));
   }, []);
 
-  React.useEffect(() => {
-    if (!autosavePending) return;
-    const { count, savedAt } = autosavePending;
-    toast(`Unsaved session found — ${count} image${count === 1 ? '' : 's'}`, {
-      // Fixed id: React 18 dev double-fires effects, and two identical prompts reads as a bug.
-      id: 'bg-autosave-restore',
-      duration: Infinity,
-      description: `Autosaved ${new Date(savedAt).toLocaleString()}. Restore it, or discard to start fresh.`,
-      action: {
-        label: 'Restore',
-        onClick: () => {
-          void restoreAutosave().then((records) => {
-            setItems((prev) => {
-              const base = nextItemId(prev);
-              return [...prev, ...records.map((r, i) => itemFromAutosave(r, base + i))];
-            });
-            toast.success(`Restored ${records.length} image${records.length === 1 ? '' : 's'}.`);
-          });
-        },
-      },
-      cancel: { label: 'Discard', onClick: () => discardAutosave() },
+  // Restore/discard is asked in a BLOCKING dialog, not a toast. The old corner toast was
+  // ignorable, and while the decision is pending, autosave holds ALL writes — an ignored
+  // toast meant entire sessions ran with crash protection silently off. The dialog closes
+  // only through one of its two buttons.
+  const handleRestoreAutosave = React.useCallback(() => {
+    void restoreAutosave().then((records) => {
+      if (!records.length) return; // second click of a double-click — nothing left to restore
+      setItems((prev) => {
+        const base = nextItemId(prev);
+        return [...prev, ...records.map((r, i) => itemFromAutosave(r, base + i))];
+      });
+      // Only when this session has no sheet of its own: a recovered queue must never displace
+      // the CSV the user is already working against.
+      if (records.csv) setCsvInfo((prev) => prev ?? csvInfoFromSheet(records.csv!));
+      toast.success(`Restored ${records.length} image${records.length === 1 ? '' : 's'}.`);
     });
-  }, [autosavePending, restoreAutosave, discardAutosave]);
-  const [selectedId, setSelectedId] = React.useState<number | null>(null);
-  // Display-only reordering for the results grid — never touches `items`, so export naming and
-  // retry-by-id are unaffected. Worst-first; ties keep queue order (Array#sort is stable).
-  const [qualitySort, setQualitySort] = React.useState(false);
-  const flaggedCount = React.useMemo(() => countFlagged(items), [items]);
-  // What "AI-fix flagged" operates on. Archived items are excluded — they have no original
-  // image left to send to the model.
+  }, [restoreAutosave, csvInfoFromSheet]);
+  const [selectedId, setSelectedId] = React.useState<number | null>(
+    () => readSession(BG_SESSION)?.selectedId ?? null,
+  );
+  // Display-only view of the queue — filtering and sorting never touch `items`, so export
+  // naming, retry-by-id and batch membership are all unaffected by what is on screen.
+  const [queueFilter, setQueueFilter] = React.useState<QueueFilter>(
+    () => readSession(BG_SESSION)?.queueFilter ?? 'all',
+  );
+  const [queueSort, setQueueSort] = React.useState<QueueSort>(
+    () => readSession(BG_SESSION)?.queueSort ?? 'queue',
+  );
+  // Assessed once per queue change. The verdict is pure arithmetic, but it was being recomputed
+  // in two memos plus once per visible cell per render; the filter needs it for every item, so
+  // one pass feeds all of them.
+  const verdicts = React.useMemo(() => assessQueue(items), [items]);
+  const verdictOf = React.useMemo(() => verdictLookup(verdicts), [verdicts]);
+  const filterCounts = React.useMemo(
+    () => countQueueFilters(items, verdictOf),
+    [items, verdictOf],
+  );
+  const flaggedCount = filterCounts.flagged;
+  // What "AI-fix flagged" operates on — a WORKLIST, not the view. Archived items are excluded
+  // because they have no original left to send to the model, which is why this count can sit
+  // below the flagged chip's: the chip shows every flagged tile, including the unfixable ones.
+  // Deriving one from the other would either hide tiles or promise fixes that cannot happen.
   const flaggedItems = React.useMemo(
-    () => items.filter((item) => canRetry(item) && assessQuality(item).level !== 'ok'),
-    [items],
+    () => items.filter((item) => canRetry(item) && verdictOf(item).level !== 'ok'),
+    [items, verdictOf],
   );
-  const displayItems = React.useMemo(
-    () => (qualitySort ? sortByQuality(items) : items),
-    [items, qualitySort],
+  // ---- Export ledger ----
+  // A batch is born when it is EXPORTED, never when it is flagged: flagged-ness changes the
+  // moment an AI fix lands, so a cohort defined by it would leak members and those images would
+  // end up in no ZIP at all. "Clean" ships now, "the rest" ships when the user says so, and the
+  // two together are always exactly the queue.
+  const [ledger, setLedger] = React.useState<BatchRecord[]>(() => readSession(BG_SESSION)?.ledger ?? []);
+  /**
+   * Batches whose numbers and file range are allocated but whose ZIP is not on disk yet — sealed
+   * and waiting for the click that a save dialog legally needs, or currently encoding, or failed
+   * and awaiting a retry. They keep their claim the whole time: encoding takes minutes and the
+   * stamp only lands on success, so anything that forgot them would hand the same images and the
+   * same file numbers to a second ZIP.
+   */
+  const [openPlans, setOpenPlans] = React.useState<ExportPlan[]>([]);
+  const claimed = React.useMemo(
+    () => new Set(openPlans.flatMap((plan) => plan.items.map((it) => it.id))),
+    [openPlans],
   );
+  // Set in Settings -> Defaults; usePersistedState syncs the change into this tab live.
+  const [sealSize] = usePersistedState('skuc_bgSealSize', DEFAULT_SEAL_SIZE);
+  const [selectedBatch, setSelectedBatch] = React.useState<number | null>(null);
+  const [exportingBatch, setExportingBatch] = React.useState<number | null>(null);
+  // Files already written cannot be un-written, so numbering may never retreat into names that
+  // exist — not when shipped rows are deleted, and not when a restore brings back stamps without
+  // their records. Moved when a range is handed out, never when it lands.
+  const allocFloorRef = React.useRef<Allocation>(
+    readSession(BG_SESSION)?.allocFloor ?? { batch: 1, offset: 0 },
+  );
+
+  const displayItems = React.useMemo(() => {
+    const byBatch =
+      selectedBatch === null ? items : items.filter((it) => it.batch === selectedBatch);
+    const shown = filterQueue(byBatch, queueFilter, verdictOf);
+    return queueSort === 'quality' ? sortByQualityWith(shown, verdictOf) : shown;
+  }, [items, selectedBatch, queueFilter, queueSort, verdictOf]);
+
+  const cleanCohort = React.useMemo(
+    () => cleanUnexported(items, verdictOf, { claimed }),
+    [items, verdictOf, claimed],
+  );
+  const restCohort = React.useMemo(() => remainingUnexported(items, { claimed }), [items, claimed]);
+  const ledgerSummary = React.useMemo(
+    () => summarizeLedger(items, ledger, { claimed }),
+    [items, ledger, claimed],
+  );
+
+  /**
+   * Rows for both halves of a batch's life: rows already on disk come from the ledger, rows
+   * sealed but not yet downloaded come from the open plans — a sealed batch has its number the
+   * moment it is allocated, so it gets a chip and a Download button straight away instead of
+   * being invisible until its file exists.
+   */
+  const batchRows = React.useMemo(() => {
+    const shipped = ledgerSummary.batches.map((b) => ({
+      batch: b.batch,
+      done: b.present,
+      total: b.shipped ?? b.present,
+      downloaded: true,
+      stale: b.staleness === 'stale',
+    }));
+    // No custom label: the list renders its own state chip, and "Batch 1 · ready" beside a
+    // "ready" chip said the same thing twice.
+    const waiting = openPlans.map((plan) => ({
+      batch: plan.batch,
+      done: plan.items.length,
+      total: plan.items.length,
+      downloaded: false,
+    }));
+    return [...shipped, ...waiting].sort((a, b) => a.batch - b.batch);
+  }, [ledgerSummary, openPlans]);
 
   // ---- Run state ----
   const [running, setRunning] = React.useState(false);
@@ -342,7 +515,18 @@ export default function BgRemover() {
   const [warming, setWarming] = React.useState(false);
   /** True while "AI-fix flagged" is mid-flight through Azure (before the re-removal batch). */
   const [aiFixing, setAiFixing] = React.useState(false);
+  /** The removal run's line. Owned by runBatchInner alone — see exportProgress. */
   const [progress, setProgress] = React.useState<{ pct: number; text: string } | null>(null);
+  /** The Azure phase's own progress line — it may run concurrently with a removal batch. */
+  const [aiProgress, setAiProgress] = React.useState<{ pct: number; text: string } | null>(null);
+  /**
+   * The export's own line. Separate from `progress` because the two phases can be live at the
+   * same time once a finished batch is downloadable while a later one still runs: sharing one
+   * bar meant the encode counter and the run's ETA overwrote each other every tick.
+   */
+  const [exportProgress, setExportProgress] = React.useState<{ pct: number; text: string } | null>(
+    null,
+  );
   const [download, setDownload] = React.useState<LoadProgress | null>(null);
   const [stage, setStage] = React.useState<RemoveStage | null>(null);
   const [setupError, setSetupError] = React.useState<string | null>(null);
@@ -361,9 +545,35 @@ export default function BgRemover() {
   // Separate from abortRef (removal batches): Cancel during an AI-edit Azure phase aborts the
   // in-flight generation requests; already-regenerated rows keep their (paid-for) results.
   const aiAbortRef = React.useRef<AbortController | null>(null);
+  // Mirrors `running` for code that decides across awaits. The AI-edit phase may overlap a
+  // removal batch, so its closures' `busy`/`running` are stale by the time Azure answers —
+  // the ref is what prevents a second concurrent batch from starting.
+  const runningRef = React.useRef(false);
+  // Regenerated images that finished their Azure phase while a removal batch was running.
+  // They need re-removal, which wants the same GPU workers the batch is saturating — so they
+  // wait here and the batch drains them before it releases the lock.
+  const deferredReRemovalRef = React.useRef<BgItem[]>([]);
+  // Every id that has been through an AI edit once, manual or auto. The auto-fix watcher never
+  // resends one: an image that comes back still flagged after its regeneration would otherwise
+  // cycle through Azure forever, spending money on an image the model cannot fix.
+  const aiAttemptedRef = React.useRef<Set<number>>(new Set(readSession(BG_SESSION)?.aiAttempted));
   // The run loop reads the queue across awaits, so it needs the committed value, not a closure.
   const itemsRef = React.useRef<BgItem[]>(items);
   React.useEffect(() => { itemsRef.current = items; }, [items]);
+
+  // The unmount cleanup runs once, so its closure is the FIRST render's — it would snapshot an
+  // empty session. Everything it needs is mirrored here on every commit instead.
+  const sessionRef = React.useRef<BgSession>({
+    items,
+    sessionName,
+    selectedId,
+    queueFilter,
+    queueSort,
+    csvInfo: null,
+    ledger: [],
+    allocFloor: { batch: 1, offset: 0 },
+    aiAttempted: [],
+  });
 
   // Leaving the product must stop inference (the models hold the main thread otherwise) and hand
   // back every object URL the decoded originals are holding — a client-side route change keeps
@@ -371,6 +581,27 @@ export default function BgRemover() {
   React.useEffect(
     () => () => {
       abortRef.current?.abort();
+      // The AI phase can outlive the page too — without this, in-flight Azure requests keep
+      // running (and spending) after navigation, then respawn the disposed worker pool.
+      aiAbortRef.current?.abort();
+      // Snapshot BEFORE the teardown below, then hand back every decoded original: releaseItem
+      // revokes those blob: URLs and clearPreviews closes the cached bitmaps, so a snapshot that
+      // kept them would revive a queue of broken images. `original` re-decodes from `source` on
+      // demand, so dropping it costs one read and nothing else.
+      //
+      // Statuses have to come to rest as well. The aborts above resolve their cancellation
+      // patches after this component is gone, so those writes never commit — without this, rows
+      // caught mid-run come back as permanent spinners, and one stuck in 'editing' refuses any
+      // further AI edit.
+      saveSession(BG_SESSION, {
+        ...sessionRef.current,
+        items: itemsRef.current.map((item) => ({
+          ...item,
+          original: null,
+          status: restingStatus(item.status, item.cutout !== null),
+        })),
+        aiAttempted: [...aiAttemptedRef.current],
+      });
       itemsRef.current.forEach(releaseItem);
       // Decoded previews are cache-owned; nothing else would ever close them.
       clearPreviews();
@@ -481,9 +712,44 @@ export default function BgRemover() {
   const displayIds = React.useMemo(() => displayItems.map((it) => it.id), [displayItems]);
   const gridSel = useGridSelection(displayIds, compareId !== null);
 
+  // Selection is dropped whenever the view changes. useGridSelection prunes its checked set
+  // against the visible order, so switching filters otherwise produces three different
+  // surprises: ids checked while hidden reappear when the filter clears, a toggle while
+  // filtered silently drops them for good, and select-all replaces them wholesale. Clearing is
+  // the one behaviour that reads the same in all three.
+  const changeQueueFilter = React.useCallback(
+    (next: QueueFilter) => {
+      setQueueFilter(next);
+      gridSel.clear();
+    },
+    [gridSel],
+  );
+
   const patchItem = React.useCallback((id: number, patch: Partial<BgItem>) => {
     setItems((prev) => prev.map((item) => (item.id === id ? { ...item, ...patch } : item)));
   }, []);
+
+  // Applies `patch` only while the item's source is still `source`, checked INSIDE the updater
+  // so the test and the write are atomic in React's queue. A pre-checked patch (read itemsRef,
+  // then patchItem) loses to an Undo committed in the ref's one-task sync lag; this cannot.
+  // `onStale` builds the replacement patch from the live item when the source moved on.
+  const patchItemIfSource = React.useCallback(
+    (
+      id: number,
+      source: BgItemSource,
+      patch: Partial<BgItem>,
+      onStale?: (live: BgItem) => Partial<BgItem>,
+    ) => {
+      setItems((prev) =>
+        prev.map((item) => {
+          if (item.id !== id) return item;
+          if (item.source === source) return { ...item, ...patch };
+          return onStale ? { ...item, ...onStale(item) } : item;
+        }),
+      );
+    },
+    [],
+  );
 
   const handleAdd = React.useCallback((drafts: BgItemDraft[]) => {
     setItems((prev) => [...prev, ...createItems(drafts, nextItemId(prev))]);
@@ -493,26 +759,68 @@ export default function BgRemover() {
   // The page owns CSV imports (not the dropzone) so the user can remap which column names the
   // images and which columns hold URLs. One CSV batch at a time: remapping — or dropping a new
   // CSV — replaces the previous CSV's items while file/paste items stay untouched.
-  const [csvInfo, setCsvInfo] = React.useState<{
-    fileName: string;
-    text: string;
-    headers: string[];
-    imageColumns: string[];
-    nameColumn: string;
-  } | null>(null);
+  const [csvInfo, setCsvInfo] = React.useState<CsvInfo | null>(
+    () => readSession(BG_SESSION)?.csvInfo ?? null,
+  );
+  /**
+   * A name-column change is a pure rename, so it must never go through replaceCsvItems: that
+   * path keys membership off the source kind, and an AI edit has already swapped the source to
+   * a file. Those rows kept their old name while a duplicate was minted for them under the new
+   * one. Matching on the CSV cell reaches every row — edited, in flight, or untouched — and
+   * touches nothing else: no membership change, no reorder, no ids, no cutouts.
+   */
+  const renameCsvItems = React.useCallback((drafts: BgItemDraft[]) => {
+    // Each cell carries the URL it names, because a cell is a position and positions repeat
+    // across files: without the check, a row left over from an earlier CSV takes the new file's
+    // title for the same row number and the export ships one product's picture under another's.
+    const byCell = new Map<string, { name: string; url: string | null }>();
+    const nameByUrl = new Map<string, string>();
+    for (const draft of drafts) {
+      const url = draft.source.kind === 'url' ? draft.source.url : null;
+      if (draft.csv) byCell.set(csvCellKey(draft.csv), { name: draft.name, url });
+      // Fallback for rows imported before provenance existed (restored projects and older
+      // autosaves): first URL wins, matching the old by-URL behaviour for duplicates.
+      if (url && !nameByUrl.has(url)) nameByUrl.set(url, draft.name);
+    }
+    setItems((prev) =>
+      prev.map((it) => {
+        const url = csvSourceUrl(it);
+        const cell = it.csv ? byCell.get(csvCellKey(it.csv)) : undefined;
+        const name =
+          (cell && cell.url === url ? cell.name : undefined) ??
+          (url ? nameByUrl.get(url) : undefined);
+        // Unchanged rows keep their object identity, so the memoised cells do not repaint and
+        // autosave's identity diff does not rewrite records that did not actually change.
+        return name === undefined || name === it.name ? it : { ...it, name };
+      }),
+    );
+  }, []);
+
   const replaceCsvItems = React.useCallback((drafts: BgItemDraft[]) => {
     // Everything is computed OUTSIDE the updater: updaters must be pure, and StrictMode runs
     // them twice. CSV membership is the source kind itself — URLs only ever enter through a
     // CSV, so kind 'url' IS "belongs to the current CSV" and no id bookkeeping can go stale.
     const current = itemsRef.current;
     const prevCsv = current.filter((it) => it.source.kind === 'url');
+    const kept = current.filter((it) => it.source.kind !== 'url');
 
-    // Remapping must not throw finished work away. Rows are matched to the new drafts by URL:
-    // a name-column change maps every row onto itself and only renames it, cutouts intact; an
-    // image-column change keeps whatever URLs survive. Duplicate URLs pair off in order — the
-    // cursor map walks each URL's rows front to back.
+    // An AI edit moves a row out of the 'url' population and into `kept`, but it still stands
+    // for its CSV cell. Without this the row is minted a second time under a fresh id — a
+    // visible duplicate, and one the AI-fix dedupe has never seen, so it can be paid for at
+    // Azure all over again. The URL is stored alongside so the claim only suppresses the row it
+    // is actually standing in for: a position claimed against one file must not swallow the
+    // same-numbered row of the next, which vanished from the queue with nothing said.
+    const claimed = new Map<string, string | null>();
+    for (const it of kept) if (it.csv) claimed.set(csvCellKey(it.csv), csvSourceUrl(it));
+
+    // Remapping must not throw finished work away. Rows are matched to the new drafts by their
+    // CSV cell, with the URL as the fallback for rows imported before provenance existed. The
+    // cell is what makes duplicate URLs pair off correctly: the plain per-URL cursor walked
+    // them positionally, so one removed duplicate cross-assigned every later row's name.
+    const byCell = new Map<string, BgItem>();
     const byUrl = new Map<string, BgItem[]>();
     for (const it of prevCsv) {
+      if (it.csv) byCell.set(csvCellKey(it.csv), it);
       if (it.source.kind !== 'url') continue;
       const list = byUrl.get(it.source.url);
       if (list) list.push(it);
@@ -523,18 +831,33 @@ export default function BgRemover() {
     let nextId = nextItemId(current);
     const fresh: BgItem[] = [];
     for (const draft of drafts) {
-      let match: BgItem | undefined;
-      if (draft.source.kind === 'url') {
-        const list = byUrl.get(draft.source.url);
-        const at = cursor.get(draft.source.url) ?? 0;
-        if (list && at < list.length) {
-          match = list[at];
-          cursor.set(draft.source.url, at + 1);
-        }
+      const cell = draft.csv ? csvCellKey(draft.csv) : '';
+      const draftUrl = draft.source.kind === 'url' ? draft.source.url : null;
+      // Already on screen as an AI-edited row — minting a second one is the duplicate bug.
+      if (cell && claimed.has(cell) && claimed.get(cell) === draftUrl) continue;
+      let match = cell ? byCell.get(cell) : undefined;
+      // A cell alone does not identify a row: it is a position, and every sheet exported from
+      // the same template repeats it. Reusing on a bare cell hit handed the new row the old
+      // file's URL and cutout, so a corrected CSV re-dropped over its own queue kept serving
+      // the picture the correction was meant to replace.
+      if (match && (reused.has(match.id) || csvSourceUrl(match) !== draftUrl)) match = undefined;
+      if (!match && draft.source.kind === 'url') {
+        const list = byUrl.get(draft.source.url) ?? [];
+        let at = cursor.get(draft.source.url) ?? 0;
+        // Skip rows already claimed by a cell match, or the same item pairs off twice.
+        while (at < list.length && reused.has(list[at].id)) at += 1;
+        if (at < list.length) match = list[at];
+        cursor.set(draft.source.url, at + (match ? 1 : 0));
       }
       if (match) {
         reused.add(match.id);
-        fresh.push(match.name === draft.name ? match : { ...match, name: draft.name });
+        // Provenance is refreshed from the draft: an image-column remap can move a kept row to
+        // a different column, and stale provenance would make the next rename miss it.
+        fresh.push(
+          match.name === draft.name && sameCsvOrigin(match.csv, draft.csv)
+            ? match
+            : { ...match, name: draft.name, ...(draft.csv ? { csv: draft.csv } : null) },
+        );
       } else {
         fresh.push(createItems([draft], nextId)[0]);
         nextId += 1;
@@ -548,9 +871,62 @@ export default function BgRemover() {
       releaseItem(it);
       dropPreview(it.id);
     }
-    const kept = current.filter((it) => it.source.kind !== 'url');
     setItems([...kept, ...fresh]);
   }, []);
+
+  // Live sealing. Reads the COMMITTED queue, not the run loop's lagging ref: "have enough clean
+  // results accumulated" can only be answered by the array React has actually rendered.
+  //
+  // A seal claims its cohort and stops there — it deliberately does not open a save dialog,
+  // because it fires mid-run with no user gesture behind it and the browser would refuse one.
+  // The rail shows the sealed batch with a Download button and the user's click supplies the
+  // gesture, while the next batch is already filling behind it.
+  React.useEffect(() => {
+    if (!running) return;
+    const plan = planSeal(items, verdictOf, {
+      threshold: sealSize,
+      alloc: nextAllocation(items, ledger, openPlans, allocFloorRef.current),
+      ledger,
+      claimed,
+    });
+    if (!plan) return;
+    openPlan(plan);
+    toast.info(`Batch ${plan.batch} sealed — ${plan.items.length} clean images ready to download.`);
+  }, [items, verdictOf, running, sealSize, ledger, openPlans, claimed]);
+
+  // Feeds the once-only unmount snapshot with current values instead of first-render ones.
+  React.useEffect(() => {
+    sessionRef.current = {
+      items,
+      sessionName,
+      selectedId,
+      queueFilter,
+      queueSort,
+      csvInfo,
+      ledger,
+      allocFloor: allocFloorRef.current,
+      aiAttempted: [...aiAttemptedRef.current],
+    };
+  });
+
+  // Mirrors the sheet into the crash net alongside the items. The ref is what stops a fresh
+  // mount from writing a null: that would delete a crashed session's CSV before its restore
+  // prompt has even been answered. Only a sheet that existed in THIS session can clear one.
+  const csvMirrored = React.useRef(false);
+  React.useEffect(() => {
+    if (!csvInfo && !csvMirrored.current) return;
+    csvMirrored.current = true;
+    autosaveCsv(
+      csvInfo
+        ? {
+            fileName: csvInfo.fileName,
+            text: csvInfo.text,
+            nameColumn: csvInfo.nameColumn,
+            imageColumns: csvInfo.imageColumns,
+          }
+        : null,
+    );
+  }, [csvInfo, autosaveCsv]);
 
   const handleCsv = React.useCallback(
     ({ fileName, text, imported }: CsvPayload) => {
@@ -576,7 +952,10 @@ export default function BgRemover() {
     const imageColumns = next.imageColumns ?? csvInfo.imageColumns;
     const imported = draftsFromCsv(csvInfo.text, { nameColumn: nameColumn || null, imageColumns });
     setCsvInfo({ ...csvInfo, nameColumn, imageColumns });
-    replaceCsvItems(imported.drafts);
+    // Only an image-column change alters WHICH rows are queued; renaming must not go near the
+    // replace path, which would reorder the queue and duplicate every AI-edited row.
+    if (next.imageColumns === undefined) renameCsvItems(imported.drafts);
+    else replaceCsvItems(imported.drafts);
     if (!imported.drafts.length) toast.warning('No image URLs under the selected columns.');
   }
 
@@ -591,11 +970,32 @@ export default function BgRemover() {
     try {
       // v2: EVERY item goes in — unprocessed rows too — with sources (URLs as strings, files
       // as embedded originals unless the size checkbox says otherwise).
-      const blob = await saveProject(all, safeArea, outputBg, { includeOriginals: saveOriginals });
+      let skippedCount = 0;
+      const blob = await saveProject(all, safeArea, outputBg, {
+        includeOriginals: saveOriginals,
+        // The sheet travels with the queue: without it a reopened project cannot re-derive the
+        // column mapping, so the name column can never be changed again.
+        csv: csvInfo
+          ? {
+              fileName: csvInfo.fileName,
+              text: csvInfo.text,
+              nameColumn: csvInfo.nameColumn,
+              imageColumns: csvInfo.imageColumns,
+            }
+          : undefined,
+        onSkip: (skipped) => {
+          skippedCount = skipped.length;
+          const names = skipped.slice(0, 3).map((s) => s.name).join(', ');
+          toast.warning(
+            `${skipped.length} unreadable item${skipped.length === 1 ? '' : 's'} left out of the save (${names}${skipped.length > 3 ? ', …' : ''}) — full list in skipped.json inside the file. Those rows are still in the queue; redo them before clearing it.`,
+            { duration: Infinity },
+          );
+        },
+      });
       await saveTo(dest, blob, projectName);
-      const cutouts = withCutout(all).length;
+      const cutouts = withCutout(all).length - skippedCount;
       toast.success(
-        `Saved ${all.length} image${all.length === 1 ? '' : 's'} (${cutouts} finished) — originals ${saveOriginals ? 'included' : 'skipped'} (Settings → Defaults).`,
+        `Saved ${all.length} image${all.length === 1 ? '' : 's'} (${cutouts} finished${skippedCount ? `, ${skippedCount} skipped` : ''}) — originals ${saveOriginals ? 'included' : 'skipped'} (Settings → Defaults).`,
       );
     } catch (e) {
       toast.error(`Could not save the project: ${errorMessage(e)}`);
@@ -626,10 +1026,20 @@ export default function BgRemover() {
               // v2 can restore rows that were saved before they ran.
               status: r.cutout ? 'done' : 'ready',
               ...(r.tileFit !== undefined ? { tileFit: r.tileFit } : null),
+              // Same reason as the autosave path: without the cell a later remap falls back to
+              // the URL, and rows that share a picture cannot be told apart.
+              ...(r.csv ? { csv: r.csv } : null),
+              ...(r.originalSourceUrl
+                ? { originalSource: { kind: 'url' as const, url: r.originalSourceUrl } }
+                : null),
+              ...(r.batch !== undefined ? { batch: r.batch } : null),
             }),
           ),
         ];
       });
+      // Same rule as the autosave restore: the file's sheet fills an empty panel, it never
+      // replaces the CSV this session is already mapped against.
+      if (restored.csv) setCsvInfo((prev) => prev ?? csvInfoFromSheet(restored.csv!));
       setSafeArea(restored.safeArea);
       setOutputBg(restored.outputBg);
       setTileFitOn(true);
@@ -745,21 +1155,31 @@ export default function BgRemover() {
     // is still null; releasing it must be handed the element we actually decoded or the object
     // URL loadImageFromFile minted is never revoked.
     releaseOriginal({ ...item, original });
-    patchItem(item.id, {
-      cutout: {
-        blob: produced.blob,
-        bounds: produced.bounds,
-        width: produced.width,
-        height: produced.height,
-        residueFraction: produced.residueFraction,
+    // The item may have been undone while this inference ran (the AI-fix undo toast overlaps
+    // the deferred re-removal drain): the result then belongs to an input the user rejected.
+    // The source check lives inside the updater — atomic with the write — so no ordering of
+    // undo-commit vs worker-completion can pair the old source with this cutout. On staleness
+    // the result is discarded and the status our stage callbacks stomped is repaired.
+    patchItemIfSource(
+      item.id,
+      item.source,
+      {
+        cutout: {
+          blob: produced.blob,
+          bounds: produced.bounds,
+          width: produced.width,
+          height: produced.height,
+          residueFraction: produced.residueFraction,
+        },
+        original: null,
+        status: 'done',
+        durationMs: produced.durationMs,
+        removedRegions: produced.removedRegions,
+        regionReport: produced.regionReport,
+        error: undefined,
       },
-      original: null,
-      status: 'done',
-      durationMs: produced.durationMs,
-      removedRegions: produced.removedRegions,
-      regionReport: produced.regionReport,
-      error: undefined,
-    });
+      (live) => ({ status: live.cutout ? 'done' : 'ready', original: null }),
+    );
     setLoadedModels((prev) => (prev.includes(runModel) ? prev : [...prev, runModel]));
   }
 
@@ -779,27 +1199,31 @@ export default function BgRemover() {
     const inFlight = usePool ? POOL_CONCURRENCY : 1;
     let started = 0;
     let finished = 0;
+    const eta = createEta();
 
     const settleOne = (item: BgItem, e?: unknown) => {
       finished++;
       if (!e) {
         done++;
       } else if (isAbortError(e)) {
-        patchItem(item.id, { status: 'cancelled' });
+        // Conditional like cutOut's result patch: an item undone mid-flight keeps its restored
+        // state instead of wearing this run's cancelled/error badge.
+        patchItemIfSource(item.id, item.source, { status: 'cancelled' });
         cancelled = true;
       } else {
         // One bad image must never end the batch.
         const message = errorMessage(e);
         failed++;
-        patchItem(item.id, { status: 'error', error: message });
+        patchItemIfSource(item.id, item.source, { status: 'error', error: message });
         // A dead image URL also says 404/fetch — only blame the weights when the model
         // itself never became resident.
         if (!isModelLoaded(modelId) && looksLikeMissingWeights(message)) setSetupError(message);
         toast.error(`${item.name || 'Image'}: ${message}`);
       }
+      const left = eta.remaining(finished, targets.length);
       setProgress({
         pct: (finished / targets.length) * 100,
-        text: `${verb} ${Math.min(finished + 1, targets.length)} of ${targets.length}`,
+        text: `${verb} ${Math.min(finished + 1, targets.length)} of ${targets.length}${left ? ` · ${left}` : ''}`,
       });
     };
 
@@ -839,20 +1263,72 @@ export default function BgRemover() {
   }
 
   async function runBatch(targets: BgItem[], verb: string, overrides?: RunOverrides) {
-    if (busy || !targets.length) return;
+    // The ref, not `busy`: the AI-edit flow calls this after an await, when its closure's
+    // `busy` no longer reflects whether a batch is running.
+    if (runningRef.current || exporting || warming || !targets.length) return;
     const ctrl = new AbortController();
     abortRef.current = ctrl;
+    runningRef.current = true;
     setRunning(true);
     setSetupError(null);
     setCompressSummary('');
     try {
       await runBatchInner(targets, verb, ctrl, overrides);
+      // Regenerated images whose Azure phase finished mid-batch queued here for re-removal.
+      // Drained before the lock releases, so "the run is finished" means all of it, and a
+      // concurrent handleRun can never double-process them. The loop re-checks because more
+      // can arrive while a drain batch runs.
+      while (!ctrl.signal.aborted && deferredReRemovalRef.current.length) {
+        const queued = deferredReRemovalRef.current;
+        deferredReRemovalRef.current = [];
+        // Skip only entries PROVABLY handled — a cutout already exists for this exact source,
+        // or the item is gone. itemsRef lags React's commit by one task, so a positive test
+        // ("looks fresh, run it") is the safe direction: worst case a since-undone entry burns
+        // one inference and cutOut's atomic source check discards the result. The inverse test
+        // ("looks stale, drop it") read the same lagging ref and could silently discard an
+        // entry whose regeneration simply hadn't committed yet — a promised re-removal that
+        // never happens.
+        const fresh = queued.filter((u) => {
+          const live = itemsRef.current.find((it) => it.id === u.id);
+          return !!live && !(live.source === u.source && live.cutout !== null);
+        });
+        if (fresh.length) await runBatchInner(fresh, 'Re-removing', ctrl);
+      }
     } finally {
+      // A cancelled run must not leave deferred work behind: those items are 'ready' with no
+      // cutout, so the ordinary Remove button covers them — and a leftover entry would
+      // otherwise fire unexpectedly at the end of some future batch. Say so — a toast already
+      // promised these items a re-removal, and a silently broken promise reads as a hang.
+      if (ctrl.signal.aborted && deferredReRemovalRef.current.length) {
+        const n = deferredReRemovalRef.current.length;
+        toast.info(
+          `${n} regenerated image${n === 1 ? '' : 's'} left in the queue — Remove backgrounds finishes them.`,
+        );
+      }
+      if (ctrl.signal.aborted) deferredReRemovalRef.current = [];
       // The lock must release even if something outside cutOut's own catch throws, or every
       // button on the page stays disabled until a reload — which also drops the queue.
+      runningRef.current = false;
       setRunning(false);
       abortRef.current = null;
     }
+  }
+
+  /**
+   * Re-removes backgrounds of AI-regenerated items, now or later: immediately when idle, or
+   * queued onto the running batch's tail when the workers are already saturated — that batch
+   * drains the queue before it releases the lock.
+   */
+  async function reRemoveOrDefer(updated: BgItem[]) {
+    if (!updated.length) return;
+    if (runningRef.current) {
+      deferredReRemovalRef.current.push(...updated);
+      toast.info(
+        `${updated.length} regenerated — re-removing backgrounds when the current batch finishes.`,
+      );
+      return;
+    }
+    await runBatch(updated, 'Re-removing');
   }
 
   function handleRun() {
@@ -914,8 +1390,10 @@ export default function BgRemover() {
       const file = new File([blob], `${item.name || 'image'}-ai-edit.png`, { type: 'image/png' });
 
       dropPreview(item.id);
-      const updated: BgItem = {
-        ...item,
+      // Only the fields the edit actually owns. `item` was captured before a network round trip
+      // that can take a minute, so patching the whole object back would silently revert
+      // anything changed meanwhile — a rename from a column remap, a tile-fit pin.
+      const patch: Partial<BgItem> = {
         source: { kind: 'file', file, regenerated: true },
         original: edited,
         cutout: null,
@@ -924,9 +1402,13 @@ export default function BgRemover() {
         durationMs: undefined,
         // Undo restores the pre-edit input AND its cutout in one step.
         prev: { source: item.source, cutout: item.cutout },
+        // Write-once: a second edit finds this already set and keeps the imported image rather
+        // than promoting the first AI output to "the original". `prev` holds one step only, so
+        // without this nothing in the item still pointed at the CSV picture after two edits.
+        originalSource: item.originalSource ?? item.source,
       };
-      patchItem(item.id, updated);
-      return updated;
+      patchItem(item.id, patch);
+      return { ...item, ...patch };
     } catch (e) {
       if (isAbortError(e)) {
         // Stopped, not failed — the tile goes back exactly where it was (nothing was replaced;
@@ -941,7 +1423,8 @@ export default function BgRemover() {
 
   /** ?mock=1 short-circuits Azure, same as the compositor. */
   async function handleAiEdit(item: BgItem, promptOverride?: string) {
-    if (busy || item.status === 'editing' || !canRetry(item)) return;
+    // Same relaxation as aiEditMany: a running removal batch is not a conflict.
+    if (aiFixing || exporting || warming || item.status === 'editing' || !canRetry(item)) return;
     const guards = aiEditGuards();
     if (!guards) return;
     const controller = new AbortController();
@@ -958,15 +1441,18 @@ export default function BgRemover() {
         controller.signal,
       );
     } finally {
-      aiAbortRef.current = null;
-      setAiFixing(false);
+      // Only while this run still owns the slot — see aiEditMany's teardown.
+      if (aiAbortRef.current === controller) {
+        aiAbortRef.current = null;
+        setAiFixing(false);
+      }
     }
     if (controller.signal.aborted) return; // stopped by the user — no error, no re-removal
     if (!updated) {
       toast.error('AI edit failed — see the image for the error.');
       return;
     }
-    await runBatch([updated], 'AI edit');
+    await reRemoveOrDefer([updated]);
   }
 
   /**
@@ -987,47 +1473,67 @@ export default function BgRemover() {
   }
 
   async function aiEditMany(targets: BgItem[]) {
-    if (busy || !targets.length) return;
+    // Deliberately NOT gated on `running`: the Azure phase is network-bound and runs fine
+    // alongside a removal batch — only the re-removal needs the workers, and that defers.
+    if (aiFixing || exporting || warming || !targets.length) return;
     const guards = aiEditGuards();
     if (!guards) return;
     const controller = new AbortController();
     aiAbortRef.current = controller;
     setAiFixing(true);
+    // Manual sends count as the attempt too — auto must never re-spend on an id a human
+    // already sent, whatever the result looked like.
+    for (const t of targets) aiAttemptedRef.current.add(t.id);
     let finished = 0;
-    setProgress({ pct: 0, text: `AI edit 1 of ${targets.length}` });
+    const eta = createEta();
+    // Its own progress line — a removal batch may own the main one at the same time.
+    setAiProgress({ pct: 0, text: `AI edit 1 of ${targets.length}` });
+    let updated: BgItem[] = [];
     try {
       const results = await mapWithLimit(targets, readParallel(), async (item) => {
         if (controller.signal.aborted) return null; // stopped: leave the rest untouched
         const updated = await aiEditOne(item, guards.prompt, guards.mock, controller.signal);
         finished++;
-        setProgress({
+        const left = eta.remaining(finished, targets.length);
+        setAiProgress({
           pct: (finished / targets.length) * 100,
-          text: `AI edit ${Math.min(finished + 1, targets.length)} of ${targets.length}`,
+          text: `AI edit ${Math.min(finished + 1, targets.length)} of ${targets.length}${left ? ` · ${left}` : ''}`,
         });
         return updated;
       });
-      const updated = results.filter((r): r is BgItem => r !== null);
+      updated = results.filter((r): r is BgItem => r !== null);
       if (controller.signal.aborted) {
+        // Stop means stop. Starting a re-removal here would race the batch teardown the same
+        // click triggered — one ordering silently discards it, the other launches a fresh
+        // batch right after the user asked for quiet. The items sit 'ready' with no cutout,
+        // so the ordinary Remove button covers them.
         toast.info(
-          `AI fix stopped — ${updated.length} of ${targets.length} regenerated${updated.length ? '; re-removing those' : ''}.`,
+          `AI fix stopped — ${updated.length} of ${targets.length} regenerated; they stay queued for Remove backgrounds.`,
         );
+        updated = [];
       } else {
         const failed = targets.length - updated.length;
         if (failed) {
           toast.error(`${failed} AI edit${failed === 1 ? '' : 's'} failed — their tiles show the error.`);
         }
       }
-      // Release the lock BEFORE the removal batch: runBatch takes running for itself, and this
-      // handler's stale `busy` closure would otherwise not matter — but the flag must not
-      // outlive the Azure phase it describes.
-      setAiFixing(false);
-      if (updated.length) {
-        await runBatch(updated, 'Re-removing');
-        offerUndo(updated.map((u) => u.id), 'AI-edited');
-      }
     } finally {
-      aiAbortRef.current = null;
-      setAiFixing(false);
+      // Teardown BEFORE the re-removal below, and only while this run still owns the slot: the
+      // button re-enables the moment aiFixing clears, so a second run may already be in flight
+      // by the time control returns here — its controller/progress must not be clobbered.
+      if (aiAbortRef.current === controller) {
+        aiAbortRef.current = null;
+        setAiFixing(false);
+        setAiProgress(null);
+      }
+    }
+    if (updated.length) {
+      // When idle this awaits the whole re-removal; when a batch is running it returns at
+      // once and the undo toast appears while the re-removal is still deferred. Safe either
+      // way: what undo restores (the pre-edit source + cutout) exists already, and cutOut's
+      // atomic source check discards any in-flight result for an undone item.
+      await reRemoveOrDefer(updated);
+      offerUndo(updated.map((u) => u.id), 'AI-edited', true);
     }
   }
 
@@ -1064,8 +1570,13 @@ export default function BgRemover() {
   }
 
   /** Post-batch toast with a one-click bulk undo over everything the batch replaced. */
-  function offerUndo(ids: number[], verb: string) {
-    const undoable = ids.filter((id) => itemsRef.current.find((it) => it.id === id)?.prev);
+  function offerUndo(ids: number[], verb: string, trustIds = false) {
+    // itemsRef lags React's commit, so a caller that JUST wrote prev onto these very items
+    // passes trustIds — filtering against the ref would undercount. undoItem re-checks prev
+    // at click time either way, so a trusted id can never undo something with nothing there.
+    const undoable = trustIds
+      ? ids
+      : ids.filter((id) => itemsRef.current.find((it) => it.id === id)?.prev);
     if (!undoable.length) return;
     toast.success(`${undoable.length} ${verb}`, {
       action: { label: 'Undo', onClick: () => undoable.forEach(undoItem) },
@@ -1175,23 +1686,92 @@ export default function BgRemover() {
 
   // ---- Export: render, optionally compress, zip ---------------------------
 
-  async function handleExport() {
-    const ready = withCutout(itemsRef.current);
-    if (!ready.length || busy) return;
+  /** The next unused batch number and file range, counting every plan still open. */
+  function allocate(): Allocation {
+    return nextAllocation(itemsRef.current, ledger, openPlans, allocFloorRef.current);
+  }
+
+  /** Reserves a plan's numbers immediately — an allocated range is spent whatever happens next. */
+  function openPlan(plan: ExportPlan) {
+    setOpenPlans((prev) => [...prev, plan]);
+    allocFloorRef.current = {
+      batch: Math.max(allocFloorRef.current.batch, plan.batch + 1),
+      offset: Math.max(allocFloorRef.current.offset, plan.offset + plan.items.length),
+    };
+  }
+
+  /**
+   * Writes one plan out and records it ONLY if the file actually reached disk. The order is the
+   * whole safety property: a stamp is what removes an image from every future cohort, so
+   * stamping a batch whose save failed would drop those pictures out of the remaining work with
+   * no ZIP anywhere containing them. A failed plan stays open, keeps its claim and keeps its
+   * chip, so the same Download button retries it under the same numbers.
+   */
+  async function runPlan(plan: ExportPlan, opts: { reexport?: boolean } = {}) {
+    if (exportingBatch !== null) return;
+    setExportingBatch(plan.batch);
+    try {
+      const saved = await exportItems(plan.items, {
+        suffix: `batch-${String(plan.batch).padStart(2, '0')}`,
+        offset: plan.offset,
+      });
+      if (!saved) return;
+      setItems((prev) => stampBatch(prev, plan));
+      const record = recordBatch(plan, { fileName: saved });
+      setLedger((prev) =>
+        opts.reexport
+          ? prev.map((row) => (row.batch === plan.batch ? record : row))
+          : [...prev, record],
+      );
+      setOpenPlans((prev) => prev.filter((p) => p !== plan));
+    } finally {
+      setExportingBatch(null);
+    }
+  }
+
+  /** Seals nothing — just hands the current cohort a range and a chip the user can download. */
+  function exportCohort(cohort: CutoutItem[]) {
+    const plan = planExport(cohort, allocate());
+    if (!plan) return;
+    openPlan(plan);
+    void runPlan(plan);
+  }
+
+  /**
+   * Renders, optionally compresses and zips one cohort. A batched run calls this per sealed
+   * batch rather than once over the whole queue, so everything that used to be implicitly "the
+   * queue" is a parameter now: which rows, what the ZIP is called, and where its numbering
+   * starts. `offset` is what stops every ZIP from opening with an `01-` file — unzip two of
+   * those into one folder and the second overwrites the first.
+   */
+  async function exportItems(
+    ready: CutoutItem[],
+    opts: { suffix?: string; offset?: number; dest?: SaveDestination } = {},
+  ) {
+    // Exports serialize against each other and wait for a model warm-up, but NOT for a run: a
+    // batch that sealed mid-run has to be able to write itself out while the workers keep going,
+    // which is the whole point of sealing early. The whole-queue button stays disabled by `busy`
+    // in the footer, so only a deliberate per-batch export takes this path. The encode side is
+    // bounded (a fixed number of lanes, each one image at a time) and reports on its own
+    // progress line, so it does not fight the run for either memory or the status bar.
+    if (!ready.length || exporting || warming) return;
     // Per-item now: each file renders by its own effective tile fit. Only the ZIP's name still
     // needs an overall shape — all-tiles / all-cutouts keep their old names, a mix says so.
     const tileCount = ready.filter((it) => effectiveTileFit(it)).length;
     const shape = tileCount === ready.length ? 'tiles' : tileCount === 0 ? 'cutouts' : 'mixed';
+    const suffix = opts.suffix ? `-${opts.suffix}` : '';
     // The save dialog opens now, while the click still counts as user activation — after
     // minutes of encoding Chrome would refuse it. Cancelling the dialog cancels the export.
     const zipName = sessionSlug
-      ? `${sessionSlug}-${shape === 'mixed' ? 'export' : shape}.zip`
+      ? `${sessionSlug}-${shape === 'mixed' ? 'export' : shape}${suffix}.zip`
       : shape === 'tiles'
-        ? 'safe-area-tiles.zip'
+        ? `safe-area-tiles${suffix}.zip`
         : shape === 'cutouts'
-          ? 'bg-cutouts.zip'
-          : 'zigma-export.zip';
-    const dest = await pickSave(zipName);
+          ? `bg-cutouts${suffix}.zip`
+          : `zigma-export${suffix}.zip`;
+    // A destination handed in was already chosen — an auto-saving run picked its folder once,
+    // at a click, and must not ask again per batch.
+    const dest = opts.dest ?? (await pickSave(zipName));
     if (dest === 'cancelled') return;
     // Snapshotted once: editing the ceiling mid-export must not give the ZIP two different rules.
     const budget = budgetActive
@@ -1200,7 +1780,7 @@ export default function BgRemover() {
 
     setExporting(true);
     setCompressSummary('');
-    const files: ZipFileEntry[] = [];
+    const files: ZipStreamEntry[] = [];
     let inTotal = 0;
     let outTotal = 0;
     let failed = 0;
@@ -1211,6 +1791,9 @@ export default function BgRemover() {
       // at once. The limit is what bounds peak memory: at most this many full-size canvases and
       // their encoded copies are alive together.
       let encoded = 0;
+      // Per-phase clocks: encode and compress throughputs differ wildly, so one shared
+      // tracker would carry the first phase's pace into the second.
+      const encodeEta = createEta();
       // One slot per file, filled in whatever order the lanes finish; null means the budget was
       // off for this run, so nothing about the file was negotiated.
       const outcomes = new Array<BudgetResult | null>(ready.length).fill(null);
@@ -1234,11 +1817,14 @@ export default function BgRemover() {
           // The compress half only exists when the compress switch is on; without it the encode
           // stage owns the whole bar, or it would stall at 50% until the run ended.
           const span = proc.compressOn ? 50 : 100;
-          setProgress({
+          const left = encodeEta.remaining(encoded, ready.length);
+          setExportProgress({
             pct: (encoded / ready.length) * span,
-            text: `Encoding ${encoded} of ${ready.length}…`,
+            text: `Encoding ${encoded} of ${ready.length}…${left ? ` · ${left}` : ''}`,
           });
-          return data;
+          // Blob, not bytes: Chrome pages blob data to disk, so a queue-scale export holds one
+          // image's bytes per lane instead of every PNG at once ("failed to allocate buffer").
+          return new Blob([data as BlobPart], { type: 'image/png' });
         } finally {
           full.close();
         }
@@ -1247,22 +1833,25 @@ export default function BgRemover() {
       // The processing space's shared compress step (pngquant + oxipng, local). A failure
       // keeps the uncompressed PNG rather than dropping an image.
       let compressed = 0;
+      const compressEta = createEta();
       const finalBytes = proc.compressOn
         ? await mapWithLimit(pngs, COMPRESS_CONCURRENCY, async (data, n) => {
             try {
-              const out = await proc.compressBytes(data);
-              inTotal += data.length;
+              const bytes = new Uint8Array(await data.arrayBuffer());
+              const out = await proc.compressBytes(bytes);
+              inTotal += bytes.length;
               outTotal += out.length;
-              return out;
+              return new Blob([out as BlobPart], { type: 'image/png' });
             } catch (e) {
               failed++;
               toast.error(`${ready[n].name || `Image ${n + 1}`}: ${errorMessage(e)}`);
               return data;
             } finally {
               compressed++;
-              setProgress({
+              const left = compressEta.remaining(compressed, ready.length);
+              setExportProgress({
                 pct: 50 + (compressed / ready.length) * 50,
-                text: `Compressing ${compressed} of ${ready.length}…`,
+                text: `Compressing ${compressed} of ${ready.length}…${left ? ` · ${left}` : ''}`,
               });
             }
           })
@@ -1270,7 +1859,7 @@ export default function BgRemover() {
 
       const names = exportFileNames(
         ready.map((item) => item.name),
-        { numbered: numberFiles },
+        { numbered: numberFiles, offset: opts.offset ?? 0 },
       );
       ready.forEach((item, n) => files.push({ name: names[n], data: finalBytes[n] }));
 
@@ -1283,7 +1872,7 @@ export default function BgRemover() {
       const shrunk = fitted.filter((entry) => entry.result.scale !== 1);
       // Judged on the bytes that actually go into the ZIP, not on what the ladder returned:
       // TinyPNG runs after the budget pass and can pull a near-miss back under the ceiling.
-      const missed = fitted.filter((entry) => finalBytes[entry.index].length > budgetKbSafe * 1024);
+      const missed = fitted.filter((entry) => finalBytes[entry.index].size > budgetKbSafe * 1024);
       let budgetLine = '';
       if (fitted.length) {
         const quantised = fitted.filter(
@@ -1319,10 +1908,10 @@ export default function BgRemover() {
       }
       if (missed.length) {
         const worst = missed.reduce((a, b) =>
-          finalBytes[a.index].length >= finalBytes[b.index].length ? a : b,
+          finalBytes[a.index].size >= finalBytes[b.index].size ? a : b,
         );
         toast.error(
-          `${missed.length} file${missed.length > 1 ? 's are' : ' is'} still over ${budgetKbSafe} KB — largest is ${formatKb(finalBytes[worst.index].length)} at ${describeBudget(worst.result)}: ${listNames(missed)}`,
+          `${missed.length} file${missed.length > 1 ? 's are' : ' is'} still over ${budgetKbSafe} KB — largest is ${formatKb(finalBytes[worst.index].size)} at ${describeBudget(worst.result)}: ${listNames(missed)}`,
         );
       }
 
@@ -1334,20 +1923,22 @@ export default function BgRemover() {
         );
       }
       setCompressSummary(summary.join(' · '));
-      setProgress({
+      setExportProgress({
         pct: 100,
         text: failed
           ? `Exported ${files.length} PNG${files.length > 1 ? 's' : ''} with ${failed} compression failure${failed > 1 ? 's' : ''}.`
           : `Exported ${files.length} PNG${files.length > 1 ? 's' : ''}.`,
       });
 
-      const blob = buildZip(files);
+      const blob = await buildZipStream(files);
       await saveTo(dest, blob, zipName);
+      return zipName;
     } catch (e) {
       toast.error(`Export failed: ${errorMessage(e)}`);
     } finally {
       setExporting(false);
     }
+    return undefined;
   }
 
   // ---- Shared panes ------------------------------------------------------
@@ -1435,6 +2026,25 @@ export default function BgRemover() {
   const aiReady =
     azureEndpoint.trim().length > 0 && azureKey.trim().length > 0 ||
     (typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('mock'));
+
+  // ---- Auto AI-fix: a standing order over the flagged list. ----
+  // Sends every not-yet-attempted flagged cutout through the AI edit the moment it appears —
+  // during a removal batch too (the Azure phase runs alongside; only the re-removal waits for
+  // the workers). One wave at a time: aiFixing gates re-entry, and its release re-runs this
+  // effect, which picks up whatever flagged while the wave flew. aiAttemptedRef (marked
+  // synchronously inside aiEditMany) is the dedupe — an effect re-fire between commits can
+  // never send the same id twice, and an image still flagged after its fix is never resent.
+  React.useEffect(() => {
+    if (!autoAiFix || !aiReady) return;
+    if (aiFixing || exporting || warming) return;
+    const wave = flaggedItems.filter((item) => !aiAttemptedRef.current.has(item.id));
+    if (!wave.length) return;
+    toast.info(`Auto AI-fix: sending ${wave.length} flagged image${wave.length === 1 ? '' : 's'}.`);
+    void aiEditMany(wave);
+    // aiEditMany is intentionally not a dependency: it is redeclared every render, and the
+    // attempted-set makes extra firings no-ops anyway.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoAiFix, aiReady, aiFixing, exporting, warming, flaggedItems]);
   const aiCard = (
     <PanelSection title="AI edit"
         hint="Send an image to Azure GPT-Image from its dialog; the result replaces the image and its background is removed again.">
@@ -1442,11 +2052,12 @@ export default function BgRemover() {
           {/* The .md tile is its own label — a "Prompt" heading above it read as a second
               section title. The per-image override note lives in the editor dialog. */}
           <MdFileTile
-            name="ai-edit-prompt.md"
+            name={activeAiSkill?.name ?? 'ai-edit-prompt.md'}
             text={aiPrompt}
-            badge={promptCustomised ? 'Customised' : 'Default'}
+            badge={activeAiSkill ? (activeAiSkill.builtin ? 'Skill' : 'Custom skill') : 'Edited'}
             onClick={() => setPromptEditorOpen(true)}
             disabled={busy}
+            skills={{ list: skills, activeId: aiSkillId, onSelect: (sk) => setAiPrompt(sk.content) }}
           />
           <Field orientation="horizontal">
             <Checkbox
@@ -1463,9 +2074,74 @@ export default function BgRemover() {
               </FieldLabel>
             </FieldContent>
           </Field>
+          {/* The action lives with the prompt and the skill it will actually send, rather than
+              floating in the grid toolbar between a filter and a sort control where its cost —
+              one paid Azure call per flagged image — read like another view toggle. Disabled
+              rather than hidden at zero flagged: a button that vanishes teaches nothing. */}
+          <Field orientation="horizontal" className="items-center justify-between">
+            <Button
+              size="sm"
+              variant="outline"
+              // `running` is deliberately absent: flagged images can start their Azure phase
+              // while the rest of the batch is still removing; only their re-removal waits for
+              // the workers to free up.
+              disabled={aiFixing || exporting || warming || !aiReady || !flaggedItems.length}
+              title={
+                !aiReady
+                  ? 'AI edit needs the Azure endpoint + key (Settings, gear in the rail)'
+                  : !flaggedItems.length
+                    ? 'Nothing is flagged that the AI fix can re-run.'
+                    : 'Regenerate every flagged image with the prompt above, then re-remove their backgrounds (after the current batch, if one is running).'
+              }
+              onClick={() => void handleAiEditFlagged()}
+            >
+              {aiFixing ? (
+                <Spinner data-icon="inline-start" />
+              ) : (
+                <WandSparklesIcon data-icon="inline-start" />
+              )}
+              Fix flagged ({flaggedItems.length.toLocaleString()})
+            </Button>
+            <label
+              className="flex items-center gap-1.5 text-xs text-muted-foreground"
+              title="Keep watching the queue and send every newly flagged image to the AI edit automatically — each image is sent at most once."
+            >
+              <Switch checked={autoAiFix} onCheckedChange={setAutoAiFix} disabled={!aiReady} />
+              Auto
+            </label>
+          </Field>
         </FieldGroup>
       </PanelSection>
   );
+
+  // The list itself; the footer frames it. Renders nothing until there is something to show,
+  // so a small queue never pays for the block.
+  const batchList =
+    batchRows.length || running || restCohort.length ? (
+      <BatchList
+        batches={batchRows}
+        selected={selectedBatch}
+        onSelect={setSelectedBatch}
+        onDownload={(batch: number) => {
+          const open = openPlans.find((p) => p.batch === batch);
+          if (open) return void runPlan(open);
+          const row = ledger.find((r) => r.batch === batch);
+          const redo = row && planReexport(itemsRef.current, row);
+          if (redo) void runPlan(redo, { reexport: true });
+        }}
+        downloadingBatch={exportingBatch}
+        downloadDisabled={exporting}
+        running={running}
+        filling={running ? { clean: cleanCohort.length, threshold: Math.max(1, sealSize) } : null}
+        // Shown for context only — the footer's primary button is the one that ships it, so the
+        // same action does not appear twice a few pixels apart.
+        tail={
+          restCohort.length
+            ? { count: restCohort.length, flagged: restCohort.length - cleanCohort.length }
+            : null
+        }
+      />
+    ) : null;
 
   // Tile fit — the old second tab, now a properties section: switch it on, tune the safe
   // area, and the export renders tiles instead of raw cutouts. The live preview shows the
@@ -1576,14 +2252,33 @@ export default function BgRemover() {
 
   // progress.text is never cleared once a run or an export has finished, so the compression
   // summary has to share the line with it rather than sit behind it in a fallback chain.
+  // The AI-edit phase and the export can each overlap a removal batch, so their lines join in
+  // rather than replacing — three phases can legitimately be reporting at once.
   const statusLine =
     (download && describeDownload(download)) ||
-    [progress?.text, compressSummary].filter(Boolean).join(' · ') ||
+    [progress?.text, aiProgress?.text, exportProgress?.text, compressSummary]
+      .filter(Boolean)
+      .join(' · ') ||
     'Cutouts export as PNGs in a ZIP.';
+
+  // A sealed batch already owns part of the queue even before its ZIP exists, so the plain
+  // "Export ZIP" label would promise the whole queue while shipping only what is left.
+  const batched = ledger.length > 0 || openPlans.length > 0;
 
   const exportFooter = (
     <div className="space-y-2">
+      {/* Batches sit with the export CTAs, not up in the settings: a batch ZIP is rendered with
+          whatever tile fit, background and compression are live when Download is pressed, so it
+          belongs downstream of the controls that decide its contents, not above them.
+          Height-capped with its own scroll because this footer does not scroll — a 14,000-image
+          run seals 28 batches, and an unbounded list would squeeze the settings above it out of
+          the panel entirely. */}
+      {batchList && (
+        <div className="-mx-1 max-h-52 overflow-y-auto px-1 pb-2">{batchList}</div>
+      )}
       {progress && <Progress value={progress.pct} />}
+      {aiProgress && <Progress value={aiProgress.pct} />}
+      {exportProgress && <Progress value={exportProgress.pct} />}
       {download?.ratio != null && <Progress value={download.ratio * 100} />}
       <p className="text-xs break-words text-muted-foreground">
         {statusLine}
@@ -1599,9 +2294,23 @@ export default function BgRemover() {
           <SaveIcon data-icon="inline-start" />
           Save project
         </Button>
-        <Button disabled={busy || !cutouts.length} onClick={handleExport}>
+        {/* One export action, and its label says what it will actually ship. It exports the
+            rows no batch has taken yet — never the whole queue — because once anything has been
+            exported, "everything with a cutout" would put images that are already inside a
+            downloaded ZIP into a second one under different numbers, and re-stamp them into a
+            batch they were never part of. With nothing exported yet the two sets are identical,
+            so the plain case is unchanged. */}
+        <Button
+          disabled={busy || !restCohort.length}
+          onClick={() => exportCohort(restCohort)}
+          title={
+            batched
+              ? 'Everything no batch has taken yet, including images you have since fixed.'
+              : 'Every finished cutout in the queue, as PNGs in one ZIP.'
+          }
+        >
           {exporting ? <Spinner data-icon="inline-start" /> : <DownloadIcon data-icon="inline-start" />}
-          Export ZIP
+          {batched ? `Export remaining (${restCohort.length.toLocaleString()})` : 'Export ZIP'}
         </Button>
       </div>
     </div>
@@ -1649,7 +2358,8 @@ export default function BgRemover() {
                       items.length > 0 && { label: `${items.length} image${items.length === 1 ? '' : 's'}` },
                       cutouts.length > 0 && { label: `${cutouts.length} cut out` },
                       flaggedCount > 0 && { label: `${flaggedCount} flagged`, tone: 'warn' as const },
-                      autosavedAt !== null && {
+                      autosaveFailing && { label: 'Autosave failing — retrying', tone: 'warn' as const },
+                      !autosaveFailing && autosavedAt !== null && {
                         label: `Autosaved ${new Date(autosavedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`,
                       },
                     ].filter(Boolean) as SessionChip[]
@@ -1818,62 +2528,40 @@ export default function BgRemover() {
                 emptyState
               ) : (
                 <>
-                  {/* Grid toolbar: count on the left, whole-queue reset on the right. */}
-                  <div className="mb-2 flex items-center justify-between gap-2">
-                    <span className="text-xs text-muted-foreground">
-                      {gridSel.active
-                        ? `${gridSel.checked.size} of ${items.length} selected`
-                        : `${items.length} image${items.length === 1 ? '' : 's'}`}
-                    </span>
-                    <ClearAllButton
-                      title="Clear the queue?"
-                      disabled={busy}
-                      onConfirm={clearAllItems}
-                      description={
-                        <>
-                          Removes all {items.length} image{items.length === 1 ? '' : 's'},
-                          including finished cutouts that haven&rsquo;t been exported. Your
-                          source files on disk are untouched.
-                        </>
-                      }
+                  {/* One row: what the grid is showing on the left, how much of it on the
+                      right. The filter and sort controls used to be nine identically-shaped
+                      pills spread over three rows, where nothing but the label said which of
+                      them changed the order and which changed the contents. */}
+                  <div className="mb-3 flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
+                    <QueueFilters
+                      filter={queueFilter}
+                      onFilterChange={changeQueueFilter}
+                      counts={filterCounts}
+                      sort={queueSort}
+                      onSortChange={setQueueSort}
                     />
-                  </div>
-                  {flaggedCount > 0 && (
-                    <div className="mb-3 flex items-center justify-between gap-2">
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled={busy || !aiReady || !flaggedItems.length}
-                        title={
-                          aiReady
-                            ? 'Regenerate every flagged image with the AI edit prompt, then re-remove their backgrounds. Parallelism comes from Settings → Image model.'
-                            : 'AI edit needs the Azure endpoint + key (Settings, gear in the rail)'
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-muted-foreground tabular-nums">
+                        {gridSel.active
+                          ? `${gridSel.checked.size.toLocaleString()} of ${displayItems.length.toLocaleString()} selected`
+                          : displayItems.length === items.length
+                            ? `${items.length.toLocaleString()} image${items.length === 1 ? '' : 's'}`
+                            : `${displayItems.length.toLocaleString()} of ${items.length.toLocaleString()}`}
+                      </span>
+                      <ClearAllButton
+                        title="Clear the queue?"
+                        disabled={busy}
+                        onConfirm={clearAllItems}
+                        description={
+                          <>
+                            Removes all {items.length.toLocaleString()} image
+                            {items.length === 1 ? '' : 's'}, including finished cutouts that
+                            haven&rsquo;t been exported. Your source files on disk are untouched.
+                          </>
                         }
-                        onClick={() => void handleAiEditFlagged()}
-                      >
-                        {aiFixing ? (
-                          <Spinner data-icon="inline-start" />
-                        ) : (
-                          <WandSparklesIcon data-icon="inline-start" />
-                        )}
-                        AI-fix flagged ({flaggedItems.length})
-                      </Button>
-                      <ToggleGroup
-                        size="sm"
-                        variant="outline"
-                        value={[qualitySort ? 'quality' : 'queue']}
-                        onValueChange={(next) => setQualitySort(next[0] === 'quality')}
-                      >
-                        <ToggleGroupItem value="queue" aria-label="Queue order">
-                          Queue order
-                        </ToggleGroupItem>
-                        <ToggleGroupItem value="quality" aria-label="Flagged first">
-                          <CircleAlertIcon data-icon="inline-start" />
-                          Flagged
-                        </ToggleGroupItem>
-                      </ToggleGroup>
+                      />
                     </div>
-                  )}
+                  </div>
                   <VirtualGrid
                     items={displayItems}
                     scrollRef={removeScrollRef}
@@ -1987,6 +2675,29 @@ export default function BgRemover() {
         busy={busy}
       />
 
+      {/* Crash recovery — blocking on purpose: while this is undecided, autosave holds all
+          writes, so leaving it open-ended (the old toast) silently disabled the crash net for
+          the whole session. Only the two buttons close it. */}
+      <AlertDialog open={autosavePending !== null}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Unsaved session found — {autosavePending?.count ?? 0} image
+              {(autosavePending?.count ?? 0) === 1 ? '' : 's'}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              Autosaved {autosavePending ? new Date(autosavePending.savedAt).toLocaleString() : ''}.
+              Restore it into the queue, or discard it to start fresh. Autosave stays paused
+              until you choose.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => discardAutosave()}>Discard</AlertDialogCancel>
+            <AlertDialogAction onClick={handleRestoreAutosave}>Restore</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       {/* Prompt editor — the .md tile in the AI edit card opens this. Edits bind live to the
           persisted default; Reset restores the shipped packshot prompt. */}
       <Dialog open={promptEditorOpen} onOpenChange={setPromptEditorOpen}>
@@ -1994,7 +2705,7 @@ export default function BgRemover() {
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <MdFileIcon className="size-4 text-muted-foreground" />
-              ai-edit-prompt.md
+              {activeAiSkill?.name ?? 'ai-edit-prompt.md'}
             </DialogTitle>
             <DialogDescription>
               The default prompt for every AI edit, including the AI-fix flagged batch.
@@ -2095,7 +2806,7 @@ const CutoutCell = React.memo(function CutoutCell({
   /** The item's own override (undefined = follows the global switch) — shown as a badge. */
   tileOverride: boolean | undefined;
   onSelect: (id: number) => void;
-  /** Clicking a finished result opens the same before/after view as a queue row. */
+  /** Clicking any result opens the same before/after view as a queue row, finished or not. */
   onCompare: (id: number) => void;
   onRemove: (id: number) => void;
   onToggleSelect: (id: number, shiftKey: boolean) => void;
@@ -2112,7 +2823,12 @@ const CutoutCell = React.memo(function CutoutCell({
       selectionActive={selectionActive}
       onSelect={() => {
         onSelect(item.id);
-        if (item.cutout) onCompare(item.id);
+        // Deliberately ungated on `cutout`: an AI edit clears the cutout until its re-removal
+        // lands, and that window can last indefinitely (deferred behind a batch, stopped,
+        // errored, or restored mid-flow). Gating here stranded exactly those images — the
+        // dialog is the only place Undo, the per-image prompt and Redo live, so the item
+        // people most need to inspect was the one they could not open.
+        onCompare(item.id);
       }}
       onToggleSelect={(shiftKey) => onToggleSelect(item.id, shiftKey)}
       onRemove={() => onRemove(item.id)}
@@ -2163,6 +2879,14 @@ const CutoutCell = React.memo(function CutoutCell({
             <CircleAlertIcon
               className={cn('size-4', quality.level === 'bad' ? 'text-destructive' : 'text-amber-500')}
             />
+          </Hint>
+        )}
+        {isAiGenerated(item) && (
+          <Hint
+            hint="Regenerated with the AI edit — the imported image is still available in the details view."
+            className="absolute top-2 left-2"
+          >
+            <SparklesIcon className="size-4 text-primary" />
           </Hint>
         )}
         {tileOverride !== undefined && (

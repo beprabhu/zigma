@@ -36,6 +36,83 @@ export function canRetry(item: BgItem): boolean {
 }
 
 /**
+ * Whether two sources point at the same image. Deliberately not `===`: in a live session the
+ * item's original import and its current source are literally the same object, but a project or
+ * autosave restore rebuilds each half separately — two `new File([slice], name)` values, two
+ * copies of the same URL string — so reference equality reports "these differ" for every
+ * restored row and the compare dialog offers a duplicate pane on all of them. Files are matched
+ * on name+size+type rather than on the object; lastModified is left out on purpose because a
+ * reconstructed File stamps it with the moment it was rebuilt, not the moment it was imported.
+ */
+export function sameSource(a: BgItemSource | undefined, b: BgItemSource | undefined): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  if (a.kind === 'url' && b.kind === 'url') return a.url === b.url;
+  if (a.kind === 'file' && b.kind === 'file') {
+    const x = a.file;
+    const y = b.file;
+    return x === y || (x.name === y.name && x.size === y.size && x.type === y.type);
+  }
+  if (a.kind === 'archived' && b.kind === 'archived') return a.label === b.label;
+  return false;
+}
+
+/**
+ * The as-imported source, but only while it still shows something the current source does not —
+ * i.e. the item has actually been through an AI edit. Everything that offers "see the original"
+ * asks through here so an untouched (or restored, see sameSource) row is not given a second pane
+ * of the same picture.
+ */
+export function importedSource(item: BgItem): BgItemSource | null {
+  const first = item.originalSource;
+  if (!first || sameSource(first, item.source)) return null;
+  return first;
+}
+
+/**
+ * Which CSV cell an item was imported from. Kept on the ITEM rather than inside its source:
+ * an AI edit replaces the source with the regenerated file, and a row that has been through
+ * Azure must still answer "which CSV row are you?" — otherwise remapping the name column
+ * cannot reach it, and remapping the image columns mints a duplicate for a row already queued.
+ */
+export interface CsvOrigin {
+  /** Record index, header row excluded — the row number draftsFromCsv iterated. */
+  row: number;
+  /** Header of the image column the URL was read out of. */
+  column: string;
+}
+
+/** Map key for a CSV cell. The row is numeric, so the first space splits it unambiguously. */
+export function csvCellKey(origin: CsvOrigin): string {
+  return `${origin.row} ${origin.column}`;
+}
+
+export function sameCsvOrigin(a: CsvOrigin | undefined, b: CsvOrigin | undefined): boolean {
+  if (!a || !b) return a === b;
+  return a.row === b.row && a.column === b.column;
+}
+
+/**
+ * The CSV image an item stands for, whatever its source has since become. An AI edit swaps
+ * `source` for the generated file, so the URL that identifies the row survives only in
+ * `originalSource` — without looking there, a row that has been through Azure cannot be
+ * recognised as the row it came from.
+ *
+ * A cell is NOT an identity on its own: `{row, column}` is a position, and every CSV exported
+ * from the same template has the same positions. Row 0 of a second file matched row 0 of the
+ * first, so re-dropping a corrected sheet reused the stale item wholesale — the fixed URL was
+ * never fetched and the export shipped the old picture under the new title. Anything that
+ * decides "this queued row IS that CSV row" has to agree on the picture too, which is also what
+ * makes an inserted row (every later position shifts by one) fall through to the URL match
+ * instead of cross-assigning the whole tail.
+ */
+export function csvSourceUrl(item: BgItem): string | null {
+  if (item.source.kind === 'url') return item.source.url;
+  const first = item.originalSource;
+  return first && first.kind === 'url' ? first.url : null;
+}
+
+/**
  * A finished cutout, stored compressed. Holding a full-resolution canvas per item is what
  * exhausted memory on real batches: a 3000px photo is 36 MB as RGBA and under 2 MB as lossless
  * WebP. The preview is everything the UI draws; the blob is decoded on demand at export.
@@ -83,6 +160,28 @@ export interface BgItem {
    * Overwritten by the next redo, cleared by undo itself.
    */
   prev?: { source: BgItemSource; cutout: BgCutout | null };
+  /**
+   * The source this item was FIRST imported with, captured once and immutable from then on.
+   * Reference only — nothing runs inference on it, and it is deliberately not part of the undo
+   * slot above: `prev` holds one step, so the second AI edit overwrote the pre-edit input and
+   * Undo cleared what was left, after which nothing in the item still pointed at the CSV image.
+   * That is what made the compare dialog show the AI output on both sides and dropped the
+   * copy/open-URL buttons off an edited row.
+   *
+   * The page writes it at the moment of the first source replacement, guarded so a later edit
+   * cannot move it (`originalSource: item.originalSource ?? item.source`), and undo must leave
+   * it alone. No release hook: it carries a File or a URL string, never an object URL, so
+   * releaseItem() has nothing to free here.
+   */
+  originalSource?: BgItemSource;
+  /**
+   * Which group of the queue this item belongs to. Nothing sets or reads it yet — it exists so
+   * the batching phase can land without another pass over every shape that carries a BgItem;
+   * absent means the single implicit batch that every item is in today.
+   */
+  batch?: number;
+  /** Set for items imported from a CSV; absent for dropped files and pasted images. */
+  csv?: CsvOrigin;
 }
 
 /** preview px per full-resolution px, for mapping bounds onto a decoded preview. */
@@ -99,6 +198,7 @@ export function decodeCutout(cutout: BgCutout): Promise<ImageBitmap> {
 export interface BgItemDraft {
   name: string;
   source: BgItemSource;
+  csv?: CsvOrigin;
 }
 
 // Ids must survive removals, so they count up from the highest live id rather than the length.
@@ -114,6 +214,7 @@ export function createItems(drafts: BgItemDraft[], startId: number): BgItem[] {
     original: null,
     cutout: null,
     status: 'ready',
+    ...(draft.csv ? { csv: draft.csv } : null),
   }));
 }
 
@@ -157,6 +258,13 @@ export interface ExportNameOptions {
    */
   numbered?: boolean;
   extension?: string;
+  /**
+   * Added to the position each name is numbered from. A batched export ships several ZIPs, and
+   * numbering each from 01 puts an `01-` file in every one of them — unzip two into the same
+   * folder and they collide. The offset is how many images earlier batches already shipped, so
+   * the second ZIP starts where the first stopped.
+   */
+  offset?: number;
 }
 
 export function exportFileName(
@@ -164,8 +272,8 @@ export function exportFileName(
   index: number,
   options: ExportNameOptions = {},
 ): string {
-  const { numbered = true, extension = 'png' } = options;
-  const position = index + 1;
+  const { numbered = true, extension = 'png', offset = 0 } = options;
+  const position = offset + index + 1;
   const base = sanitizeName(name, `image-${position}`);
   return numbered ? `${String(position).padStart(2, '0')}-${base}.${extension}` : `${base}.${extension}`;
 }
@@ -248,6 +356,7 @@ export function draftsFromCsv(text: string, overrides: CsvColumnOverrides = {}):
       drafts.push({
         name: title || nameFromUrl(url) || `row-${row + 1}`,
         source: { kind: 'url', url },
+        csv: { row, column },
       });
     }
   });
@@ -340,17 +449,31 @@ interface SaveHandle {
   createWritable(): Promise<{ write(data: Blob): Promise<void>; close(): Promise<void> }>;
 }
 
+interface SavePickerOptions {
+  suggestedName?: string;
+  types?: { description: string; accept: Record<string, string[]> }[];
+}
+
 /** The user's chosen destination, or how to proceed without one. */
 export type SaveDestination = SaveHandle | 'fallback' | 'cancelled';
 
 export async function pickSave(suggestedName: string): Promise<SaveDestination> {
   const picker = (
-    window as { showSaveFilePicker?: (opts: { suggestedName?: string }) => Promise<SaveHandle> }
+    window as { showSaveFilePicker?: (opts: SavePickerOptions) => Promise<SaveHandle> }
   ).showSaveFilePicker;
   // No picker (non-Chromium): the plain anchor download still applies the suggested name.
   if (typeof picker !== 'function') return 'fallback';
   try {
-    return await picker.call(window, { suggestedName });
+    // The types entry is what makes Chrome KEEP the extension when the user edits the name
+    // in the dialog. Without it, typing "Continue" over "batch.zesku" saves an extensionless
+    // file the dropzone then refuses — a real 3.3 GB support case.
+    const ext = suggestedName.includes('.')
+      ? suggestedName.slice(suggestedName.lastIndexOf('.')).toLowerCase()
+      : '';
+    const types = /^\.[a-z0-9]+$/.test(ext)
+      ? [{ description: `${ext.slice(1).toUpperCase()} file`, accept: { 'application/octet-stream': [ext] } }]
+      : undefined;
+    return await picker.call(window, { suggestedName, ...(types ? { types } : null) });
   } catch (e) {
     // Dismissing the dialog means "don't export", not "export to the default name".
     if (e instanceof DOMException && e.name === 'AbortError') return 'cancelled';

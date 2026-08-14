@@ -9,6 +9,11 @@
 // sanity checks (empty matte, near-zero or near-total subject area, edge-touching fragments,
 // heavy-handed filtering), not a replacement for looking at the picture.
 
+//
+// The back half of the file turns that verdict into the grid's filter/sort vocabulary. It stays
+// here rather than in a UI module because "flagged" has to mean the same thing to the chip that
+// counts it, the predicate that hides tiles, and the button that acts on them.
+
 import type { BgItem } from './batch';
 
 export type QualityLevel = 'ok' | 'warn' | 'bad';
@@ -132,9 +137,7 @@ export function qualityRank(level: QualityLevel): number {
 
 /** Worst-first, stable within a tier (Array#sort is stable, so ties keep queue order). */
 export function sortByQuality<T extends BgItem>(items: T[]): T[] {
-  return [...items].sort(
-    (a, b) => qualityRank(assessQuality(a).level) - qualityRank(assessQuality(b).level),
-  );
+  return sortByQualityWith(items, assessQuality);
 }
 
 export function countFlagged(items: BgItem[]): number {
@@ -143,4 +146,139 @@ export function countFlagged(items: BgItem[]): number {
     if (assessQuality(item).level !== 'ok') n++;
   }
   return n;
+}
+
+/**
+ * A verdict the caller already has. assessQuality is cheap per call but not free per CELL per
+ * RENDER: a virtualized 3,000-tile grid re-runs every predicate on each scroll frame, and the
+ * comparator below would re-assess O(n log n) times per sort. Everything downstream therefore
+ * takes the verdict as data. Build the table once per queue change with assessQueue().
+ */
+export type VerdictLookup = (item: BgItem) => QualityAssessment;
+
+export function assessQueue(items: readonly BgItem[]): ReadonlyMap<number, QualityAssessment> {
+  const verdicts = new Map<number, QualityAssessment>();
+  for (const item of items) verdicts.set(item.id, assessQuality(item));
+  return verdicts;
+}
+
+/**
+ * Reader over an assessQueue() table. The miss case returns OK rather than assessing on the
+ * spot: a miss means the table is a render behind the queue (an item added since the memo), and
+ * silently re-assessing would hide exactly the staleness worth noticing while costing the work
+ * the table exists to avoid.
+ */
+export function verdictLookup(verdicts: ReadonlyMap<number, QualityAssessment>): VerdictLookup {
+  return (item) => verdicts.get(item.id) ?? OK;
+}
+
+/**
+ * Which tiles the results grid is showing. Single-select on purpose: these are five views of
+ * one queue, not facets to intersect. An intersection like "AI-generated AND severe" has no
+ * operator behind it — no button in the product acts on that set — and multi-select would also
+ * make the chip counts lie, since each count is measured against the whole queue.
+ *
+ * 'flagged' is any severity, 'flagged-severe' is the `bad` tier only (today: the empty-matte
+ * case). 'errored' is a run STATUS, disjoint from the quality verdict — assessQuality returns
+ * OK for anything not `done`, so a failed item is never also flagged.
+ */
+export const QUEUE_FILTERS = ['all', 'flagged', 'flagged-severe', 'ai', 'errored'] as const;
+
+export type QueueFilter = (typeof QUEUE_FILTERS)[number];
+
+/** Grid ordering. 'quality' is worst-first; 'queue' is insertion order. */
+export type QueueSort = 'queue' | 'quality';
+
+export type QueueFilterCounts = Record<QueueFilter, number>;
+
+/**
+ * An AI edit replaces the item's source with the file Azure produced, and that swap is the only
+ * durable trace of it — status goes back to 'done' after the re-removal, and `prev` is cleared
+ * by undo. So the regenerated flag on the source IS the definition of "AI-generated" here.
+ */
+export function isAiGenerated(item: BgItem): boolean {
+  return item.source.kind === 'file' && item.source.regenerated === true;
+}
+
+/**
+ * Archived-source policy — the one place two "flagged" numbers are allowed to disagree.
+ *
+ * page.tsx's flaggedItems (what the "AI-fix flagged (n)" button runs on) additionally filters by
+ * canRetry(): an archived item restored from a saved project has no original bytes, so there is
+ * nothing to send through Azure and nothing to re-remove. That list is a WORKLIST and must hold
+ * only items the button can actually act on.
+ *
+ * This predicate is a VIEW, so it keeps archived items. Hiding an archived flagged tile behind
+ * the flagged chip would drop precisely the cutouts that need a human — nothing automated can
+ * repair them — and it would do so while the amber badge on the tile is still visible in the
+ * unfiltered grid, which reads as a bug.
+ *
+ * The consequence is deliberate: with archived items queued, a chip reading "Flagged 12" beside
+ * a button reading "AI-fix flagged (9)" is correct. Wire the chip counts from
+ * countQueueFilters() and the button from the canRetry-filtered list, and never derive one from
+ * the other — making them agree would mean either hiding tiles or offering a fix that no-ops.
+ */
+export function matchesQueueFilter(
+  item: BgItem,
+  filter: QueueFilter,
+  verdict: QualityAssessment,
+): boolean {
+  switch (filter) {
+    case 'all':
+      return true;
+    case 'flagged':
+      return verdict.level !== 'ok';
+    case 'flagged-severe':
+      return verdict.level === 'bad';
+    case 'ai':
+      return isAiGenerated(item);
+    case 'errored':
+      return item.status === 'error';
+  }
+}
+
+/**
+ * 'all' returns the SAME array, not a copy — the results grid keys its windowing memos off the
+ * items reference, so cloning on the default filter would invalidate them on every render.
+ */
+export function filterQueue<T extends BgItem>(
+  items: T[],
+  filter: QueueFilter,
+  verdictOf: VerdictLookup,
+): T[] {
+  if (filter === 'all') return items;
+  return items.filter((item) => matchesQueueFilter(item, filter, verdictOf(item)));
+}
+
+/**
+ * Every chip's count in one pass. Counts are measured against the WHOLE queue, so a chip always
+ * answers "how many would I show if you pressed me" regardless of what is selected now — a chip
+ * whose count moved because of the active filter could never be trusted as a way out of it.
+ */
+export function countQueueFilters(
+  items: readonly BgItem[],
+  verdictOf: VerdictLookup,
+): QueueFilterCounts {
+  const counts: QueueFilterCounts = {
+    'all': items.length,
+    'flagged': 0,
+    'flagged-severe': 0,
+    'ai': 0,
+    'errored': 0,
+  };
+  for (const item of items) {
+    const verdict = verdictOf(item);
+    if (verdict.level !== 'ok') {
+      counts.flagged++;
+      if (verdict.level === 'bad') counts['flagged-severe']++;
+    }
+    if (isAiGenerated(item)) counts.ai++;
+    if (item.status === 'error') counts.errored++;
+  }
+  return counts;
+}
+
+/** sortByQuality against a prebuilt verdict table — see VerdictLookup for why that matters. */
+export function sortByQualityWith<T extends BgItem>(items: T[], verdictOf: VerdictLookup): T[] {
+  return [...items].sort((a, b) => qualityRank(verdictOf(a).level) - qualityRank(verdictOf(b).level));
 }

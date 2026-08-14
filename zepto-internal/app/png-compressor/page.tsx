@@ -31,7 +31,7 @@ import { Canvas, PanelSection, RightPanel, StudioShell } from '@/components/pane
 import { ClearAllButton } from '@/components/selection';
 import { DropzoneShell } from '@/components/dropzone';
 import { SessionHeader, type SessionChip } from '@/components/session-header';
-import { buildZip, type ZipFileEntry } from '@/lib/zip';
+import { buildZipStream, type ZipStreamEntry } from '@/lib/zip';
 import { canvasToPngBlob, formatKb, loadImageFromFile, mapWithLimit, releaseCanvas } from '@/lib/bg/batch';
 import { compressPng } from '@/lib/compress';
 import { useProcessing } from '@/components/process-panel';
@@ -182,13 +182,13 @@ export default function PngCompressorPage() {
   const downloadZip = React.useCallback(async () => {
     const done = items.filter((it) => it.status === 'done' && it.output);
     if (!done.length) return;
-    const entries: ZipFileEntry[] = await Promise.all(
-      done.map(async (it) => ({
-        name: tinyName(it.file.name),
-        data: new Uint8Array(await it.output!.arrayBuffer()),
-      })),
-    );
-    const url = URL.createObjectURL(buildZip(entries));
+    // The outputs are already Blobs — hand them to the zip as-is instead of materializing
+    // every compressed PNG into memory first.
+    const entries: ZipStreamEntry[] = done.map((it) => ({
+      name: tinyName(it.file.name),
+      data: it.output!,
+    }));
+    const url = URL.createObjectURL(await buildZipStream(entries));
     const a = document.createElement('a');
     a.href = url;
     a.download = sessionSlug ? `${sessionSlug}-compressed.zip` : 'compressed-pngs.zip';

@@ -34,7 +34,8 @@ import {
   SidebarMenuItem, SidebarProvider,
 } from '@/components/ui/sidebar';
 import { usePersistedState } from '@/hooks/use-persisted-state';
-import { newSkillId, useSkills, type PromptSkill } from '@/lib/skills';
+import { DEFAULT_SEAL_SIZE } from '@/lib/bg/ledger';
+import { diffStat, newSkillId, useSkills, type PromptSkill } from '@/lib/skills';
 import { azureImageUrl } from '@/lib/pipeline';
 import { QUALITIES, QUALITY_BLURB, useImageQuality, type ImageQuality } from '@/lib/quality';
 import { clampParallel, clampRpm, useParallel, useRpm } from '@/lib/rate';
@@ -303,10 +304,45 @@ function ImageModelPane() {
 }
 
 function DefaultsPane() {
-  // Same persisted key Cleanup's save flow reads — the setting moved here from its footer.
+  // Same persisted keys Cleanup's save and seal flows read — both settings moved here from the
+  // page. DEFAULT_SEAL_SIZE is imported rather than retyped as 500: the page seeds its own state
+  // from that constant, so a literal here would drift the moment the constant moves and the
+  // dialog would show a number the run is not using.
   const [saveOriginals, setSaveOriginals] = usePersistedState('skuc_bgSaveOriginals', true);
+  const [sealSize, setSealSize] = usePersistedState('skuc_bgSealSize', DEFAULT_SEAL_SIZE);
   return (
+    // Groups run in the order their settings bite. Batch size shapes what arrives DURING a run —
+    // it is set before starting 14,000 images and changes delivery for the next several hours —
+    // while project contents only matter once someone chooses to save afterwards.
     <div className="space-y-5">
+      <div className="space-y-3">
+        <h3 className="text-[11px] font-semibold tracking-wide text-muted-foreground uppercase">Batches (.zip)</h3>
+        <Field orientation="horizontal">
+          <FieldContent>
+            <FieldLabel htmlFor="settings-seal-size" className="font-normal">
+              <Hint hint="Cleanup groups clean results into a downloadable ZIP each time this many have landed, so a long run delivers throughout instead of one file at the end. Flagged images are never sealed — they wait for the AI fix and ship with the rest.">
+                Clean images per batch
+              </Hint>
+            </FieldLabel>
+          </FieldContent>
+          <Input
+            id="settings-seal-size"
+            type="number"
+            min={1}
+            step={50}
+            className="w-24"
+            value={sealSize}
+            onChange={(e) => {
+              // An emptied field parses to NaN, which passes every threshold comparison and
+              // switches sealing off for the rest of a run — nothing throws, and the only symptom
+              // is ZIPs that stop arriving. NaN cannot survive JSON either, so it would persist
+              // as null and come back as null on every later mount.
+              const next = Number.parseInt(e.target.value, 10);
+              setSealSize(Number.isFinite(next) && next > 0 ? next : DEFAULT_SEAL_SIZE);
+            }}
+          />
+        </Field>
+      </div>
       <div className="space-y-3">
         <h3 className="text-[11px] font-semibold tracking-wide text-muted-foreground uppercase">Projects (.zesku)</h3>
         <Field orientation="horizontal">
@@ -332,11 +368,25 @@ function SkillsPane() {
   const { skills, setCustom } = useSkills();
   const fileRef = React.useRef<HTMLInputElement>(null);
   // The editor dialog's draft. `fresh` = not yet in the list, so Cancel leaves no trace.
-  const [draft, setDraft] = React.useState<{ skill: PromptSkill; fresh: boolean } | null>(null);
+  // `original` snapshots name+content as the editor opened: the diff chip renders against it,
+  // and an unchanged save keeps the stored updatedAt instead of restamping.
+  const [draft, setDraft] = React.useState<{
+    skill: PromptSkill;
+    fresh: boolean;
+    original: { name: string; content: string };
+  } | null>(null);
+  const stat = draft ? diffStat(draft.original.content, draft.skill.content) : null;
 
   function saveDraft() {
     if (!draft) return;
-    const skill = { ...draft.skill, name: draft.skill.name.trim() || 'untitled.md' };
+    const name = draft.skill.name.trim() || 'untitled.md';
+    const changed =
+      draft.fresh || draft.skill.content !== draft.original.content || name !== draft.original.name;
+    const skill = {
+      ...draft.skill,
+      name,
+      ...(changed ? { updatedAt: new Date().toISOString() } : null),
+    };
     setCustom((prev) => {
       const list = Array.isArray(prev) ? prev : [];
       const at = list.findIndex((s) => s.id === skill.id);
@@ -365,7 +415,13 @@ function SkillsPane() {
             <div className="min-w-0 flex-1">
               <div className="truncate text-sm">{skill.name}</div>
               <div className="truncate text-xs text-muted-foreground">
-                {skill.content.split('\n').find((l) => l.trim()) || 'Empty'}
+                {/* Custom skills show when they last changed; built-ins (and skills saved
+                    before updatedAt existed) keep the first-line preview. */}
+                {skill.updatedAt
+                  ? `Updated ${new Date(skill.updatedAt).toLocaleString(undefined, {
+                      day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit',
+                    })}`
+                  : skill.content.split('\n').find((l) => l.trim()) || 'Empty'}
               </div>
             </div>
             {skill.builtin ? (
@@ -375,16 +431,14 @@ function SkillsPane() {
                   variant="ghost"
                   size="icon-sm"
                   title="Duplicate into an editable copy"
-                  onClick={() =>
+                  onClick={() => {
+                    const name = skill.name.replace(/\.md$/, '') + '-copy.md';
                     setDraft({
                       fresh: true,
-                      skill: {
-                        id: newSkillId(),
-                        name: skill.name.replace(/\.md$/, '') + '-copy.md',
-                        content: skill.content,
-                      },
-                    })
-                  }
+                      skill: { id: newSkillId(), name, content: skill.content },
+                      original: { name, content: skill.content },
+                    });
+                  }}
                 >
                   <CopyIcon />
                 </Button>
@@ -395,7 +449,9 @@ function SkillsPane() {
                   variant="ghost"
                   size="icon-sm"
                   title="Edit"
-                  onClick={() => setDraft({ fresh: false, skill })}
+                  onClick={() =>
+                    setDraft({ fresh: false, skill, original: { name: skill.name, content: skill.content } })
+                  }
                 >
                   <PencilIcon />
                 </Button>
@@ -418,7 +474,11 @@ function SkillsPane() {
           variant="outline"
           size="sm"
           onClick={() =>
-            setDraft({ fresh: true, skill: { id: newSkillId(), name: 'new-skill.md', content: '' } })
+            setDraft({
+              fresh: true,
+              skill: { id: newSkillId(), name: 'new-skill.md', content: '' },
+              original: { name: 'new-skill.md', content: '' },
+            })
           }
         >
           <PlusIcon data-icon="inline-start" />
@@ -443,7 +503,11 @@ function SkillsPane() {
               const name = /\.(md|markdown|txt)$/i.test(file.name)
                 ? file.name.replace(/\.(markdown|txt)$/i, '.md')
                 : `${file.name}.md`;
-              setDraft({ fresh: true, skill: { id: newSkillId(), name, content } });
+              setDraft({
+                fresh: true,
+                skill: { id: newSkillId(), name, content },
+                original: { name, content },
+              });
             });
           }}
         />
@@ -483,6 +547,17 @@ function SkillsPane() {
                 className="max-h-[50dvh] min-h-40 overflow-y-auto text-xs"
               />
               <DialogFooter>
+                {/* Git-style stat against the content the editor opened with — appears only
+                    once something actually changed. */}
+                {stat && (stat.added > 0 || stat.removed > 0) && (
+                  <span
+                    className="mr-auto self-center font-mono text-xs"
+                    aria-label={`${stat.added} lines added, ${stat.removed} lines removed`}
+                  >
+                    <span className="text-emerald-600 dark:text-emerald-400">+{stat.added}</span>{' '}
+                    <span className="text-red-600 dark:text-red-400">−{stat.removed}</span>
+                  </span>
+                )}
                 <Button variant="outline" onClick={() => setDraft(null)}>Cancel</Button>
                 <Button onClick={saveDraft} disabled={!draft.skill.content.trim()}>Save</Button>
               </DialogFooter>

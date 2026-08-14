@@ -19,6 +19,35 @@ export interface PromptSkill {
   name: string;
   content: string;
   builtin?: boolean;
+  /** ISO timestamp of the last saved change. Absent on built-ins and pre-existing skills. */
+  updatedAt?: string;
+}
+
+export interface DiffStat {
+  added: number;
+  removed: number;
+}
+
+/**
+ * Line-level diff stat, git-numstat style: an edited line counts +1/−1, an appended line +1.
+ * Lines are matched by content frequency rather than LCS — O(n) because this runs on every
+ * keystroke of the skill editor. The one divergence from a real diff: purely reordering
+ * existing lines counts 0, which for a "how much did I change" chip is acceptable.
+ */
+export function diffStat(before: string, after: string): DiffStat {
+  if (before === after) return { added: 0, removed: 0 };
+  const lines = (s: string) => (s === '' ? [] : s.split('\n'));
+  const surplus = new Map<string, number>();
+  for (const line of lines(before)) surplus.set(line, (surplus.get(line) ?? 0) + 1);
+  let added = 0;
+  for (const line of lines(after)) {
+    const left = surplus.get(line) ?? 0;
+    if (left > 0) surplus.set(line, left - 1);
+    else added++;
+  }
+  let removed = 0;
+  for (const left of surplus.values()) removed += left;
+  return { added, removed };
 }
 
 export const SKILLS_KEY = 'skuc_skills';

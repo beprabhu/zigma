@@ -5,6 +5,7 @@
 //   manifest.json       version, safe-area config, per-item metadata (name, bounds, provenance)
 //   cutouts/NNN.webp    the lossless WebP masters, byte-identical to what the workers produced
 //   originals/NNN.*     (v2, optional) the input files, so a reopened project keeps its inputs
+//   source.csv          (v2, optional) the sheet the queue was imported from, verbatim
 //
 // The cutouts are ordinary images on purpose: rename .zesku to .zip and the file opens anywhere.
 //
@@ -14,17 +15,47 @@
 // file sources embed their bytes under originals/ (skippable via includeOriginals for huge
 // batches). v1 files still load exactly as before.
 
-import { buildZip, readZipIndex, type ZipFileEntry } from '../zip';
-import type { BgCutout, BgItem, BgItemSource } from './batch';
+import { buildZipStream, readZipIndex, type ZipStreamEntry } from '../zip';
+import type { BgCutout, BgItem, BgItemSource, CsvOrigin } from './batch';
 import { ANCHORS, DEFAULT_SAFE_AREA, type SafeAreaConfig, type SubjectBounds } from './safe-area';
 
 export const PROJECT_EXTENSION = '.zesku';
 const MANIFEST = 'manifest.json';
+const CSV_ENTRY = 'source.csv';
 const FORMAT = 'zesku-bg-remover-project';
+// Stays 2 while the format only GAINS keys. loadProject — here and in every build already on a
+// colleague's machine — hard-rejects a version it does not recognise, so a bump makes today's
+// files unopenable there, whereas an unknown key is skipped without a word. The CSV entry, the
+// per-item csv/originalSourceUrl/batch fields and anything else additive therefore ride under
+// v2; only a change that makes an old file misread earns the next number.
 const VERSION = 2;
 
 export function isProjectFile(file: File): boolean {
   return file.name.toLowerCase().endsWith(PROJECT_EXTENSION);
+}
+
+const ZIP_MAGIC = [0x50, 0x4b, 0x03, 0x04]; // "PK\x03\x04", every non-empty zip starts with it
+
+/**
+ * Extension check plus a content fallback: save dialogs can strip the suffix (a 3.3 GB
+ * extensionless "Continue" was a real case), and the format doc explicitly blesses renaming
+ * to .zip. A file qualifies when it is named .zesku, OR when its name claims nothing else
+ * (no extension, or .zip) and its first bytes are the zip magic. Images and CSVs keep their
+ * own routes — they never reach the byte sniff. A non-project zip that slips through fails
+ * in loadProject with a readable "no manifest.json" error, which is the right message anyway.
+ */
+export async function sniffProjectFile(file: File): Promise<boolean> {
+  if (isProjectFile(file)) return true;
+  const name = file.name.toLowerCase();
+  const ext = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1) : '';
+  if (ext && ext !== 'zip') return false;
+  if (file.size < 22) return false; // smaller than even an empty zip
+  try {
+    const head = new Uint8Array(await file.slice(0, 4).arrayBuffer());
+    return ZIP_MAGIC.every((byte, i) => head[i] === byte);
+  } catch {
+    return false;
+  }
 }
 
 interface ManifestItem {
@@ -45,6 +76,34 @@ interface ManifestItem {
   originalName?: string;
   /** v2: per-item tile-fit override (absent = follows the global switch). */
   tileFit?: boolean;
+  /**
+   * v2: the embedded original is an AI edit's output, not a dropped input. Autosave decides
+   * which file sources are worth persisting from this flag (lib/bg/autosave.ts recordOf), so
+   * losing it on a reopen quietly drops paid Azure bytes out of crash recovery.
+   */
+  regenerated?: boolean;
+  /**
+   * v2: the CSV cell this row was read out of. A reopened project without it cannot answer
+   * "which row are you?", and the whole remap UI depends on that answer — renaming reaches no
+   * row, and a re-pick of the image columns mints duplicates for rows already in the queue.
+   */
+  csv?: { row: number; column: string };
+  /**
+   * v2: where the row came from before an AI edit replaced its source. URL only and reference
+   * only — the pre-edit bytes are deliberately not embedded a second time, since doubling the
+   * archive to keep a copy of something still sitting on the CDN is a bad trade.
+   */
+  originalSourceUrl?: string;
+  /** v2: batch grouping, so a reopened project keeps the grouping it was saved with. */
+  batch?: number;
+}
+
+/** Where the CSV text lives and how its columns were mapped; the text itself is a zip entry. */
+interface ManifestCsv {
+  fileName: string;
+  nameColumn: string;
+  imageColumns: string[];
+  path: string;
 }
 
 interface Manifest {
@@ -53,7 +112,18 @@ interface Manifest {
   savedAt: string;
   safeArea: SafeAreaConfig;
   outputBg: string;
+  csv?: ManifestCsv;
   items: ManifestItem[];
+}
+
+/** The sheet a queue was imported from, with the column choices that shaped it. */
+export interface ProjectCsv {
+  fileName: string;
+  /** Raw CSV text, exactly as it was read — headers are re-derived by re-parsing it. */
+  text: string;
+  /** Column that names each image; '' means names come from the URL's filename. */
+  nameColumn: string;
+  imageColumns: string[];
 }
 
 function originOf(source: BgItemSource): string {
@@ -71,48 +141,126 @@ function mimeFromName(name: string): string {
   );
 }
 
+export interface SkippedEntry {
+  name: string;
+  lost: 'cutout' | 'original';
+  origin: string;
+  reason: string;
+}
+
 /** Packs EVERY item (finished or not) plus the current settings into a project blob. */
 export async function saveProject(
   items: BgItem[],
   safeArea: SafeAreaConfig,
   outputBg: string,
-  opts: { includeOriginals?: boolean } = {},
+  opts: {
+    includeOriginals?: boolean;
+    /** Fired (once, before packing) when unreadable blobs were dropped from the save — the
+        call site must warn while the live queue still holds the recoverable rows; a silent
+        skip behind a success toast reads as "everything saved" right when it is not. */
+    onSkip?: (skipped: SkippedEntry[]) => void;
+    /** The CSV behind the queue. Omitted for file/paste batches, which have no sheet. */
+    csv?: ProjectCsv;
+  } = {},
 ): Promise<Blob> {
   const includeOriginals = opts.includeOriginals ?? true;
-  const entries: ZipFileEntry[] = [];
+  const entries: ZipStreamEntry[] = [];
   const manifestItems: ManifestItem[] = [];
+  // A blob backed by a file that changed on disk after it was dropped throws NotReadableError
+  // on first touch — and one dead reference must not sink a save carrying hours of batch work.
+  // Each blob is probed with a one-byte read; unreadable halves are dropped from the item (a
+  // v2 manifest row with path '' is a legitimate unprocessed item) and reported in
+  // skipped.json inside the archive. The full bytes are never materialized here: entries go
+  // into buildZipStream as Blob references, so a queue-scale save cannot exhaust the tab.
+  const skipped: SkippedEntry[] = [];
+  const readable = async (blob: Blob) => {
+    try {
+      await blob.slice(0, 1).arrayBuffer();
+      return true;
+    } catch {
+      return false;
+    }
+  };
 
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     const n = String(i + 1).padStart(3, '0');
 
     let path = '';
+    let saved: BgCutout | null = null;
     if (item.cutout) {
-      path = `cutouts/${n}.webp`;
-      entries.push({ name: path, data: new Uint8Array(await item.cutout.blob.arrayBuffer()) });
+      if (await readable(item.cutout.blob)) {
+        path = `cutouts/${n}.webp`;
+        saved = item.cutout;
+        entries.push({ name: path, data: item.cutout.blob });
+      } else {
+        skipped.push({ name: item.name, lost: 'cutout', origin: originOf(item.source), reason: 'unreadable blob' });
+        console.warn(`save: skipping unreadable cutout for "${item.name}"`);
+      }
     }
 
     let originalPath: string | undefined;
     let originalName: string | undefined;
     if (includeOriginals && item.source.kind === 'file') {
       const file = item.source.file;
-      const ext = file.name.includes('.') ? file.name.slice(file.name.lastIndexOf('.')) : '.png';
-      originalPath = `originals/${n}${ext.toLowerCase()}`;
-      originalName = file.name;
-      entries.push({ name: originalPath, data: new Uint8Array(await file.arrayBuffer()) });
+      if (await readable(file)) {
+        const ext = file.name.includes('.') ? file.name.slice(file.name.lastIndexOf('.')) : '.png';
+        originalPath = `originals/${n}${ext.toLowerCase()}`;
+        originalName = file.name;
+        entries.push({ name: originalPath, data: file });
+      } else {
+        skipped.push({ name: item.name, lost: 'original', origin: originOf(item.source), reason: 'unreadable blob' });
+        console.warn(`save: skipping unreadable original for "${item.name}"`);
+      }
     }
 
     manifestItems.push({
       name: item.name,
       path,
-      width: item.cutout?.width ?? 0,
-      height: item.cutout?.height ?? 0,
-      bounds: item.cutout?.bounds ?? null,
+      width: saved?.width ?? 0,
+      height: saved?.height ?? 0,
+      bounds: saved?.bounds ?? null,
       origin: originOf(item.source),
       ...(item.source.kind === 'url' ? { sourceUrl: item.source.url } : null),
       ...(originalPath ? { originalPath, originalName } : null),
+      // Only meaningful next to the bytes it describes: with originals off (or an unreadable
+      // blob skipped above) the source restores as 'archived', and a marker on a row the
+      // loader can never rebuild into a file source would just be a lie in the manifest.
+      ...(originalPath && item.source.kind === 'file' && item.source.regenerated
+        ? { regenerated: true }
+        : null),
       ...(item.tileFit !== undefined ? { tileFit: item.tileFit } : null),
+      ...(item.csv ? { csv: { row: item.csv.row, column: item.csv.column } } : null),
+      // Only a URL survives the round trip: an original that was a dropped FILE is already
+      // embedded under originals/ when the save includes them, and re-embedding it a second
+      // time to record "this is what it used to be" would double the archive for nothing.
+      ...(item.originalSource?.kind === 'url'
+        ? { originalSourceUrl: item.originalSource.url }
+        : null),
+      ...(typeof item.batch === 'number' ? { batch: item.batch } : null),
     });
+  }
+
+  if (skipped.length) {
+    entries.push({ name: 'skipped.json', data: new TextEncoder().encode(JSON.stringify(skipped, null, 1)) });
+    opts.onSkip?.(skipped);
+  }
+
+  // The sheet is its own entry rather than a manifest field: a 3,000-row export runs to
+  // megabytes of text, and manifest.json is JSON.parsed in full before the first cutout can be
+  // listed — burying the CSV in it would tax every open, including opens that never touch the
+  // column mapping. Saved verbatim so the remap re-parses the same bytes the import did; a
+  // re-serialized sheet would drift on quoting and take the row numbering with it.
+  const csv = opts.csv;
+  let manifestCsv: ManifestCsv | undefined;
+  if (csv && csv.text) {
+    entries.push({ name: CSV_ENTRY, data: new TextEncoder().encode(csv.text) });
+    manifestCsv = {
+      fileName: csv.fileName,
+      nameColumn: csv.nameColumn,
+      imageColumns: [...csv.imageColumns],
+      path: CSV_ENTRY,
+    };
   }
 
   const manifest: Manifest = {
@@ -121,11 +269,12 @@ export async function saveProject(
     savedAt: new Date().toISOString(),
     safeArea,
     outputBg,
+    ...(manifestCsv ? { csv: manifestCsv } : null),
     items: manifestItems,
   };
   // Manifest first, so even a truncated file fails with a readable error about the right entry.
   entries.unshift({ name: MANIFEST, data: new TextEncoder().encode(JSON.stringify(manifest, null, 1)) });
-  return buildZip(entries);
+  return buildZipStream(entries);
 }
 
 export interface RestoredItem {
@@ -135,6 +284,11 @@ export interface RestoredItem {
   cutout: BgCutout | null;
   /** Per-item tile-fit override, round-tripped from the manifest. */
   tileFit?: boolean;
+  /** Which CSV cell the row came from; absent for file/paste rows and for v1 files. */
+  csv?: CsvOrigin;
+  /** Pre-AI-edit provenance, URL only — the caller rebuilds a {kind:'url'} source from it. */
+  originalSourceUrl?: string;
+  batch?: number;
 }
 
 export interface RestoredProject {
@@ -142,6 +296,8 @@ export interface RestoredProject {
   safeArea: SafeAreaConfig;
   outputBg: string;
   savedAt: string;
+  /** Absent when the project was saved without a sheet, or when its entry did not survive. */
+  csv?: ProjectCsv;
 }
 
 /** Number-shaped guard: manifests come from disk and deserve zero trust. */
@@ -154,6 +310,15 @@ function parseBounds(v: unknown): SubjectBounds | null {
   const b = v as Record<string, unknown>;
   if ([b.x, b.y, b.w, b.h].some((n) => typeof n !== 'number' || !Number.isFinite(n))) return null;
   return { x: b.x as number, y: b.y as number, w: b.w as number, h: b.h as number };
+}
+
+/** Both halves or nothing: a row number without its column names no cell the remap can find. */
+function parseCsvOrigin(v: unknown): CsvOrigin | null {
+  if (!v || typeof v !== 'object') return null;
+  const c = v as Record<string, unknown>;
+  if (typeof c.row !== 'number' || !Number.isFinite(c.row) || c.row < 0) return null;
+  if (typeof c.column !== 'string' || !c.column) return null;
+  return { row: Math.round(c.row), column: c.column };
 }
 
 /** Rebuilds queue-ready items (cutout blob + regenerated preview + bounds) from a project file. */
@@ -228,7 +393,13 @@ export async function loadProject(file: File): Promise<RestoredProject> {
             ? rec.originalName
             : originalPath.slice(originalPath.lastIndexOf('/') + 1);
         // File over the lazy slice — bytes are only read when the input is actually used.
-        source = { kind: 'file', file: new File([originalSlice], fileName, { type: mimeFromName(fileName) }) };
+        source = {
+          kind: 'file',
+          file: new File([originalSlice], fileName, { type: mimeFromName(fileName) }),
+          // Carried back so a reopened AI edit keeps autosaving its bytes, and so anything
+          // that asks "is this AI output?" still gets the truth after a round trip.
+          ...(rec.regenerated === true ? { regenerated: true } : null),
+        };
       } else if (typeof rec.sourceUrl === 'string' && /^https?:\/\//i.test(rec.sourceUrl)) {
         source = { kind: 'url', url: rec.sourceUrl };
       }
@@ -238,11 +409,21 @@ export async function loadProject(file: File): Promise<RestoredProject> {
         continue;
       }
 
+      const csvOrigin = parseCsvOrigin(rec.csv);
       items.push({
         name: typeof rec.name === 'string' && rec.name ? rec.name : 'restored',
         source,
         cutout,
         ...(typeof rec.tileFit === 'boolean' ? { tileFit: rec.tileFit } : null),
+        ...(csvOrigin ? { csv: csvOrigin } : null),
+        // Same http(s) test the live source gets: a stored "undefined" or a file path would
+        // otherwise reach the AI-edit and view-original paths as if it were fetchable.
+        ...(typeof rec.originalSourceUrl === 'string' && /^https?:\/\//i.test(rec.originalSourceUrl)
+          ? { originalSourceUrl: rec.originalSourceUrl }
+          : null),
+        ...(typeof rec.batch === 'number' && Number.isFinite(rec.batch)
+          ? { batch: Math.round(rec.batch) }
+          : null),
       });
     }
   }
@@ -277,11 +458,50 @@ export async function loadProject(file: File): Promise<RestoredProject> {
       typeof sa.background === 'string' && sa.background ? sa.background : DEFAULT_SAFE_AREA.background,
   };
 
+  // Rebuilt field by field for the same reason as the settings above, and with the same stakes:
+  // these strings land in the column pickers, which call .includes on imageColumns and hand
+  // nameColumn to draftsFromCsv as a record key. A hand-edited manifest carrying a number where
+  // a header belongs would take out the remap panel on every render.
+  //
+  // Nothing here may throw: the sheet only powers the remap UI, so a truncated or missing entry
+  // must cost that panel alone — refusing to open a project whose cutouts are perfectly intact
+  // over a side-car text file would be the worse failure by far.
+  let csv: ProjectCsv | undefined;
+  const rawCsv = manifest.csv;
+  if (rawCsv && typeof rawCsv === 'object' && !Array.isArray(rawCsv)) {
+    const c = rawCsv as Partial<ManifestCsv>;
+    const csvPath = typeof c.path === 'string' && c.path ? c.path : CSV_ENTRY;
+    const csvBlob = byName.get(csvPath);
+    if (csvBlob) {
+      try {
+        const text = await csvBlob.text();
+        if (text) {
+          csv = {
+            fileName:
+              typeof c.fileName === 'string' && c.fileName
+                ? c.fileName
+                : csvPath.slice(csvPath.lastIndexOf('/') + 1),
+            text,
+            // '' is a legitimate value here — it means "name each image from its URL" — so an
+            // absent or wrong-typed column must degrade to that, never to a header guess.
+            nameColumn: typeof c.nameColumn === 'string' ? c.nameColumn : '',
+            imageColumns: Array.isArray(c.imageColumns)
+              ? c.imageColumns.filter((column): column is string => typeof column === 'string' && !!column)
+              : [],
+          };
+        }
+      } catch {
+        console.warn(`${file.name}: ${csvPath} is unreadable — column remapping is unavailable`);
+      }
+    }
+  }
+
   return {
     items,
     safeArea,
     outputBg:
       typeof manifest.outputBg === 'string' && manifest.outputBg ? manifest.outputBg : 'transparent',
     savedAt: typeof manifest.savedAt === 'string' ? manifest.savedAt : '',
+    ...(csv ? { csv } : null),
   };
 }
