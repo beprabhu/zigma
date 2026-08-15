@@ -1,3 +1,6 @@
 desktop/node_modules/
 desktop/dist/
 desktop/node_modules/
+
+# Labelled cutout-quality training data (45MB of images) — see zesku-quality-labels/HANDOFF.md
+zesku-quality-labels/
