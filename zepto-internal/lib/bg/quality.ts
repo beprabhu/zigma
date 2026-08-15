@@ -17,6 +17,7 @@
 import { BG_MODELS, type BgModelId } from './engine';
 import type { BgItem } from './batch';
 import type { OriginalComponentReport, RegionReport } from './regions';
+import { MODEL_FLAG_THRESHOLD, qualityModelProbability } from './quality-model';
 
 export type QualityLevel = 'ok' | 'warn' | 'bad';
 
@@ -664,6 +665,25 @@ export function assessQuality(item: BgItem): QualityAssessment {
   );
   if (edgeFragments.length > 0 && kept.length <= 2) {
     reasons.push('Kept region touches the frame edge — check the subject wasn’t cropped');
+  }
+
+  // The fitted model decides WHETHER to flag; everything above only decides what the tooltip
+  // says. Measured on the same labelled set, the rules' verdict wrongly flagged 36% of
+  // genuinely-good cutouts — the model at this threshold, 18% — so the model's "clean" beats
+  // the rules' "suspicious". Two exceptions stay hard flags regardless of the score: an empty
+  // matte (early-returned above), and a verify-sweep disagreement — that one is a PAID second
+  // inference by a different architecture, not a threshold heuristic, and the model never saw
+  // verify verdicts in training so it has no standing to overrule one.
+  const verifyDisagree = Boolean(item.verify && !item.verify.agree);
+  const prob = qualityModelProbability(item);
+  if (prob !== null && !verifyDisagree) {
+    if (prob < MODEL_FLAG_THRESHOLD) return OK;
+    if (!reasons.length) {
+      reasons.push(
+        'Fitted quality model flagged this cutout — its measurements match bad training examples, though no single rule names the defect',
+      );
+    }
+    return { level: 'warn', reasons };
   }
 
   if (!reasons.length) return OK;
