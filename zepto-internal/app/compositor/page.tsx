@@ -2,7 +2,9 @@
 
 import * as React from 'react';
 import { toast } from 'sonner';
-import { CircleStopIcon, DownloadIcon, ImageIcon, RefreshCwIcon, SparklesIcon } from 'lucide-react';
+import {
+  CircleStopIcon, DownloadIcon, ImageIcon, RefreshCwIcon, SparklesIcon, WandSparklesIcon,
+} from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Hint } from '@/components/hint';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -24,6 +26,8 @@ import { Textarea } from '@/components/ui/textarea';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 
 import { TemplateEditor } from '@/components/template-editor';
+import { BatchPromptDialog } from '@/components/regen-prompt';
+import { ColumnPicker } from '@/components/column-picker';
 import { CsvDropzone, CsvFileTile } from '@/components/csv-dropzone';
 import { SessionHeader, type SessionChip } from '@/components/session-header';
 import { TileGrid, TileDialog } from '@/components/tile-grid';
@@ -102,6 +106,8 @@ export default function Compositor() {
   const [numberFiles, setNumberFiles] = usePersistedState('skuc_coNumberFiles', true);
   const [prompt, setPrompt] = usePersistedState('skuc_prompt', DEFAULT_PROMPT);
   const [promptEditorOpen, setPromptEditorOpen] = React.useState(false);
+  // The wand asks before it spends: pressing it opens the batch prompt rather than firing.
+  const [aiBatchOpen, setAiBatchOpen] = React.useState(false);
   // Prompt is skill-driven, preset-style: the dropdown derives which skill the current text
   // equals; editing the text flips it to Custom without losing anything.
   const { skills } = useSkills();
@@ -205,13 +211,18 @@ export default function Compositor() {
     reader.readAsText(file);
   }
 
+  /** The row's images under a mapping: every picked column that actually holds an http(s) URL. */
+  function rowUrls(record: CsvRecord, imageCols: string[]): string[] {
+    return imageCols.map((c) => record[c]).filter((u) => /^https?:\/\//i.test(u || ''));
+  }
+
   function buildQueue(records: CsvRecord[], imageCols: string[], titleCol: string, offerCol: string): QueueItem[] {
     return records.map((record, i) => {
-      const urls = imageCols.map((c) => record[c]).filter((u) => /^https?:\/\//i.test(u || ''));
+      const urls = rowUrls(record, imageCols);
       return {
         id: i, record, urls,
-        title: titleCol ? record[titleCol] : '',
-        offer: offerCol ? record[offerCol] : '',
+        title: titleCol ? record[titleCol] ?? '' : '',
+        offer: offerCol ? record[offerCol] ?? '' : '',
         status: urls.length ? 'ready' : 'no-images',
         resultImage: null,
         compressed: null,
@@ -219,6 +230,13 @@ export default function Compositor() {
     });
   }
 
+  /**
+   * Remapping columns re-derives what a row IS, never what it has already produced. The queue is
+   * index-aligned to the sheet — a mapping change can neither add, remove nor reorder a row — so
+   * every item is patched in place and generated tiles, undo slots and in-flight statuses all
+   * survive it. Rebuilding the queue here is what used to throw a whole finished batch away the
+   * moment someone corrected the title column. (Generate remaps names the same way.)
+   */
   function updateMapping(next: { imageCols?: string[]; titleCol?: string; offerCol?: string }) {
     const ic = next.imageCols ?? imageCols;
     const tc = next.titleCol ?? titleCol;
@@ -226,7 +244,34 @@ export default function Compositor() {
     if (next.imageCols) setImageCols(ic);
     if (next.titleCol !== undefined) setTitleCol(tc);
     if (next.offerCol !== undefined) setOfferCol(oc);
-    setItems(buildQueue(records, ic, tc, oc));
+    // The summary describes bytes that some rows no longer have; it is re-earned on next export.
+    if (tc !== titleCol || oc !== offerCol) setCompressSummary('');
+    setItems((prev) =>
+      prev.map((it) => {
+        const urls = rowUrls(it.record, ic);
+        const title = tc ? it.record[tc] ?? '' : '';
+        const offer = oc ? it.record[oc] ?? '' : '';
+        const sameUrls = urls.length === it.urls.length && urls.every((u, n) => u === it.urls[n]);
+        const sameText = title === it.title && offer === it.offer;
+        // Untouched rows keep their object identity, so their canvases do not repaint.
+        if (sameUrls && sameText) return it;
+        return {
+          ...it,
+          urls,
+          title,
+          offer,
+          // Only the two statuses the mapping itself decides are re-derived. A row that has
+          // generated, failed, or is in flight keeps the state it earned.
+          status:
+            it.status === 'ready' || it.status === 'no-images'
+              ? urls.length ? 'ready' : 'no-images'
+              : it.status,
+          // Title and offer are drawn at render time, so changing them invalidates the cached
+          // PNG bytes exactly the way a template edit does.
+          compressed: sameText ? it.compressed : null,
+        };
+      }),
+    );
   }
 
   // ---- Generation ----
@@ -239,17 +284,19 @@ export default function Compositor() {
     setItems((prev) => prev.map((it) => (it.id === id ? { ...it, ...patch } : it)));
   }
 
-  async function generateItem(item: QueueItem, signal?: AbortSignal) {
+  /** `promptOverride` is one row's edit from its dialog — it never touches the shared prompt. */
+  async function generateItem(item: QueueItem, signal?: AbortSignal, promptOverride?: string) {
     patchItem(item.id, { status: 'fetching', errorMsg: undefined });
     const images: HTMLImageElement[] = [];
     for (const u of item.urls) images.push(await loadImageFromUrl(u, signal));
     patchItem(item.id, { status: 'generating' });
+    const runPrompt = promptOverride?.trim() || prompt;
     let resultImage: HTMLImageElement;
     if (mock) {
       await new Promise((r) => setTimeout(r, 600));
       resultImage = await mockComposite(images);
     } else {
-      resultImage = await callAzure(images, { endpoint, apiKey: azureKey, prompt, size: presetSize, signal });
+      resultImage = await callAzure(images, { endpoint, apiKey: azureKey, prompt: runPrompt, size: presetSize, signal });
     }
     if (removeBg) {
       patchItem(item.id, { status: 'removing-bg' });
@@ -297,8 +344,44 @@ export default function Compositor() {
     await runTiles(items.filter((it) => it.urls.length), 'generated');
   }
 
-  /** One run over `todo` — Generate-all and Regenerate-selected share everything but the verb. */
-  async function runTiles(todo: QueueItem[], verb: string) {
+  /**
+   * A second Azure pass over a tile that already exists — Cleanup's AI edit, on the composite
+   * instead of a cutout. The tile IS the input here, not the row's source photos. It runs on the
+   * product's one prompt; a single tile's dialog is where that prompt can be reworded for that
+   * tile alone. The tile it replaces becomes the undo slot, exactly as a regenerate's does.
+   */
+  async function aiEditItem(item: QueueItem, signal?: AbortSignal, promptOverride?: string) {
+    const source = item.resultImage;
+    if (!source) return;
+    patchItem(item.id, { status: 'generating', errorMsg: undefined });
+    const runPrompt = promptOverride?.trim() || prompt;
+    let edited: HTMLImageElement;
+    if (mock) {
+      await new Promise((r) => setTimeout(r, 600));
+      edited = await mockComposite([source]);
+    } else {
+      edited = await callAzure([source], {
+        endpoint, apiKey: azureKey, prompt: runPrompt, size: presetSize, signal,
+      });
+    }
+    patchItem(item.id, {
+      status: 'done',
+      resultImage: edited,
+      compressed: null,
+      prev: { resultImage: source },
+    });
+  }
+
+  /**
+   * One run over `todo`. Generate-all, Regenerate-selected and AI-edit-selected share the whole
+   * batch machinery — concurrency, ETA, stop, per-row error isolation — and differ only in the
+   * verb and in what each row is actually put through.
+   */
+  async function runTiles(
+    todo: QueueItem[],
+    verb: string,
+    run: (item: QueueItem, signal: AbortSignal) => Promise<void> = generateItem,
+  ) {
     if (!todo.length) return;
     const controller = new AbortController();
     genAbortRef.current = controller;
@@ -318,7 +401,7 @@ export default function Compositor() {
         return;
       }
       try {
-        await generateItem(item, controller.signal);
+        await run(item, controller.signal);
         done++;
       } catch (e) {
         if (isAbortError(e)) {
@@ -362,14 +445,29 @@ export default function Compositor() {
     // Rows without image URLs can't generate; quietly skip them like Generate-all does.
     const todo = items.filter((it) => sel.checked.has(it.id) && it.urls.length);
     await runTiles(todo, 'regenerated');
+    offerUndo(todo, 'regenerated');
+  }
+
+  /** The wand's targets: only rows that HAVE a tile — the tile itself is the input. */
+  const aiEditTargets = items.filter((it) => sel.checked.has(it.id) && it.resultImage);
+
+  async function handleAiEditSelected(promptOverride: string) {
+    if (!guards()) return;
+    const todo = aiEditTargets;
+    if (!todo.length) return;
+    await runTiles(todo, 'edited', (item, signal) => aiEditItem(item, signal, promptOverride));
+    offerUndo(todo, 'edited');
+  }
+
+  /** Post-run toast whose Undo restores every tile the run replaced. */
+  function offerUndo(todo: QueueItem[], verb: string) {
     const undoable = todo
       .map((it) => it.id)
       .filter((id) => itemsRef.current.find((it) => it.id === id)?.prev);
-    if (undoable.length) {
-      toast.success(`${undoable.length} regenerated`, {
-        action: { label: 'Undo', onClick: () => undoable.forEach(undoItem) },
-      });
-    }
+    if (!undoable.length) return;
+    toast.success(`${undoable.length} ${verb}`, {
+      action: { label: 'Undo', onClick: () => undoable.forEach(undoItem) },
+    });
   }
 
   function deleteSelected() {
@@ -393,14 +491,14 @@ export default function Compositor() {
     setCompressSummary('');
   }
 
-  async function handleRegenerate(item: QueueItem) {
+  async function handleRegenerate(item: QueueItem, promptOverride?: string) {
     if (running) return;
     const controller = new AbortController();
     genAbortRef.current = controller;
     setRunning(true);
     setProgress({ pct: 50, text: `Regenerating row ${item.id + 1}…` });
     try {
-      await generateItem(item, controller.signal);
+      await generateItem(item, controller.signal, promptOverride);
       setProgress({ pct: 100, text: `Row ${item.id + 1} regenerated.` });
     } catch (e) {
       if (isAbortError(e)) {
@@ -574,6 +672,26 @@ export default function Compositor() {
 
   const doneCount = items.filter((it) => it.status === 'done').length;
   const canGenerate = items.some((it) => it.urls.length);
+  // Greyed out with a reason beats erroring on click — same gate as Cleanup's AI edit.
+  const aiReady = mock || (endpoint.trim().length > 0 && azureKey.trim().length > 0);
+
+  // The template preview answers "what will my tiles look like", so once a sheet is in it
+  // renders the first row by the same rules the grid uses — the row's own title and offer,
+  // the typed text only where the row is blank, and no offer bar on a row that has none.
+  // Without a sheet the typed text IS the tile, exactly as before.
+  const previewRow = items[0];
+  const previewTitle = previewRow?.title || tplTitle;
+  const previewOffer = previewRow?.offer || tplOffer;
+  const previewOfferVisible =
+    offerVisible && (!previewRow || !!previewRow.offer.trim() || !offerCol);
+  // Which columns the preview is reading, for the line under the two text fields. The offer is
+  // named only where there is a bar to draw it in, so the line never credits a hidden layer.
+  const mappedText = [
+    titleCol && `title from ${titleCol}`,
+    template.offer.visible && offerCol && `offer from ${offerCol}`,
+  ]
+    .filter(Boolean)
+    .join(' · ');
 
   return (
     <div className="flex min-h-dvh flex-col">
@@ -658,37 +776,48 @@ export default function Compositor() {
               <TemplateEditor
                 template={template}
                 onChange={handleTemplateChange}
-                previewTitle={tplTitle}
-                previewOffer={tplOffer}
-                previewOfferVisible={offerVisible}
+                previewTitle={previewTitle}
+                previewOffer={previewOffer}
+                previewOfferVisible={previewOfferVisible}
                 minimal={presetSize !== undefined}
               >
                 {presetSize !== undefined ? null : (
-                <FieldGroup className="grid grid-cols-2 gap-3">
-                  <Field>
-                    <FieldLabel htmlFor="tpl-title">Tile name</FieldLabel>
-                    <Input id="tpl-title" value={tplTitle} onChange={(e) => setTplTitle(e.target.value)} />
-                  </Field>
-                  <Field>
-                    {/* The show/hide toggle lives on the offer label — it controls this text. */}
-                    <div className="flex items-center justify-between">
-                      <FieldLabel htmlFor="tpl-offer">Offer text</FieldLabel>
-                      <FieldLabel htmlFor="offer-visible" className="flex items-center gap-1.5 text-xs font-normal text-muted-foreground">
-                        <Checkbox
-                          id="offer-visible"
-                          checked={offerVisible}
-                          onCheckedChange={(c) => setOfferVisible(c === true)}
-                        />
-                        Show
-                      </FieldLabel>
-                    </div>
-                    <Input
-                      id="tpl-offer"
-                      value={tplOffer}
-                      disabled={!offerVisible}
-                      onChange={(e) => setTplOffer(e.target.value)}
-                    />
-                  </Field>
+                <FieldGroup className="gap-2">
+                  <div className="grid grid-cols-2 gap-3">
+                    <Field>
+                      <FieldLabel htmlFor="tpl-title">Tile name</FieldLabel>
+                      <Input id="tpl-title" value={tplTitle} onChange={(e) => setTplTitle(e.target.value)} />
+                    </Field>
+                    <Field>
+                      {/* The show/hide toggle lives on the offer label — it controls this text. */}
+                      <div className="flex items-center justify-between">
+                        <FieldLabel htmlFor="tpl-offer">Offer text</FieldLabel>
+                        <FieldLabel htmlFor="offer-visible" className="flex items-center gap-1.5 text-xs font-normal text-muted-foreground">
+                          <Checkbox
+                            id="offer-visible"
+                            checked={offerVisible}
+                            onCheckedChange={(c) => setOfferVisible(c === true)}
+                          />
+                          Show
+                        </FieldLabel>
+                      </div>
+                      <Input
+                        id="tpl-offer"
+                        value={tplOffer}
+                        disabled={!offerVisible}
+                        onChange={(e) => setTplOffer(e.target.value)}
+                      />
+                    </Field>
+                  </div>
+                  {/* Says what the preview above is reading, so sheet text appearing in these
+                      fields' place reads as the mapping working, not as them being ignored. */}
+                  <FieldDescription>
+                    {mappedText
+                      ? `Preview shows row 1 — ${mappedText}. This text fills a blank title; a row with a blank offer renders without the bar.`
+                      : records.length
+                        ? 'No title or offer column mapped below, so every tile renders exactly this text.'
+                        : 'Sample text for the preview — map a title or offer column once a CSV is in to preview real rows.'}
+                  </FieldDescription>
                 </FieldGroup>
                 )}
               </TemplateEditor>
@@ -727,23 +856,19 @@ export default function Compositor() {
             <PanelSection title="Columns">
                 <FieldGroup className="gap-4">
                   <Field>
-                    <FieldLabel>Image URL columns</FieldLabel>
-                    {headers.map((h) => (
-                      <Field key={h} orientation="horizontal">
-                        <Checkbox
-                          id={`col-${h}`}
-                          checked={imageCols.includes(h)}
-                          onCheckedChange={(c) => updateMapping({
-                            imageCols: c === true
-                              ? [...imageCols, h]
-                              : imageCols.filter((x) => x !== h),
-                          })}
-                        />
-                        <FieldLabel htmlFor={`col-${h}`} className="font-normal">{h}</FieldLabel>
-                      </Field>
-                    ))}
+                    <FieldLabel htmlFor="co-img-cols">Image URL columns</FieldLabel>
+                    {/* Same combobox as Cleanup's and Generate's column pickers — a checkbox
+                        per header pushed every control below it off a wide sheet's panel. */}
+                    <ColumnPicker
+                      id="co-img-cols"
+                      columns={headers}
+                      selected={imageCols}
+                      onChange={(next) => updateMapping({ imageCols: next })}
+                      disabled={running}
+                      placeholder="None — no row can generate"
+                    />
                     <FieldDescription>
-                      Auto-detected on drop; each ticked column contributes one product image
+                      Auto-detected on drop; each picked column contributes one product image
                       per row.
                     </FieldDescription>
                   </Field>
@@ -751,6 +876,7 @@ export default function Compositor() {
                     <FieldLabel htmlFor="title-col">Title column</FieldLabel>
                     <Select
                       value={titleCol || NONE}
+                      disabled={running}
                       onValueChange={(v) => updateMapping({ titleCol: v === NONE ? '' : String(v ?? '') })}
                     >
                       {/* Select.Value renders the raw value, so the sentinel needs a label. */}
@@ -763,10 +889,17 @@ export default function Compositor() {
                       </SelectContent>
                     </Select>
                   </Field>
+                  {/* Only where there is an offer bar to fill. The Image presets are an image
+                      container and nothing else, so mapping a column to a layer they do not
+                      draw is a control that cannot do anything. The stored choice is kept, not
+                      cleared, so switching back to a banner tile brings the mapping back with
+                      it. Title stays either way — it names the cell and the exported file. */}
+                  {template.offer.visible && (
                   <Field>
                     <FieldLabel htmlFor="offer-col">Offer / discount column</FieldLabel>
                     <Select
                       value={offerCol || NONE}
+                      disabled={running}
                       onValueChange={(v) => updateMapping({ offerCol: v === NONE ? '' : String(v ?? '') })}
                     >
                       <SelectTrigger id="offer-col" className="w-full">
@@ -778,11 +911,15 @@ export default function Compositor() {
                       </SelectContent>
                     </Select>
                   </Field>
+                  )}
                 </FieldGroup>
               </PanelSection>
           )}
 
-          <PanelSection title="Prompt" hint="What the composite model is told to do. Skills are managed in Settings.">
+          {/* One prompt for the product, exactly as Cleanup has one. Both the composite and the
+              wand's second pass start from it; a tile's own dialog is where it becomes editable
+              for that tile alone. */}
+          <PanelSection title="Prompt" hint="What the model is told to do, for composites and for the wand's AI edit. Skills are managed in Settings.">
               <FieldGroup className="gap-4">
                 {/* The tile carries the skill switcher (the caret menu) — same control on
                     Cleanup's AI-edit prompt and Generate's brief. */}
@@ -865,10 +1002,19 @@ export default function Compositor() {
                     busy={running}
                     actions={[
                       {
-                        key: 'regenerate',
-                        label: 'Regenerate selected — composes each tile again',
-                        icon: RefreshCwIcon,
+                        key: 'ai-edit',
+                        label: aiReady
+                          ? 'AI edit selected — sends each finished tile back to Azure with the AI edit prompt'
+                          : 'AI edit needs the Azure endpoint + key (Settings, gear in the rail)',
+                        icon: WandSparklesIcon,
                         accent: true,
+                        disabled: !aiReady || !aiEditTargets.length,
+                        onRun: () => setAiBatchOpen(true),
+                      },
+                      {
+                        key: 'regenerate',
+                        label: 'Regenerate selected — composes each tile again from its source images',
+                        icon: RefreshCwIcon,
                         onRun: () => void handleRegenerateSelected(),
                       },
                     ]}
@@ -1023,6 +1169,22 @@ export default function Compositor() {
         </RightPanel>
       </StudioShell>
 
+      <BatchPromptDialog
+        open={aiBatchOpen}
+        onOpenChange={setAiBatchOpen}
+        defaultPrompt={prompt}
+        count={aiEditTargets.length}
+        noun="tile"
+        busy={running}
+        excludedNote={(() => {
+          const skipped = sel.checked.size - aiEditTargets.length;
+          return skipped > 0
+            ? `${skipped} selected row${skipped === 1 ? ' has' : 's have'} no finished tile yet and ${skipped === 1 ? 'is' : 'are'} left out.`
+            : undefined;
+        })()}
+        onRun={(p) => void handleAiEditSelected(p)}
+      />
+
       {/* Prompt editor — same .md-tile-opens-modal pattern as Cleanup's AI-edit prompt. */}
       <Dialog open={promptEditorOpen} onOpenChange={setPromptEditorOpen}>
         <DialogContent className="sm:max-w-2xl">
@@ -1032,8 +1194,9 @@ export default function Compositor() {
               {activeSkill?.name ?? 'custom-prompt.md'}
             </DialogTitle>
             <DialogDescription>
-              The instruction sent with every composite. Editing detaches it from the selected
-              skill; save reusable versions from Settings → Skills.
+              The instruction sent with every composite, and what the wand&rsquo;s AI edit starts
+              from. Editing detaches it from the selected skill; save reusable versions from
+              Settings → Skills.
             </DialogDescription>
           </DialogHeader>
           <Textarea
@@ -1063,6 +1226,7 @@ export default function Compositor() {
         offerToggle={offerVisible}
         hasOfferCol={!!offerCol}
         running={running}
+        prompt={prompt}
         onClose={() => setOpenId(null)}
         onRegenerate={handleRegenerate}
         onUndo={(item) => undoItem(item.id)}

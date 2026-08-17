@@ -18,6 +18,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { ClearAllButton, SelectionBar, useGridSelection } from '@/components/selection';
 import { ColumnPicker } from '@/components/column-picker';
+import { BatchPromptDialog } from '@/components/regen-prompt';
 import { Checkbox } from '@/components/ui/checkbox';
 import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
@@ -101,6 +102,8 @@ export default function ImageGenerator() {
   const [briefName, setBriefName] = React.useState<string | null>(() => revived?.briefName ?? null);
   // The brief renders as an .md tile in the panel; this opens its editor modal.
   const [briefEditorOpen, setBriefEditorOpen] = React.useState(false);
+  // The bulk action asks before it spends: the toolbar opens the batch prompt rather than firing.
+  const [batchPromptOpen, setBatchPromptOpen] = React.useState(false);
   // The tile's caret menu can seed the brief from a saved skill — same switcher as
   // Compose's prompt and Cleanup's AI-edit prompt. Selection is content-derived.
   const { skills } = useSkills();
@@ -294,8 +297,13 @@ export default function ImageGenerator() {
     return true;
   }
 
-  async function generateOne(item: GenItem, signal?: AbortSignal): Promise<boolean> {
-    const prompt = buildRowPrompt(brief, headers, item.record, excludedSet);
+  /** `promptOverride` is one row's edit from its dialog — it never touches the brief. */
+  async function generateOne(
+    item: GenItem,
+    signal?: AbortSignal,
+    promptOverride?: string,
+  ): Promise<boolean> {
+    const prompt = promptOverride?.trim() || buildRowPrompt(brief, headers, item.record, excludedSet);
     if (isPromptEmpty(prompt)) {
       patchItem(item.id, { status: 'error', errorMsg: 'Nothing to send — no brief and no included columns' });
       return false;
@@ -335,7 +343,8 @@ export default function ImageGenerator() {
   }
 
   /** One run over `todo` — Generate-all and Regenerate-selected share everything but the verb. */
-  async function runBatch(todo: GenItem[], verb: string) {
+  /** `promptOverride` is the selection's one-off wording from the batch dialog. */
+  async function runBatch(todo: GenItem[], verb: string, promptOverride?: string) {
     const controller = new AbortController();
     genAbortRef.current = controller;
     setRunning(true);
@@ -354,7 +363,7 @@ export default function ImageGenerator() {
           finished++;
           return;
         }
-        if (await generateOne(item, controller.signal)) ok++;
+        if (await generateOne(item, controller.signal, promptOverride)) ok++;
         finished++;
         const left = eta.remaining(finished, todo.length);
         setProgress({
@@ -373,7 +382,7 @@ export default function ImageGenerator() {
     }
   }
 
-  async function handleRegenerate(id: number) {
+  async function handleRegenerate(id: number, promptOverride?: string) {
     if (busy || !guards()) return;
     const item = itemsRef.current.find((it) => it.id === id);
     if (!item) return;
@@ -382,7 +391,7 @@ export default function ImageGenerator() {
     setRunning(true);
     setProgress({ pct: 50, text: `Regenerating ${item.name}…` });
     try {
-      const ok = await generateOne(item, controller.signal);
+      const ok = await generateOne(item, controller.signal, promptOverride);
       setProgress({
         pct: 100,
         text: controller.signal.aborted
@@ -424,11 +433,11 @@ export default function ImageGenerator() {
     });
   }
 
-  async function handleRegenerateSelected() {
+  async function handleRegenerateSelected(promptOverride: string) {
     if (busy || !guards()) return;
     const todo = itemsRef.current.filter((it) => sel.checked.has(it.id));
     if (!todo.length) return;
-    await runBatch(todo, 'regenerated');
+    await runBatch(todo, 'regenerated', promptOverride);
     const undoable = todo.filter((it) => itemsRef.current.find((n) => n.id === it.id)?.prev);
     if (undoable.length) {
       toast.success(`${undoable.length} regenerated`, {
@@ -763,10 +772,10 @@ export default function ImageGenerator() {
                   actions={[
                     {
                       key: 'regenerate',
-                      label: 'Regenerate selected — sends each row to Azure again',
+                      label: 'Regenerate selected — edit the prompt, then send each row to Azure again',
                       icon: RefreshCwIcon,
                       accent: true,
-                      onRun: () => void handleRegenerateSelected(),
+                      onRun: () => setBatchPromptOpen(true),
                     },
                   ]}
                   deleteTitle={`Delete ${sel.checked.size} row${sel.checked.size === 1 ? '' : 's'}?`}
@@ -809,6 +818,20 @@ export default function ImageGenerator() {
           </PanelSection>
         </RightPanel>
       </StudioShell>
+
+      {/* A row's prompt is brief + its own cells, so a selection has no single "current" text.
+          The brief is what they share, and what an override replaces for this run. */}
+      <BatchPromptDialog
+        open={batchPromptOpen}
+        onOpenChange={setBatchPromptOpen}
+        defaultPrompt={brief}
+        count={sel.checked.size}
+        noun="row"
+        actionLabel="Regenerate"
+        busy={busy}
+        excludedNote="An edit here replaces the whole prompt for this run — the row's CSV cells are not appended to it."
+        onRun={(p) => void handleRegenerateSelected(p)}
+      />
 
       <GenDialog
         item={openItem}

@@ -94,6 +94,7 @@ import {
 import { VERIFY_MODEL_ID, compareCutouts, filteredRects } from '@/lib/bg/verify';
 import { QueueFilters } from '@/components/bg-remover/queue-filters';
 import { ColumnPicker } from '@/components/column-picker';
+import { BatchPromptDialog } from '@/components/regen-prompt';
 import { parseCSV } from '@/lib/csv';
 import { buildRowPrompt } from '@/lib/row-prompt';
 import { BatchList } from '@/components/bg-remover/batch-list';
@@ -356,6 +357,8 @@ export default function BgRemover() {
   const activeAiSkill = skills.find((sk) => sk.id === aiSkillId);
   // The AI-edit card shows the prompt as a compact .md tile; this opens its editor modal.
   const [promptEditorOpen, setPromptEditorOpen] = React.useState(false);
+  // The wand asks before it spends: pressing it opens the batch prompt rather than firing.
+  const [aiBatchOpen, setAiBatchOpen] = React.useState(false);
   // PNG file-size ceiling. Off by default: on, an export can lose colours or pixels, and that
   // has to be something the user asked for rather than something they discover on the CDN.
   const [budgetOn, setBudgetOn] = usePersistedState('skuc_bgBudgetOn', false);
@@ -1869,14 +1872,15 @@ export default function BgRemover() {
     await aiEditMany(flaggedItems);
   }
 
-  async function handleAiEditSelected() {
+  async function handleAiEditSelected(promptOverride: string) {
     // Archived sources have no pixels to re-reference; skip them like the per-item edit does.
     const targets = itemsRef.current.filter((it) => gridSel.checked.has(it.id) && canRetry(it));
     gridSel.clear();
-    await aiEditMany(targets);
+    await aiEditMany(targets, promptOverride);
   }
 
-  async function aiEditMany(targets: BgItem[]) {
+  /** `promptOverride` is the selection's one-off wording from the batch dialog. */
+  async function aiEditMany(targets: BgItem[], promptOverride?: string) {
     // Deliberately NOT gated on `running`: the Azure phase is network-bound and runs fine
     // alongside a removal batch — only the re-removal needs the workers, and that defers.
     if (aiFixing || exporting || warming || !targets.length) return;
@@ -1896,7 +1900,12 @@ export default function BgRemover() {
     try {
       const results = await mapWithLimit(targets, readParallel(), async (item) => {
         if (controller.signal.aborted) return null; // stopped: leave the rest untouched
-        const updated = await aiEditOne(item, guards.prompt, guards.mock, controller.signal);
+        const updated = await aiEditOne(
+          item,
+          promptOverride?.trim() || guards.prompt,
+          guards.mock,
+          controller.signal,
+        );
         finished++;
         const left = eta.remaining(finished, targets.length);
         setAiProgress({
@@ -2463,6 +2472,8 @@ export default function BgRemover() {
 
   // The prompt always resolves to something (blank falls back to the default), so only the
   // credentials gate AI editing.
+  // What the wand will actually touch — the dialog counts these, not the raw selection.
+  const aiSelectedCount = items.filter((it) => gridSel.checked.has(it.id) && canRetry(it)).length;
   const aiReady =
     azureEndpoint.trim().length > 0 && azureKey.trim().length > 0 ||
     (typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('mock'));
@@ -3090,7 +3101,7 @@ export default function BgRemover() {
                           icon: WandSparklesIcon,
                           accent: true,
                           disabled: !aiReady,
-                          onRun: () => void handleAiEditSelected(),
+                          onRun: () => setAiBatchOpen(true),
                         },
                         {
                           key: 'redo',
@@ -3131,6 +3142,22 @@ export default function BgRemover() {
 
 
       {/* One dialog for the whole product: queue rows and result images open the same view. */}
+      <BatchPromptDialog
+        open={aiBatchOpen}
+        onOpenChange={setAiBatchOpen}
+        defaultPrompt={aiPrompt}
+        count={aiSelectedCount}
+        noun="image"
+        busy={aiFixing || exporting || warming}
+        excludedNote={(() => {
+          const skipped = gridSel.checked.size - aiSelectedCount;
+          return skipped > 0
+            ? `${skipped} selected image${skipped === 1 ? ' has' : 's have'} no source left to re-reference and ${skipped === 1 ? 'is' : 'are'} left out.`
+            : undefined;
+        })()}
+        onRun={(p) => void handleAiEditSelected(p)}
+      />
+
       <CompareDialog
         item={compareItem}
         index={compareIndex < 0 ? 0 : compareIndex}

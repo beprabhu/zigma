@@ -61,7 +61,15 @@ export interface TileOpts {
   title: string;
   offerText: string;
   offerVisible: boolean;
-  image: HTMLImageElement | null;
+  /**
+   * What goes in the image box. One element is the finished composite — the export path, and
+   * the only shape a generated tile ever uses. An array is the pre-generation preview: the
+   * row's several source photos packed into the one box by how many there are. Null slots are
+   * photos still loading; their cell is reserved from the start, so nothing shifts as they land.
+   */
+  image: HTMLImageElement | (HTMLImageElement | null)[] | null;
+  /** Sources past the four the box can hold, drawn as a "+N" chip. Preview only. */
+  extraImages?: number;
 }
 
 export const DEFAULT_TEMPLATE: TileTemplate = {
@@ -175,19 +183,77 @@ function drawImageFit(
   ctx.restore();
 }
 
+/**
+ * Where several sources sit inside the one image box, as fractions of it — index = cells - 1.
+ * Four is the ceiling: past that each photo is too small to tell a product from a prop, so the
+ * last cell counts the remainder rather than the pack thinning into slivers. The count goes in
+ * a cell, not a corner chip, because the corners of this box belong to the title and offer
+ * layers — whichever way the template stacks them.
+ */
+const IMAGE_PACKS: [number, number, number, number][][] = [
+  [[0, 0, 1, 1]],
+  [[0, 0, 0.5, 1], [0.5, 0, 0.5, 1]],
+  [[0, 0, 0.5, 0.5], [0.5, 0, 0.5, 0.5], [0.25, 0.5, 0.5, 0.5]],
+  [[0, 0, 0.5, 0.5], [0.5, 0, 0.5, 0.5], [0, 0.5, 0.5, 0.5], [0.5, 0.5, 0.5, 0.5]],
+];
+
+/** The empty state of the image box — also what a preview shows until its first photo lands. */
+function drawImagePlaceholder(ctx: CanvasRenderingContext2D, r: LayerRect) {
+  ctx.fillStyle = '#f2f3f6';
+  ctx.fillRect(r.x, r.y, r.w, r.h);
+  ctx.fillStyle = '#c3c8d2';
+  ctx.font = `500 6px ${FONT_STACK}`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('image', r.x + r.w / 2, r.y + r.h / 2);
+}
+
+/** The last cell of an overflowing pack: "+3" standing for the sources there was no room for. */
+function drawCountCell(
+  ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, n: number,
+) {
+  ctx.fillStyle = '#eceef3';
+  roundedRectPath(ctx, x, y, w, h, Math.min(w, h) * 0.08);
+  ctx.fill();
+  ctx.fillStyle = '#7c8598';
+  ctx.font = `700 ${Math.min(w, h) * 0.28}px ${FONT_STACK}`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(`+${n}`, x + w / 2, y + h / 2);
+}
+
 function drawImageLayer(ctx: CanvasRenderingContext2D, tpl: TileTemplate, opts: TileOpts) {
   const r = tileLayerRect(tpl, 'image');
-  if (opts.image) {
-    drawImageFit(ctx, opts.image, r.x, r.y, r.w, r.h, tpl.image.fit);
-  } else {
-    ctx.fillStyle = '#f2f3f6';
-    ctx.fillRect(r.x, r.y, r.w, r.h);
-    ctx.fillStyle = '#c3c8d2';
-    ctx.font = `500 6px ${FONT_STACK}`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText('image', r.x + r.w / 2, r.y + r.h / 2);
+  const list = Array.isArray(opts.image) ? opts.image : opts.image ? [opts.image] : [];
+  const extra = opts.extraImages ?? 0;
+  const cells = Math.min(list.length + (extra > 0 ? 1 : 0), IMAGE_PACKS.length);
+  if (!list.some(Boolean)) {
+    drawImagePlaceholder(ctx, r);
+    return;
   }
+  // One source is the layer as designed — the template's own cover/contain fit, untouched.
+  // This is the only shape a generated tile ever takes, so its rendering is never packed.
+  if (cells === 1) {
+    drawImageFit(ctx, list[0]!, r.x, r.y, r.w, r.h, tpl.image.fit);
+    return;
+  }
+  const pack = IMAGE_PACKS[cells - 1];
+  const gap = Math.min(r.w, r.h) * 0.02;
+  pack.forEach(([fx, fy, fw, fh], i) => {
+    const x = r.x + fx * r.w + gap;
+    const y = r.y + fy * r.h + gap;
+    const w = fw * r.w - gap * 2;
+    const h = fh * r.h - gap * 2;
+    if (extra > 0 && i === cells - 1) {
+      drawCountCell(ctx, x, y, w, h, extra);
+      return;
+    }
+    const img = list[i];
+    if (!img) return;
+    // Contain, whatever the layer's fit says: photos cropped to fill a quarter each would lose
+    // the very edges that say which product it is. Cover is for the one composite that ships.
+    drawImageFit(ctx, img, x, y, w, h, 'contain');
+  });
 }
 
 function drawTitleLayer(ctx: CanvasRenderingContext2D, tpl: TileTemplate, opts: TileOpts) {

@@ -7,7 +7,7 @@
 // generated tile, copy-URL per source, regenerate and download.
 
 import * as React from 'react';
-import { CheckIcon, CopyIcon, DownloadIcon, RefreshCwIcon, Undo2Icon } from 'lucide-react';
+import { CheckIcon, CopyIcon, DownloadIcon, Undo2Icon } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import {
@@ -19,6 +19,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { Spinner } from '@/components/ui/spinner';
+import { RegenPrompt } from '@/components/regen-prompt';
 import { ResultCell } from '@/components/result-cell';
 import { CHECKERBOARD } from '@/components/bg-remover/bg-queue-list';
 import { pickSave, saveTo } from '@/lib/bg/batch';
@@ -60,7 +61,9 @@ function proxied(url: string): string {
 
 /** Renders the composited tile — shared by the grid cell and the dialog's "after" pane. */
 function TileCanvas({
-  item,
+  id,
+  image,
+  extraImages,
   template,
   title,
   offerText,
@@ -69,7 +72,11 @@ function TileCanvas({
   className,
   style,
 }: {
-  item: QueueItem;
+  id: number;
+  /** null draws the template's own "image" placeholder — the tile minus its picture. */
+  image: HTMLImageElement | (HTMLImageElement | null)[] | null;
+  /** Sources past the four the image box can hold; drawn as a "+N" chip. */
+  extraImages?: number;
   template: TileTemplate;
   title: string;
   offerText: string;
@@ -83,16 +90,85 @@ function TileCanvas({
 
   React.useEffect(() => {
     if (!registerCanvas) return;
-    registerCanvas(item.id, ref.current);
-    return () => registerCanvas(item.id, null);
-  }, [item.id, registerCanvas]);
+    registerCanvas(id, ref.current);
+    return () => registerCanvas(id, null);
+  }, [id, registerCanvas]);
 
   React.useEffect(() => {
     if (!ref.current) return;
-    renderTile(ref.current, { title, offerText, offerVisible, image: item.resultImage }, template);
-  }, [item.resultImage, template, title, offerText, offerVisible, fontsReady]);
+    renderTile(ref.current, { title, offerText, offerVisible, image, extraImages }, template);
+  }, [image, extraImages, template, title, offerText, offerVisible, fontsReady]);
 
   return <canvas ref={ref} className={className} style={style} />;
+}
+
+/** Cells the image box packs into. A fifth source and beyond are counted in the last one. */
+const PREVIEW_CELLS = 4;
+
+/**
+ * The cell before its tile exists: the same template drawn around the row's OWN source photos,
+ * so a sheet reads as tiles — title, offer bar, frame — from the moment it lands rather than
+ * only once Azure has answered. Every image column the row fills is packed into the image box,
+ * which makes it the one place that shows what the model is actually being handed for that row.
+ * Never registered for export; only a generated tile ships.
+ *
+ * The <img> elements are what do the fetching. They stay in the layout at zero opacity so
+ * `loading="lazy"` still defers a thousand-row sheet to what is actually on screen, and their
+ * load events hand the decoded elements to the canvas. Mounted under a `key` of the URLs
+ * upstream, so remapping the image columns starts a clean load rather than leaving stale photos.
+ */
+function SourceTilePreview({
+  id, urls, template, title, offerText, offerVisible, className, style,
+}: {
+  id: number;
+  urls: string[];
+  template: TileTemplate;
+  title: string;
+  offerText: string;
+  offerVisible: boolean;
+  className?: string;
+  style?: React.CSSProperties;
+}) {
+  // Four sources fill four cells; more than that and the fourth cell becomes the count, so the
+  // three that fit are the ones drawn. Nothing is dropped without saying so.
+  const shown = urls.length > PREVIEW_CELLS ? urls.slice(0, PREVIEW_CELLS - 1) : urls;
+  // One slot per source, held from the first render: the pack is laid out by slot count, so a
+  // photo arriving late drops into a cell that was already reserved for it.
+  const [images, setImages] = React.useState<(HTMLImageElement | null)[]>(
+    () => shown.map(() => null),
+  );
+  const mark = (i: number, el: HTMLImageElement) =>
+    setImages((prev) => (prev[i] === el ? prev : prev.map((x, n) => (n === i ? el : x))));
+
+  return (
+    <>
+      <TileCanvas
+        id={id}
+        image={images}
+        extraImages={urls.length - shown.length}
+        template={template}
+        title={title}
+        offerText={offerText}
+        offerVisible={offerVisible}
+        className={className}
+        style={style}
+      />
+      {shown.map((url, i) => (
+        <img
+          key={url}
+          src={url}
+          alt=""
+          aria-hidden
+          loading="lazy"
+          // A photo already in the browser cache can finish before React attaches onLoad, which
+          // would leave its cell stuck empty; the ref catches that case on commit.
+          ref={(el) => { if (el?.complete && el.naturalWidth) mark(i, el); }}
+          onLoad={(e) => mark(i, e.currentTarget)}
+          className="pointer-events-none absolute inset-0 size-full opacity-0"
+        />
+      ))}
+    </>
+  );
 }
 
 /** The frame's own corner radius, so transparent corners don't read as extra space. */
@@ -146,7 +222,8 @@ function TileCell({
         {item.resultImage ? (
           // The canvas stays mounted for export even while a regenerate is in flight.
           <TileCanvas
-            item={item}
+            id={item.id}
+            image={item.resultImage}
             template={template}
             title={title}
             offerText={offerText}
@@ -155,22 +232,26 @@ function TileCell({
             className="block w-full"
             style={{ borderRadius: frameRadius(template) }}
           />
+        ) : item.urls.length ? (
+          // The source products stand in until the tile replaces them — a cell shows the tile it
+          // is going to be from the moment the CSV lands, not only once generation finishes.
+          // The ring is the tell that this one is a stand-in: a generated tile has no edge.
+          <SourceTilePreview
+            key={item.urls.join('|')}
+            id={item.id}
+            urls={item.urls.map(proxied)}
+            template={template}
+            title={title}
+            offerText={offerText}
+            offerVisible={offerVisible}
+            className="block w-full ring-1 ring-border"
+            style={{ borderRadius: frameRadius(template) }}
+          />
         ) : (
-          // The source product stands in until its tile replaces it — a cell is visible from
-          // the moment the CSV lands, not only once generation finishes.
           <div className="grid size-full place-items-center overflow-hidden rounded-lg border bg-muted/30 p-2">
-            {item.urls.length ? (
-              <img
-                src={proxied(item.urls[0])}
-                loading="lazy"
-                alt=""
-                className="max-h-full max-w-full min-h-0 min-w-0 object-contain"
-              />
-            ) : (
-              <span className="px-2 text-center text-xs text-muted-foreground">
-                No image URLs in this row
-              </span>
-            )}
+            <span className="px-2 text-center text-xs text-muted-foreground">
+              No image URLs in this row
+            </span>
           </div>
         )}
         {working && (
@@ -258,8 +339,10 @@ export interface TileDialogProps {
   offerToggle: boolean;
   hasOfferCol: boolean;
   running: boolean;
+  /** The composite prompt every row shares — the seed and Reset target for this row's copy. */
+  prompt: string;
   onClose: () => void;
-  onRegenerate: (item: QueueItem) => void;
+  onRegenerate: (item: QueueItem, promptOverride?: string) => void;
   /** Restores the tile the last regenerate replaced. Shown only while item.prev exists. */
   onUndo: (item: QueueItem) => void;
 }
@@ -270,7 +353,7 @@ export interface TileDialogProps {
  */
 export function TileDialog({
   item, template, fallbackTitle, fallbackOffer, offerToggle, hasOfferCol,
-  running, onClose, onRegenerate, onUndo,
+  running, prompt, onClose, onRegenerate, onUndo,
 }: TileDialogProps) {
   const [saving, setSaving] = React.useState(false);
 
@@ -352,7 +435,8 @@ export function TileDialog({
                 <div className="text-xs font-medium text-muted-foreground">Generated tile</div>
                 {item.resultImage ? (
                   <TileCanvas
-                    item={item}
+                    id={item.id}
+                    image={item.resultImage}
                     template={template}
                     title={item.title || fallbackTitle}
                     offerText={item.offer || fallbackOffer}
@@ -375,20 +459,30 @@ export function TileDialog({
               </div>
             </div>
 
+            {/* Keyed by row: a prompt tweaked for one tile never opens on the next. */}
+            <RegenPrompt
+              key={item.id}
+              defaultPrompt={prompt}
+              busy={running}
+              working={
+                item.status === 'fetching' ||
+                item.status === 'generating' ||
+                item.status === 'removing-bg'
+              }
+              disabled={!item.urls.length}
+              hint={
+                item.urls.length
+                  ? 'Run this row through Azure again'
+                  : 'This row has no image URLs to send'
+              }
+              onRegenerate={(p) => onRegenerate(item, p)}
+            />
+
             <DialogFooter className="flex-wrap gap-2">
-              <Button
-                variant="outline"
-                className="mr-auto"
-                disabled={running || !item.urls.length}
-                title="Run this row through Azure again"
-                onClick={() => onRegenerate(item)}
-              >
-                <RefreshCwIcon data-icon="inline-start" />
-                Regenerate
-              </Button>
               {item.prev && (
                 <Button
                   variant="outline"
+                  className="mr-auto"
                   disabled={running}
                   title="Restore the tile the last regenerate replaced"
                   onClick={() => onUndo(item)}

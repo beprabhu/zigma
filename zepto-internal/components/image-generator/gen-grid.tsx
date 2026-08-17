@@ -6,7 +6,7 @@
 // result, which is the only place the exact string sent to Azure can be read back.
 
 import * as React from 'react';
-import { CheckIcon, CopyIcon, DownloadIcon, RefreshCwIcon, Undo2Icon } from 'lucide-react';
+import { DownloadIcon, Undo2Icon } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import {
@@ -18,6 +18,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { Spinner } from '@/components/ui/spinner';
+import { RegenPrompt } from '@/components/regen-prompt';
 import { ResultCell } from '@/components/result-cell';
 import { pickSave, saveTo } from '@/lib/bg/batch';
 import { genFileStem, type GenItem, type GenStatus } from '@/lib/gen';
@@ -37,30 +38,6 @@ export function genStatusLine(item: GenItem): { text: string; error: boolean } {
     return { text: `✓ done in ${(item.durationMs / 1000).toFixed(1)} s`, error: false };
   }
   return { text: STATUS_TEXT[item.status], error: false };
-}
-
-/** One-click copy with the async-clipboard + execCommand fallback the suite uses everywhere. */
-export function CopyButton({ text, title }: { text: string; title: string }) {
-  const [copied, setCopied] = React.useState(false);
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      const field = document.createElement('textarea');
-      field.value = text;
-      document.body.appendChild(field);
-      field.select();
-      document.execCommand('copy');
-      field.remove();
-    }
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
-  };
-  return (
-    <Button variant="ghost" size="icon-sm" title={title} onClick={copy}>
-      {copied ? <CheckIcon /> : <CopyIcon />}
-    </Button>
-  );
 }
 
 const GenCell = React.memo(function GenCell({
@@ -152,7 +129,8 @@ export function GenGrid({
 
 /**
  * Prompt against result. `sentPrompt` is preferred over the live preview so a row generated
- * before the brief was edited still shows what it was actually built from.
+ * before the brief was edited still shows what it was actually built from — RegenPrompt applies
+ * that rule, and the same block appears in Compose's and Cleanup's dialogs.
  */
 export function GenDialog({
   item,
@@ -166,13 +144,11 @@ export function GenDialog({
   previewPrompt: string;
   running: boolean;
   onClose: () => void;
-  onRegenerate: (id: number) => void;
+  onRegenerate: (id: number, promptOverride?: string) => void;
   /** Restores the result the last regenerate replaced. Shown only while item.prev exists. */
   onUndo: (id: number) => void;
 }) {
   const [saving, setSaving] = React.useState(false);
-  const shown = item?.sentPrompt ?? previewPrompt;
-  const stale = !!item?.sentPrompt && item.sentPrompt !== previewPrompt;
 
   async function handleDownload() {
     if (!item?.image) return;
@@ -201,57 +177,42 @@ export function GenDialog({
               </DialogDescription>
             </DialogHeader>
 
-            <div className="grid min-w-0 gap-4 sm:grid-cols-2">
-              <div className="min-w-0 space-y-1.5">
-                <div className="flex items-center gap-1">
-                  <span className="text-xs font-medium text-muted-foreground">
-                    {item.sentPrompt ? 'Prompt sent' : 'Prompt to send'}
-                  </span>
-                  <CopyButton text={shown} title="Copy the full prompt" />
-                </div>
-                <pre className="max-h-64 min-w-0 overflow-auto rounded-lg bg-muted/40 p-3 text-[11px] leading-snug whitespace-pre-wrap">
-                  {shown || 'Nothing to send.'}
-                </pre>
-                {stale && (
-                  <p className="text-[11px] text-muted-foreground">
-                    The brief or columns changed since this ran — regenerate to use the current
-                    prompt.
-                  </p>
+            {/* There is no "before" image in a text-to-image product, so the result gets the
+                middle on its own and the prompt sits under it — the same place Compose and
+                Cleanup put theirs. */}
+            <div className="mx-auto w-full max-w-sm space-y-1.5">
+              <div className="text-xs font-medium text-muted-foreground">Generated image</div>
+              <div className="grid aspect-square place-items-center overflow-hidden rounded-lg border bg-muted/30 p-2">
+                {item.image ? (
+                  <img
+                    src={item.image.src}
+                    alt=""
+                    className="max-h-full max-w-full min-h-0 min-w-0 object-contain"
+                  />
+                ) : item.status === 'generating' ? (
+                  <Spinner className="size-5 text-primary" />
+                ) : (
+                  <span className="text-xs text-muted-foreground">Not generated yet</span>
                 )}
-              </div>
-
-              <div className="min-w-0 space-y-1.5">
-                <div className="text-xs font-medium text-muted-foreground">Generated image</div>
-                <div className="grid aspect-square place-items-center overflow-hidden rounded-lg border bg-muted/30 p-2">
-                  {item.image ? (
-                    <img
-                      src={item.image.src}
-                      alt=""
-                      className="max-h-full max-w-full min-h-0 min-w-0 object-contain"
-                    />
-                  ) : item.status === 'generating' ? (
-                    <Spinner className="size-5 text-primary" />
-                  ) : (
-                    <span className="text-xs text-muted-foreground">Not generated yet</span>
-                  )}
-                </div>
               </div>
             </div>
 
+            {/* Keyed by row: a prompt tweaked for one image never opens on the next. */}
+            <RegenPrompt
+              key={item.id}
+              defaultPrompt={previewPrompt}
+              sentPrompt={item.sentPrompt}
+              busy={running}
+              working={item.status === 'generating'}
+              hint="Send this row to Azure again"
+              onRegenerate={(p) => onRegenerate(item.id, p)}
+            />
+
             <DialogFooter className="flex-wrap gap-2">
-              <Button
-                variant="outline"
-                className="mr-auto"
-                disabled={running}
-                title="Send this row to Azure again"
-                onClick={() => onRegenerate(item.id)}
-              >
-                <RefreshCwIcon data-icon="inline-start" />
-                Regenerate
-              </Button>
               {item.prev && (
                 <Button
                   variant="outline"
+                  className="mr-auto"
                   disabled={running}
                   title="Restore the image the last regenerate replaced"
                   onClick={() => onUndo(item.id)}

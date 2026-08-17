@@ -7,16 +7,12 @@
 
 import * as React from 'react';
 import {
-  CheckIcon, ChevronRightIcon, CopyIcon, DownloadIcon, ExternalLinkIcon, RefreshCwIcon,
-  SparklesIcon, Undo2Icon,
+  CheckIcon, CopyIcon, DownloadIcon, ExternalLinkIcon, RefreshCwIcon, Undo2Icon,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
-import { Textarea } from '@/components/ui/textarea';
-import {
-  Collapsible, CollapsibleContent, CollapsibleTrigger,
-} from '@/components/ui/collapsible';
+import { RegenPrompt } from '@/components/regen-prompt';
 import {
   Dialog,
   DialogContent,
@@ -598,11 +594,6 @@ function CompareView({
   const [saveError, setSaveError] = React.useState<string | null>(null);
   const [copied, setCopied] = React.useState(false);
 
-  // Per-image prompt, seeded from the product default. CompareView is keyed by item id, so
-  // opening another image reseeds it — a tweak made for one image never leaks into the next.
-  const [aiPromptDraft, setAiPromptDraft] = React.useState(aiEdit?.defaultPrompt ?? '');
-  const promptEdited = aiPromptDraft.trim() !== (aiEdit?.defaultPrompt ?? '').trim();
-
   // A one-off choice: redoing from here must not rewrite the global model setting. CompareView
   // is keyed by item id, so opening a different image remounts this and the picker resets to the
   // current global model — no effect needed to sync it.
@@ -813,72 +804,19 @@ function CompareView({
       {/* Same tie-to-cutout rule as the region table above. */}
       {item.cutout && <ComponentTable item={item} />}
 
+      {/* The same block Compose and Generate show in their dialogs (components/regen-prompt.tsx).
+          CompareView is already keyed by item id upstream, so the draft reseeds per image. */}
       {aiEdit && canRetry(item) && (
-        <Collapsible className="rounded-lg border">
-          {/* Chevron rotation: a static rule in base.css keys off Base UI's data-panel-open
-              (the JIT variants proved unreliable under the long-lived dev server's scan). */}
-          <CollapsibleTrigger className="flex w-full cursor-pointer items-center gap-2 px-3 py-2 text-sm font-medium">
-            <ChevronRightIcon className="size-4 transition-transform" />
-            <SparklesIcon className="size-4 text-primary" />
-            AI edit
-            <span className="ml-auto text-xs font-normal text-muted-foreground">
-              {item.status === 'editing'
-                ? 'Regenerating…'
-                : promptEdited
-                  ? 'Custom prompt'
-                  : 'Default prompt'}
-            </span>
-          </CollapsibleTrigger>
-          <CollapsibleContent>
-            <div className="space-y-2 border-t p-3">
-              <Textarea
-                value={aiPromptDraft}
-                onChange={(e) => setAiPromptDraft(e.target.value)}
-                rows={5}
-                disabled={busy || item.status === 'editing'}
-                aria-label="Prompt for this image"
-                className="text-xs"
-              />
-              {aiEdit.rowContext && (
-                // Read-only: these cells come from the CSV, and editing them here would edit
-                // one send rather than the sheet. The picker in the AI edit panel is where they
-                // are chosen; this is only the proof of what goes out with them.
-                <pre className="max-h-28 overflow-auto rounded-md bg-muted/50 p-2 text-[11px] whitespace-pre-wrap text-muted-foreground">
-                  {aiEdit.rowContext}
-                </pre>
-              )}
-              <div className="flex flex-wrap items-center gap-2">
-                <p className="mr-auto text-xs text-muted-foreground">
-                  Applies to this image only — the default prompt stays unchanged.
-                  {aiEdit.rowContext ? ' The CSV row above is appended to it.' : ''}
-                </p>
-                {promptEdited && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    disabled={busy || item.status === 'editing'}
-                    onClick={() => setAiPromptDraft(aiEdit.defaultPrompt)}
-                  >
-                    Reset
-                  </Button>
-                )}
-                <Button
-                  size="sm"
-                  disabled={busy || !aiEdit.ready || item.status === 'editing' || !aiPromptDraft.trim()}
-                  title={aiEdit.hint}
-                  onClick={() => aiEdit.onEdit(item, aiPromptDraft)}
-                >
-                  {item.status === 'editing' ? (
-                    <Spinner data-icon="inline-start" />
-                  ) : (
-                    <SparklesIcon data-icon="inline-start" />
-                  )}
-                  Regenerate
-                </Button>
-              </div>
-            </div>
-          </CollapsibleContent>
-        </Collapsible>
+        <RegenPrompt
+          title="AI edit"
+          defaultPrompt={aiEdit.defaultPrompt}
+          rowContext={aiEdit.rowContext}
+          busy={busy}
+          working={item.status === 'editing'}
+          disabled={!aiEdit.ready}
+          hint={aiEdit.hint}
+          onRegenerate={(prompt) => aiEdit.onEdit(item, prompt)}
+        />
       )}
 
       {saveError && <p className="text-xs text-destructive">{saveError}</p>}
