@@ -3,7 +3,8 @@
 import * as React from 'react';
 import { toast } from 'sonner';
 import {
-  CircleStopIcon, DownloadIcon, RefreshCwIcon, SparklesIcon, UploadCloudIcon, WandSparklesIcon,
+  CircleStopIcon, DownloadIcon, PlusIcon, RefreshCwIcon, SparklesIcon, UploadCloudIcon,
+  WandSparklesIcon,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Hint } from '@/components/hint';
@@ -26,7 +27,8 @@ import { TemplateEditor } from '@/components/template-editor';
 import { BatchPromptDialog } from '@/components/regen-prompt';
 import { ColumnPicker } from '@/components/column-picker';
 import { CsvFileTile } from '@/components/csv-dropzone';
-import { CanvasDropzone } from '@/components/dropzone';
+import { CanvasDropzone, DropzoneShell } from '@/components/dropzone';
+import { BandCard } from '@/components/grid-bands';
 import { SessionHeader, type SessionChip } from '@/components/session-header';
 import { TileGrid, TileDialog, tileOptsFor } from '@/components/tile-grid';
 import { ClearAllButton, SelectionBar, useGridSelection } from '@/components/selection';
@@ -37,7 +39,8 @@ import { MdFileIcon, MdFileTile } from '@/components/md-file-tile';
 
 import { DEFAULT_TEMPLATE, EXPORT_WIDTH, TileTemplate, renderTile, tileToPngBlob } from '@/lib/tile';
 import {
-  CUSTOM_PRESET_ID, PRESET_TYPES, TILE_PRESETS as TEMPLATE_PRESETS, matchPreset,
+  CUSTOM_PRESET_ID, DEFAULT_BAND_PRESET_ID, PRESET_TYPES, TILE_PRESETS as TEMPLATE_PRESETS,
+  bandPreset, matchPreset, withTileColors,
 } from '@/lib/tile-presets';
 import { parseCSV, detectImageColumns, detectTitleColumn, detectOfferColumn, CsvRecord } from '@/lib/csv';
 import { buildZipStream, ZipStreamEntry } from '@/lib/zip';
@@ -51,7 +54,7 @@ import { isAbortError, mapWithLimit, pickSave, releaseCanvas, saveTo } from '@/l
 import { readParallel } from '@/lib/rate';
 import { describeBudget, fitToBudget, type BudgetResult } from '@/lib/bg/budget';
 import { isPng8Supported } from '@/lib/bg/png8';
-import { QueueItem, DEFAULT_ENDPOINT, DEFAULT_PROMPT } from '@/lib/types';
+import { GridBand, QueueItem, DEFAULT_ENDPOINT, DEFAULT_PROMPT } from '@/lib/types';
 import { usePersistedState } from '@/hooks/use-persisted-state';
 
 const NONE = '__none__';
@@ -60,6 +63,30 @@ const EXPORT_SCALES = [1, 2, 3];
 // Bounds how many tile canvases encode at once on export; TinyPNG stays narrower (rate limits).
 const ENCODE_CONCURRENCY = 8;
 const COMPRESS_CONCURRENCY = 4;
+
+/** A Banner grid row, before it has a CSV. Four across is the shelf shape these grids ship in. */
+function newBand(id = crypto.randomUUID()): GridBand {
+  return {
+    id,
+    presetId: DEFAULT_BAND_PRESET_ID,
+    count: 0,
+    columns: 4,
+    fileName: null,
+    headers: [],
+    records: [],
+    imageCols: [],
+    titleCol: '',
+    offerCol: '',
+  };
+}
+
+/**
+ * The row grid mode opens on. Derived rather than seeded into state: grid mode is read from
+ * localStorage after mount, so nothing can put a first band in the initial state, and writing
+ * one from an effect would just be a cascading render. Stable identity — every mutation
+ * replaces it — so it can stand in for state until the first edit materialises it.
+ */
+const SEED_BAND: GridBand = newBand('grid-row-1');
 
 // The tile renderer draws an HTMLImageElement, so a cutout canvas has to be re-encoded.
 // The load must be awaited: drawing an undecoded image paints nothing.
@@ -84,10 +111,18 @@ export default function Compositor() {
   const presetSize = activePreset?.azureSize;
   function applyPreset(id: string) {
     const preset = TEMPLATE_PRESETS.find((p) => p.id === id);
-    if (preset) setTemplate(structuredClone(preset.template));
+    // Geometry comes from the preset, colours stay with the batch. The other half of the same
+    // rule matchPreset follows: if recolouring does not leave a preset, then changing ratio
+    // must not silently undo the recolouring.
+    if (preset) setTemplate((current) => withTileColors(structuredClone(preset.template), current));
   }
+  // Banner grid is a wrapper, not a template, so it is the one type that has no preset to
+  // apply — picking it switches the product into band mode and the bands carry the ratios.
+  const [gridMode, setGridMode] = usePersistedState('skuc_coGridMode', false);
   // Type picks the family (first ratio applies); Ratio picks within it.
   function applyType(type: string) {
+    if (type === 'grid') { setGridMode(true); return; }
+    setGridMode(false);
     const first = TEMPLATE_PRESETS.find((p) => p.type === type);
     if (first) applyPreset(first.id);
   }
@@ -151,6 +186,19 @@ export default function Compositor() {
   const [titleCol, setTitleCol] = React.useState('');
   const [offerCol, setOfferCol] = React.useState('');
 
+  // Banner grid — the rows ("bands") of the grid. Each owns one CSV, one banner-tile preset and
+  // how much of that sheet to draw; the tiles themselves live in the flat queue below, tagged
+  // with their band, so every batch mechanism stays band-agnostic.
+  const [bands, setBands] = React.useState<GridBand[]>([]);
+  // A grid holds several sheets at once, so a row's sheet index can no longer be its queue id.
+  const nextItemId = React.useRef(0);
+  // Grid mode is never empty-handed: there is always a row on screen to drop a CSV into.
+  const gridBands = bands.length ? bands : [SEED_BAND];
+  /** Band writes go through the SAME list the UI reads, seed included. */
+  function updateBands(fn: (prev: GridBand[]) => GridBand[]) {
+    setBands((prev) => fn(prev.length ? prev : [SEED_BAND]));
+  }
+
   // Queue / run state
   const [items, setItems] = React.useState<QueueItem[]>([]);
   const [running, setRunning] = React.useState(false);
@@ -162,7 +210,18 @@ export default function Compositor() {
   const [openId, setOpenId] = React.useState<number | null>(null);
   const openItem = items.find((it) => it.id === openId) ?? null;
 
-  const itemIds = React.useMemo(() => items.map((it) => it.id), [items]);
+  /**
+   * The queue the product is currently working on. Grid mode and single-template mode keep
+   * their rows in the SAME array, told apart by bandId, so flipping the Preset dropdown parks
+   * one and shows the other instead of throwing either away — and neither can ship tiles the
+   * canvas is not showing.
+   */
+  const activeItems = React.useMemo(
+    () => items.filter((it) => (gridMode ? !!it.bandId : !it.bandId)),
+    [items, gridMode],
+  );
+
+  const itemIds = React.useMemo(() => activeItems.map((it) => it.id), [activeItems]);
   const sel = useGridSelection(itemIds, openId !== null);
 
   // Post-await reads (undo eligibility, toast actions) need the LIVE queue, not the closure.
@@ -213,11 +272,26 @@ export default function Compositor() {
     return imageCols.map((c) => record[c]).filter((u) => /^https?:\/\//i.test(u || ''));
   }
 
-  function buildQueue(records: CsvRecord[], imageCols: string[], titleCol: string, offerCol: string): QueueItem[] {
+  /**
+   * `rowStart` is the 1-based sheet position of `records[0]` — raising a band's tile count
+   * appends the NEXT slice of its sheet, and those tiles must keep the row numbers they have in
+   * that file rather than restarting at 1.
+   */
+  function buildQueue(
+    records: CsvRecord[],
+    imageCols: string[],
+    titleCol: string,
+    offerCol: string,
+    opts: { bandId?: string; rowStart?: number } = {},
+  ): QueueItem[] {
+    const rowStart = opts.rowStart ?? 1;
     return records.map((record, i) => {
       const urls = rowUrls(record, imageCols);
       return {
-        id: i, record, urls,
+        id: nextItemId.current++,
+        row: rowStart + i,
+        ...(opts.bandId ? { bandId: opts.bandId } : null),
+        record, urls,
         title: titleCol ? record[titleCol] ?? '' : '',
         offer: offerCol ? record[offerCol] ?? '' : '',
         status: urls.length ? 'ready' : 'no-images',
@@ -225,6 +299,150 @@ export default function Compositor() {
         compressed: null,
       };
     });
+  }
+
+  // ---- Banner grid bands ----
+
+  /** The band an item belongs to, or undefined outside grid mode. */
+  function bandOf(item: QueueItem): GridBand | undefined {
+    return item.bandId ? gridBands.find((b) => b.id === item.bandId) : undefined;
+  }
+
+  /**
+   * The template a tile is drawn with: its band's preset in grid mode, the shared one outside.
+   * A band chooses a ratio, never a palette — the Colours panel is the batch's, so every band
+   * wears its colours. Reading the preset raw would leave recolouring a no-op in grid mode.
+   */
+  function templateFor(item: QueueItem): TileTemplate {
+    const band = bandOf(item);
+    return band ? withTileColors(bandPreset(band.presetId).template, template) : template;
+  }
+
+  /** The Azure size to request for a tile — same rule as presetSize, asked per band. */
+  function sizeFor(item: QueueItem) {
+    const band = bandOf(item);
+    return band ? bandPreset(band.presetId).azureSize : presetSize;
+  }
+
+  /**
+   * The text rules a tile renders by. Batch-wide fallbacks are shared, but "is an offer column
+   * mapped" is a property of the SHEET, so in grid mode it comes from the item's own band.
+   */
+  function rulesFor(item: QueueItem) {
+    const band = bandOf(item);
+    return {
+      fallbackTitle: tplTitle,
+      fallbackOffer: tplOffer,
+      offerToggle: offerVisible,
+      hasOfferCol: band ? !!band.offerCol : !!offerCol,
+    };
+  }
+
+  /**
+   * Replaces one band's slice of the queue, keeping the flat array grouped in band order so the
+   * grid, shift-select and the export all read the rows in the order the panel lists them.
+   */
+  function setBandItems(bandId: string, next: QueueItem[]) {
+    setItems((prev) => {
+      const mine = new Map<string, QueueItem[]>();
+      for (const band of gridBands) {
+        mine.set(band.id, band.id === bandId ? next : prev.filter((it) => it.bandId === band.id));
+      }
+      return gridBands.flatMap((band) => mine.get(band.id) ?? []);
+    });
+  }
+
+  function patchBand(id: string, patch: Partial<GridBand>) {
+    updateBands((prev) => prev.map((b) => (b.id === id ? { ...b, ...patch } : b)));
+  }
+
+  function addBand() {
+    updateBands((prev) => [...prev, newBand()]);
+  }
+
+  function removeBand(id: string) {
+    updateBands((prev) => prev.filter((b) => b.id !== id));
+    setItems((prev) => prev.filter((it) => it.bandId !== id));
+    setOpenId((prev) => (prev !== null && itemsRef.current.find((it) => it.id === prev)?.bandId === id ? null : prev));
+    setCompressSummary('');
+  }
+
+  /** A CSV dropped in one band's area on the canvas. Only that band is touched. */
+  function handleBandFile(bandId: string, file: File) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const { headers, records } = parseCSV(String(reader.result));
+      if (!headers.length || !records.length) { toast.error('CSV appears empty.'); return; }
+      const imgCols = detectImageColumns(headers, records);
+      const tCol = detectTitleColumn(headers, imgCols);
+      const oCol = detectOfferColumn(headers, imgCols);
+      const band = gridBands.find((b) => b.id === bandId);
+      // A fresh sheet fills the row it landed in: as many tiles as the band's grid holds
+      // (two full rows of it), or the whole sheet where it is smaller.
+      const count = Math.min(records.length, (band?.columns ?? 4) * 2);
+      setSessionName((prev) => (prev.trim() ? prev : file.name.replace(/\.[^.]+$/, '')));
+      patchBand(bandId, {
+        fileName: file.name, headers, records,
+        imageCols: imgCols, titleCol: tCol, offerCol: oCol, count,
+      });
+      setBandItems(bandId, buildQueue(records.slice(0, count), imgCols, tCol, oCol, { bandId }));
+    };
+    reader.readAsText(file);
+  }
+
+  /** Removing a band's CSV empties the row without removing the row itself. */
+  function clearBandFile(bandId: string) {
+    patchBand(bandId, {
+      fileName: null, headers: [], records: [], imageCols: [], titleCol: '', offerCol: '', count: 0,
+    });
+    setBandItems(bandId, []);
+  }
+
+  /**
+   * The tile count is a window onto the band's sheet: lowering it drops the tail, raising it
+   * appends the next rows. Tiles that survive keep their object identity, so lowering and
+   * raising the count again never costs a generated tile.
+   */
+  function setBandCount(band: GridBand, count: number) {
+    const capped = Math.min(Math.max(0, count), band.records.length);
+    patchBand(band.id, { count: capped });
+    const mine = items.filter((it) => it.bandId === band.id);
+    if (capped <= mine.length) {
+      setBandItems(band.id, mine.slice(0, capped));
+      return;
+    }
+    const extra = buildQueue(
+      band.records.slice(mine.length, capped),
+      band.imageCols, band.titleCol, band.offerCol,
+      { bandId: band.id, rowStart: mine.length + 1 },
+    );
+    setBandItems(band.id, [...mine, ...extra]);
+  }
+
+  /** One band's column mapping, re-derived in place exactly the way updateMapping does. */
+  function remapBand(band: GridBand, patch: Partial<GridBand>) {
+    const next = { ...band, ...patch };
+    patchBand(band.id, patch);
+    if (next.titleCol !== band.titleCol || next.offerCol !== band.offerCol) setCompressSummary('');
+    setItems((prev) =>
+      prev.map((it) =>
+        it.bandId === band.id
+          ? remapItem(it, next.imageCols, next.titleCol, next.offerCol)
+          : it,
+      ),
+    );
+  }
+
+  /**
+   * A band whose preset changed draws different pixels, so its cached PNG bytes are stale for
+   * the same reason a template edit makes the shared queue's stale.
+   */
+  function setBandPreset(band: GridBand, presetId: string) {
+    patchBand(band.id, { presetId });
+    setItems((prev) =>
+      prev.map((it) => (it.bandId === band.id && it.compressed ? { ...it, compressed: null } : it)),
+    );
+    setCompressSummary('');
   }
 
   /**
@@ -243,32 +461,33 @@ export default function Compositor() {
     if (next.offerCol !== undefined) setOfferCol(oc);
     // The summary describes bytes that some rows no longer have; it is re-earned on next export.
     if (tc !== titleCol || oc !== offerCol) setCompressSummary('');
-    setItems((prev) =>
-      prev.map((it) => {
-        const urls = rowUrls(it.record, ic);
-        const title = tc ? it.record[tc] ?? '' : '';
-        const offer = oc ? it.record[oc] ?? '' : '';
-        const sameUrls = urls.length === it.urls.length && urls.every((u, n) => u === it.urls[n]);
-        const sameText = title === it.title && offer === it.offer;
-        // Untouched rows keep their object identity, so their canvases do not repaint.
-        if (sameUrls && sameText) return it;
-        return {
-          ...it,
-          urls,
-          title,
-          offer,
-          // Only the two statuses the mapping itself decides are re-derived. A row that has
-          // generated, failed, or is in flight keeps the state it earned.
-          status:
-            it.status === 'ready' || it.status === 'no-images'
-              ? urls.length ? 'ready' : 'no-images'
-              : it.status,
-          // Title and offer are drawn at render time, so changing them invalidates the cached
-          // PNG bytes exactly the way a template edit does.
-          compressed: sameText ? it.compressed : null,
-        };
-      }),
-    );
+    setItems((prev) => prev.map((it) => remapItem(it, ic, tc, oc)));
+  }
+
+  /** One row under a new mapping — the rule updateMapping and remapBand share. */
+  function remapItem(it: QueueItem, ic: string[], tc: string, oc: string): QueueItem {
+    const urls = rowUrls(it.record, ic);
+    const title = tc ? it.record[tc] ?? '' : '';
+    const offer = oc ? it.record[oc] ?? '' : '';
+    const sameUrls = urls.length === it.urls.length && urls.every((u, n) => u === it.urls[n]);
+    const sameText = title === it.title && offer === it.offer;
+    // Untouched rows keep their object identity, so their canvases do not repaint.
+    if (sameUrls && sameText) return it;
+    return {
+      ...it,
+      urls,
+      title,
+      offer,
+      // Only the two statuses the mapping itself decides are re-derived. A row that has
+      // generated, failed, or is in flight keeps the state it earned.
+      status:
+        it.status === 'ready' || it.status === 'no-images'
+          ? urls.length ? 'ready' : 'no-images'
+          : it.status,
+      // Title and offer are drawn at render time, so changing them invalidates the cached
+      // PNG bytes exactly the way a template edit does.
+      compressed: sameText ? it.compressed : null,
+    };
   }
 
   // ---- Generation ----
@@ -306,7 +525,7 @@ export default function Compositor() {
       const { canvas } = await turn;
       return await canvasToImage(canvas);
     } catch (e) {
-      toast.warning(`Row ${item.id + 1}: tile generated without background removal — ${(e as Error).message}`);
+      toast.warning(`Row ${item.row}: tile generated without background removal — ${(e as Error).message}`);
       return image;
     }
   }
@@ -323,7 +542,7 @@ export default function Compositor() {
       await new Promise((r) => setTimeout(r, 600));
       resultImage = await mockComposite(images);
     } else {
-      resultImage = await callAzure(images, { endpoint, apiKey: azureKey, prompt: runPrompt, size: presetSize, signal });
+      resultImage = await callAzure(images, { endpoint, apiKey: azureKey, prompt: runPrompt, size: sizeFor(item), signal });
     }
     resultImage = await stripBackground(resultImage, item);
     patchItem(item.id, {
@@ -346,7 +565,7 @@ export default function Compositor() {
 
   async function handleGenerateAll() {
     if (!guards()) return;
-    await runTiles(items.filter((it) => it.urls.length), 'generated');
+    await runTiles(activeItems.filter((it) => it.urls.length), 'generated');
   }
 
   /**
@@ -366,7 +585,7 @@ export default function Compositor() {
       edited = await mockComposite([source]);
     } else {
       edited = await callAzure([source], {
-        endpoint, apiKey: azureKey, prompt: runPrompt, size: presetSize, signal,
+        endpoint, apiKey: azureKey, prompt: runPrompt, size: sizeFor(item), signal,
       });
     }
     edited = await stripBackground(edited, item);
@@ -485,6 +704,9 @@ export default function Compositor() {
   /** Full reset back to the drop zone. Session name survives, like Generate's clear. */
   function clearAll() {
     setItems([]);
+    // Emptying the list is what puts grid mode back on its seed row, so a clear still leaves
+    // a drop area on the canvas.
+    setBands([]);
     sel.clear();
     setOpenId(null);
     setFileName(null);
@@ -502,17 +724,17 @@ export default function Compositor() {
     const controller = new AbortController();
     genAbortRef.current = controller;
     setRunning(true);
-    setProgress({ pct: 50, text: `Regenerating row ${item.id + 1}…` });
+    setProgress({ pct: 50, text: `Regenerating row ${item.row}…` });
     try {
       await generateItem(item, controller.signal, promptOverride);
-      setProgress({ pct: 100, text: `Row ${item.id + 1} regenerated.` });
+      setProgress({ pct: 100, text: `Row ${item.row} regenerated.` });
     } catch (e) {
       if (isAbortError(e)) {
         patchItem(item.id, { status: item.status, errorMsg: undefined });
-        setProgress({ pct: 100, text: `Row ${item.id + 1} — stopped.` });
+        setProgress({ pct: 100, text: `Row ${item.row} — stopped.` });
       } else {
         patchItem(item.id, { status: 'error', errorMsg: (e as Error).message });
-        setProgress({ pct: 100, text: `Row ${item.id + 1} failed: ${(e as Error).message}` });
+        setProgress({ pct: 100, text: `Row ${item.row} failed: ${(e as Error).message}` });
       }
     }
     genAbortRef.current = null;
@@ -523,15 +745,15 @@ export default function Compositor() {
   async function handleExport() {
     // Anything generated, whether or not its cell is currently mounted — export rasterises its
     // own canvas now, so it no longer depends on the grid having one on screen.
-    const done = items.filter((it) => it.status === 'done' && it.resultImage);
+    const done = activeItems.filter((it) => it.status === 'done' && it.resultImage);
     // The grid's rules, snapshotted for the whole export: the tile you looked at is the tile
     // that ships, and editing a field mid-encode must not give the ZIP two different answers.
-    const textRules = {
-      fallbackTitle: tplTitle,
-      fallbackOffer: tplOffer,
-      offerToggle: offerVisible,
-      hasOfferCol: !!offerCol,
-    };
+    // Per item, not per batch — in Banner grid mode each band brings its own sheet, template
+    // and offer mapping.
+    const plan = new Map(done.map((it) => [
+      it.id,
+      { template: templateFor(it), rules: rulesFor(it) },
+    ]));
     if (!done.length) return;
     // Save dialog first, while the click still counts as user activation — TinyPNG passes can
     // take minutes, after which Chrome would refuse to open it. Cancelling cancels the export.
@@ -566,10 +788,11 @@ export default function Compositor() {
         // looking at, and export resolution is a separate decision. Same template, same row
         // text (tileOptsFor is the one rule), just more pixels.
         const canvas = document.createElement('canvas');
+        const sheet = plan.get(item.id)!;
         renderTile(
           canvas,
-          { ...tileOptsFor(item, textRules), image: item.resultImage },
-          template,
+          { ...tileOptsFor(item, sheet.rules), image: item.resultImage },
+          sheet.template,
           exportScale,
         );
         let data: Uint8Array;
@@ -611,7 +834,7 @@ export default function Compositor() {
           return out;
         } catch (e) {
           failed++;
-          toast.error(`Row ${item.id + 1}: ${(e as Error).message}`);
+          toast.error(`Row ${item.row}: ${(e as Error).message}`);
           // fall back to the uncompressed PNG for this tile
           return data;
         } finally {
@@ -626,15 +849,22 @@ export default function Compositor() {
 
       const used = new Map<string, number>();
       done.forEach((item, n) => {
-        const base = (item.title || `tile-${item.id + 1}`).replace(/[^\w\- ]+/g, '').trim().replace(/\s+/g, '-').toLowerCase() || `tile-${item.id + 1}`;
+        const base = (item.title || `tile-${item.row}`).replace(/[^\w\- ]+/g, '').trim().replace(/\s+/g, '-').toLowerCase() || `tile-${item.row}`;
+        // A banner grid ships as folders, one per row of the grid, so the ZIP has the same
+        // shape on disk as the grid has on screen. Outside grid mode the prefix is empty and
+        // the ZIP is flat, exactly as before.
+        const bandIndex = item.bandId ? gridBands.findIndex((b) => b.id === item.bandId) : -1;
+        const folder = bandIndex >= 0 ? `row-${bandIndex + 1}/` : '';
         let name: string;
         if (numberFiles) {
-          name = `${String(item.id + 1).padStart(2, '0')}-${base}.png`;
+          name = `${folder}${String(item.row).padStart(2, '0')}-${base}.png`;
         } else {
-          // Repeated titles get -2, -3 so nothing in the ZIP is silently overwritten.
-          const seen = (used.get(base) ?? 0) + 1;
-          used.set(base, seen);
-          name = seen === 1 ? `${base}.png` : `${base}-${seen}.png`;
+          // Repeated titles get -2, -3 so nothing in the ZIP is silently overwritten. Counted
+          // per folder: the same title in two rows of the grid is not a collision.
+          const key = `${folder}${base}`;
+          const seen = (used.get(key) ?? 0) + 1;
+          used.set(key, seen);
+          name = seen === 1 ? `${folder}${base}.png` : `${folder}${base}-${seen}.png`;
         }
         files.push({ name, data: finalBytes[n] });
       });
@@ -660,7 +890,7 @@ export default function Compositor() {
         if (flagged.length) {
           const names = flagged
             .slice(0, 3)
-            .map(({ item, result }) => `${item.title || `row ${item.id + 1}`} (${describeBudget(result)})`)
+            .map(({ item, result }) => `${item.title || `row ${item.row}`} (${describeBudget(result)})`)
             .join(', ');
           toast.warning(
             over.length
@@ -701,20 +931,23 @@ export default function Compositor() {
     setCompressSummary('');
   }
 
-  const doneCount = items.filter((it) => it.status === 'done').length;
-  const canGenerate = items.some((it) => it.urls.length);
+  const doneCount = activeItems.filter((it) => it.status === 'done').length;
+  const canGenerate = activeItems.some((it) => it.urls.length);
   // Greyed out with a reason beats erroring on click — same gate as Cleanup's AI edit.
   const aiReady = mock || (endpoint.trim().length > 0 && azureKey.trim().length > 0);
 
   // The template preview answers "what will my tiles look like", so once a sheet is in it
   // renders the first row by exactly the rules the grid and the export use. With no sheet there
   // is nothing to render, so SAMPLE_* stands in — placeholder for a preview, never for a tile.
+  // In grid mode there is no single frame to quote, so the hint speaks for row 1 — the rows
+  // differ only in ratio, and the scale is what the control actually sets.
+  const exportFrame = (gridMode ? bandPreset(gridBands[0].presetId).template : template).frame;
   const exportPx = {
     w: Math.round(EXPORT_WIDTH * exportScale),
-    h: Math.round((EXPORT_WIDTH * exportScale * template.frame.height) / template.frame.width),
+    h: Math.round((EXPORT_WIDTH * exportScale * exportFrame.height) / exportFrame.width),
   };
 
-  const previewRow = items[0];
+  const previewRow = activeItems[0];
   const previewTitle = previewRow?.title || tplTitle;
   const previewOffer = previewRow?.offer || tplOffer;
   const previewOfferVisible =
@@ -742,8 +975,10 @@ export default function Compositor() {
               product="Compose"
               chips={
                 [
-                  records.length > 0 && { label: `${records.length} row${records.length === 1 ? '' : 's'}` },
-                  items.length > 0 && { label: `${doneCount}/${items.length} tiles` },
+                  gridMode
+                    ? { label: `${gridBands.length} grid row${gridBands.length === 1 ? '' : 's'}` }
+                    : records.length > 0 && { label: `${records.length} row${records.length === 1 ? '' : 's'}` },
+                  activeItems.length > 0 && { label: `${doneCount}/${activeItems.length} tiles` },
                 ].filter(Boolean) as SessionChip[]
               }
             />
@@ -768,7 +1003,7 @@ export default function Compositor() {
                 <Field>
                   <FieldLabel htmlFor="tpl-preset-type">Preset</FieldLabel>
                   <Select
-                    value={activePreset?.type ?? CUSTOM_PRESET_ID}
+                    value={gridMode ? 'grid' : activePreset?.type ?? CUSTOM_PRESET_ID}
                     onValueChange={(v) => applyType(String(v ?? ''))}
                   >
                     <SelectTrigger id="tpl-preset-type">
@@ -784,13 +1019,15 @@ export default function Compositor() {
                         <SelectItem key={t.id} value={t.id}>{t.label}</SelectItem>
                       ))}
                       {/* Indicator, not an action: it becomes selected by editing, not by picking. */}
-                      <SelectItem value={CUSTOM_PRESET_ID} disabled={presetId !== CUSTOM_PRESET_ID}>
+                      <SelectItem value={CUSTOM_PRESET_ID} disabled={gridMode || presetId !== CUSTOM_PRESET_ID}>
                         Custom
                       </SelectItem>
                     </SelectContent>
                   </Select>
                 </Field>
-                {activePreset && (
+                {/* One shared ratio is meaningless in grid mode — each band picks its own,
+                    in its own row item below. */}
+                {!gridMode && activePreset && (
                   <Field>
                     <FieldLabel htmlFor="tpl-preset-ratio">Ratio</FieldLabel>
                     <Select value={presetId} onValueChange={(v) => applyPreset(String(v ?? ''))}>
@@ -808,6 +1045,7 @@ export default function Compositor() {
                   </Field>
                 )}
               </FieldGroup>
+              {!gridMode && (
               <TemplateEditor
                 template={template}
                 onChange={handleTemplateChange}
@@ -857,8 +1095,48 @@ export default function Compositor() {
                 </FieldGroup>
                 )}
               </TemplateEditor>
+              )}
             </PanelSection>
-          {fileName && (
+
+          {/* The banner grid itself: one row item per band, each pairing with its own drop area
+              on the canvas. Changing a row's preset moves only that row's tiles. */}
+          {gridMode && (
+            <PanelSection
+              title="Grid rows"
+              hint="Each row is a band of banner tiles with its own CSV. The plus adds another; its drop area appears under the last one on the canvas."
+              action={
+                <Button variant="ghost" size="icon-sm" disabled={running} onClick={addBand} aria-label="Add row">
+                  <PlusIcon />
+                </Button>
+              }
+              className="space-y-3"
+            >
+              {gridBands.map((band, i) => (
+                <BandCard
+                  key={band.id}
+                  band={band}
+                  index={i}
+                  total={gridBands.length}
+                  tiles={items.filter((it) => it.bandId === band.id).length}
+                  disabled={running}
+                  onReplaceCsv={(file) => handleBandFile(band.id, file)}
+                  onRemove={() => removeBand(band.id)}
+                  onChange={(patch) => {
+                    if (patch.presetId !== undefined) setBandPreset(band, patch.presetId);
+                    else if (patch.count !== undefined) setBandCount(band, patch.count);
+                    else if (patch.fileName === null) clearBandFile(band.id);
+                    else if (patch.imageCols || patch.titleCol !== undefined || patch.offerCol !== undefined) remapBand(band, patch);
+                    else patchBand(band.id, patch);
+                  }}
+                />
+              ))}
+              <Button variant="outline" className="w-full" disabled={running} onClick={addBand}>
+                <PlusIcon data-icon="inline-start" />
+                Add row
+              </Button>
+            </PanelSection>
+          )}
+          {!gridMode && fileName && (
             <PanelSection title="CSV file">
               {/* Only once there IS a file. The drop target lives in the canvas now, so an
                   empty slot here would offer a second route to the same act. */}
@@ -873,7 +1151,7 @@ export default function Compositor() {
                   title: 'Remove the CSV?',
                   description: (
                     <>
-                      Clears all {items.length} row{items.length === 1 ? '' : 's'}
+                      Clears all {activeItems.length} row{activeItems.length === 1 ? '' : 's'}
                       {doneCount > 0 && <> and the {doneCount} generated tile{doneCount === 1 ? '' : 's'} (not exported anywhere yet)</>}
                       . Your CSV file on disk is untouched — drop it again to rebuild the queue.
                     </>
@@ -885,7 +1163,7 @@ export default function Compositor() {
 
           {/* The tile above carries the file name; repeating it in this title just made two
               rows disagree about truncation. */}
-          {headers.length > 0 && (
+          {!gridMode && headers.length > 0 && (
             <PanelSection title="Columns">
                 <FieldGroup className="gap-4">
                   <Field>
@@ -976,7 +1254,102 @@ export default function Compositor() {
 
         <Canvas>
 
-            {items.length === 0 ? (
+            {gridMode ? (
+              /* One block per band, stacked in panel order: the row item on the left and its
+                 own drop area here are the two halves of the same thing, so a CSV can only ever
+                 land in the row it was dropped on. */
+              <div className="flex flex-col gap-6">
+                {gridBands.map((band, i) => {
+                  const bandItems = items.filter((it) => it.bandId === band.id);
+                  const preset = bandPreset(band.presetId);
+                  const bandDone = bandItems.filter((it) => it.status === 'done').length;
+                  return (
+                    <section key={band.id} aria-label={`Row ${i + 1}`} className="flex flex-col gap-2">
+                      <div className="flex items-baseline gap-2">
+                        <h2 className="text-sm font-semibold">Row {i + 1}</h2>
+                        <span className="text-xs text-muted-foreground">
+                          {preset.ratio}
+                          {band.fileName ? ` · ${band.fileName}` : ''}
+                          {bandItems.length ? ` · ${bandItems.length} tile${bandItems.length === 1 ? '' : 's'}` : ''}
+                          {bandDone ? ` · ${bandDone} generated` : ''}
+                        </span>
+                      </div>
+                      {bandItems.length ? (
+                        <TileGrid
+                          items={bandItems}
+                          template={preset.template}
+                          columns={band.columns}
+                          fallbackTitle={tplTitle}
+                          fallbackOffer={tplOffer}
+                          offerToggle={offerVisible}
+                          hasOfferCol={!!band.offerCol}
+                          running={running}
+                          selected={sel.checked}
+                          onOpen={(item) => setOpenId(item.id)}
+                          onRemove={(item) => {
+                            setBandItems(band.id, bandItems.filter((it) => it.id !== item.id));
+                            setOpenId((prev) => (prev === item.id ? null : prev));
+                          }}
+                          onToggleSelect={sel.toggle}
+                        />
+                      ) : (
+                        <DropzoneShell
+                          accept=".csv,text/csv"
+                          disabled={running}
+                          onFiles={(files) => handleBandFile(band.id, files[0])}
+                          className="min-h-32 justify-center"
+                        >
+                          <UploadCloudIcon className="size-6" />
+                          <span className="font-medium text-foreground">
+                            Drop row {i + 1}&rsquo;s CSV here, or{' '}
+                            <span className="font-normal text-primary underline underline-offset-2">browse</span>
+                          </span>
+                          <span className="text-xs">
+                            Its first {band.columns * 2} rows fill this row of the grid; change
+                            the count in the panel.
+                          </span>
+                        </DropzoneShell>
+                      )}
+                    </section>
+                  );
+                })}
+                <Button variant="outline" className="self-start" disabled={running} onClick={addBand}>
+                  <PlusIcon data-icon="inline-start" />
+                  Add row
+                </Button>
+                {sel.active && (
+                  <SelectionBar
+                    count={sel.checked.size}
+                    total={activeItems.length}
+                    allSelected={sel.allSelected}
+                    busy={running}
+                    actions={[
+                      {
+                        key: 'ai-edit',
+                        label: aiReady
+                          ? 'AI edit selected — sends each finished tile back to Azure with the AI edit prompt'
+                          : 'AI edit needs the Azure endpoint + key (Settings, gear in the rail)',
+                        icon: WandSparklesIcon,
+                        accent: true,
+                        disabled: !aiReady || !aiEditTargets.length,
+                        onRun: () => setAiBatchOpen(true),
+                      },
+                      {
+                        key: 'regenerate',
+                        label: 'Regenerate selected — composes each tile again from its source images',
+                        icon: RefreshCwIcon,
+                        onRun: () => void handleRegenerateSelected(),
+                      },
+                    ]}
+                    deleteTitle={`Delete ${sel.checked.size} tile${sel.checked.size === 1 ? '' : 's'}?`}
+                    deleteDescription="Removes them from the grid, along with anything they generated. Raising a row's tile count brings its rows back from the CSV."
+                    onDelete={deleteSelected}
+                    onSelectAll={sel.selectAll}
+                    onClear={sel.clear}
+                  />
+                )}
+              </div>
+            ) : activeItems.length === 0 ? (
               <CanvasDropzone
                 icon={<UploadCloudIcon />}
                 title="Drop a CSV to start"
@@ -991,8 +1364,8 @@ export default function Compositor() {
                 <CanvasToolbar className="justify-between">
                   <span className="text-xs text-muted-foreground">
                     {sel.active
-                      ? `${sel.checked.size} of ${items.length} selected`
-                      : `${items.length} row${items.length === 1 ? '' : 's'}${doneCount ? ` · ${doneCount} generated` : ''}`}
+                      ? `${sel.checked.size} of ${activeItems.length} selected`
+                      : `${activeItems.length} row${activeItems.length === 1 ? '' : 's'}${doneCount ? ` · ${doneCount} generated` : ''}`}
                   </span>
                   <ClearAllButton
                     title="Clear this run?"
@@ -1000,7 +1373,7 @@ export default function Compositor() {
                     onConfirm={clearAll}
                     description={
                       <>
-                        Removes all {items.length} row{items.length === 1 ? '' : 's'}
+                        Removes all {activeItems.length} row{activeItems.length === 1 ? '' : 's'}
                         {doneCount > 0 && <> and the {doneCount} generated tile{doneCount === 1 ? '' : 's'} (not exported anywhere yet)</>}
                         . Your CSV file on disk is untouched — drop it again to rebuild the
                         queue.
@@ -1009,7 +1382,7 @@ export default function Compositor() {
                   />
                 </CanvasToolbar>
                 <TileGrid
-                  items={items}
+                  items={activeItems}
                   template={template}
                   fallbackTitle={tplTitle}
                   fallbackOffer={tplOffer}
@@ -1027,7 +1400,7 @@ export default function Compositor() {
                 {sel.active && (
                   <SelectionBar
                     count={sel.checked.size}
-                    total={items.length}
+                    total={activeItems.length}
                     allSelected={sel.allSelected}
                     busy={running}
                     actions={[
@@ -1153,7 +1526,9 @@ export default function Compositor() {
                         ))}
                       </ToggleGroup>
                       <FieldDescription>
-                        PNGs export at {exportPx.w.toLocaleString()} × {exportPx.h.toLocaleString()} px.
+                        {gridMode
+                          ? `Row 1's tiles export at ${exportPx.w.toLocaleString()} × ${exportPx.h.toLocaleString()} px; other rows follow their own ratio.`
+                          : `PNGs export at ${exportPx.w.toLocaleString()} × ${exportPx.h.toLocaleString()} px.`}
                       </FieldDescription>
                     </Field>
 
@@ -1246,11 +1621,11 @@ export default function Compositor() {
 
       <TileDialog
         item={openItem}
-        template={template}
+        template={openItem ? templateFor(openItem) : template}
         fallbackTitle={tplTitle}
         fallbackOffer={tplOffer}
         offerToggle={offerVisible}
-        hasOfferCol={!!offerCol}
+        hasOfferCol={openItem ? rulesFor(openItem).hasOfferCol : !!offerCol}
         running={running}
         prompt={prompt}
         exportScale={exportScale}

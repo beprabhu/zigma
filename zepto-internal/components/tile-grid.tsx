@@ -220,7 +220,7 @@ function TileCell({
   const r = template.frame;
   return (
     <ResultCell
-      label={item.title || `Row ${item.id + 1}`}
+      label={item.title || `Row ${item.row}`}
       status={statusLine(item)}
       checked={checked}
       selectionActive={selectionActive}
@@ -284,14 +284,22 @@ interface TileGridProps {
   onOpen: (item: QueueItem) => void;
   onRemove: (item: QueueItem) => void;
   onToggleSelect: (id: number, shiftKey: boolean) => void;
+  /**
+   * Fixed tiles-per-row, for a Banner grid band whose columns are part of the design. Omitted
+   * (the default queue view) keeps the responsive 3/4-up grid.
+   */
+  columns?: number;
 }
 
 export function TileGrid({
   items, template, fallbackTitle, fallbackOffer, offerToggle, hasOfferCol,
-  running, selected, onOpen, onRemove, onToggleSelect,
+  running, selected, onOpen, onRemove, onToggleSelect, columns,
 }: TileGridProps) {
   return (
-    <div className="grid grid-cols-3 gap-3.5 xl:grid-cols-4">
+    <div
+      className={columns ? 'grid gap-3.5' : 'grid grid-cols-3 gap-3.5 xl:grid-cols-4'}
+      style={columns ? { gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` } : undefined}
+    >
       {items.map((item) => (
         <TileCell
           key={item.id}
@@ -365,7 +373,7 @@ export function TileDialog({
 
   async function handleDownload() {
     if (!item?.resultImage) return;
-    const fileName = `${(item.title || `row-${item.id + 1}`).replace(/[^\w.-]+/g, '-')}.png`;
+    const fileName = `${(item.title || `row-${item.row}`).replace(/[^\w.-]+/g, '-')}.png`;
     // Dialog first, while the click is fresh — it names the file before it lands.
     const dest = await pickSave(fileName);
     if (dest === 'cancelled') return;
@@ -396,7 +404,7 @@ export function TileDialog({
           <>
             <DialogHeader className="min-w-0">
               <DialogTitle className="truncate" title={item.title || undefined}>
-                {item.title || `Row ${item.id + 1}`}
+                {item.title || `Row ${item.row}`}
               </DialogTitle>
               <DialogDescription className={line?.error ? 'text-destructive' : undefined}>
                 {line?.text}

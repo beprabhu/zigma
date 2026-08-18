@@ -3,7 +3,15 @@ import type { CsvRecord } from './csv';
 export type ItemStatus = 'ready' | 'no-images' | 'fetching' | 'generating' | 'removing-bg' | 'done' | 'error';
 
 export interface QueueItem {
+  /**
+   * Unique across the whole run, not a sheet index: in Banner grid mode several CSVs share one
+   * queue, so ids come from a counter. `row` is what a person is shown.
+   */
   id: number;
+  /** 1-based position in the CSV this item came from — the "Row 3" every message names. */
+  row: number;
+  /** Which banner-grid band owns this row; absent outside Banner grid mode. */
+  bandId?: string;
   record: CsvRecord;
   urls: string[];
   title: string;
@@ -17,6 +25,31 @@ export interface QueueItem {
    * result; overwritten by the next regenerate, cleared by undo.
    */
   prev?: { resultImage: HTMLImageElement };
+}
+
+/**
+ * One row of a Banner grid — the "row item" in Compose's left panel and the drop area it owns
+ * in the canvas. A band is a wrapper around banner tiles: it picks ONE banner-tile preset, one
+ * CSV, and how many of that sheet's rows to draw, in how many columns.
+ *
+ * The tiles themselves live in the flat queue (QueueItem.bandId), not here, so every existing
+ * batch mechanism — patching, selection, the compare dialog, stop, export — keeps working
+ * unchanged whether there is one band or six.
+ */
+export interface GridBand {
+  id: string;
+  /** A banner-tile preset id; see BAND_PRESETS in lib/tile-presets.ts. */
+  presetId: string;
+  /** How many of the sheet's rows to draw, capped at records.length. */
+  count: number;
+  /** Tiles per row in this band's grid. */
+  columns: number;
+  fileName: string | null;
+  headers: string[];
+  records: CsvRecord[];
+  imageCols: string[];
+  titleCol: string;
+  offerCol: string;
 }
 
 export interface Keys {
