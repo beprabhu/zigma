@@ -35,7 +35,6 @@ import {
 import {
   Field, FieldContent, FieldDescription, FieldGroup, FieldLabel,
 } from '@/components/ui/field';
-import { Input } from '@/components/ui/input';
 import { Progress } from '@/components/ui/progress';
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
@@ -93,6 +92,7 @@ import {
 } from '@/lib/bg/quality';
 import { VERIFY_MODEL_ID, compareCutouts, filteredRects } from '@/lib/bg/verify';
 import { QueueFilters } from '@/components/bg-remover/queue-filters';
+import { ColorPicker } from '@/components/color-picker';
 import { ColumnPicker } from '@/components/column-picker';
 import { BatchPromptDialog } from '@/components/regen-prompt';
 import { parseCSV } from '@/lib/csv';
@@ -2501,11 +2501,12 @@ export default function BgRemover() {
         hint="Send an image to Azure GPT-Image from its dialog; the result replaces the image and its background is removed again.">
         <FieldGroup className="gap-4">
           {/* The .md tile is its own label — a "Prompt" heading above it read as a second
-              section title. The per-image override note lives in the editor dialog. */}
+              section title. The per-image override note lives in the editor dialog. No
+              `badge`: the tile shows the active skill's own tag, or "Edited" when the text
+              matches no skill. A chip reading "Skill" only repeated the section it sits in. */}
           <MdFileTile
             name={activeAiSkill?.name ?? 'ai-edit-prompt.md'}
             text={aiPrompt}
-            badge={activeAiSkill ? (activeAiSkill.builtin ? 'Skill' : 'Custom skill') : 'Edited'}
             onClick={() => setPromptEditorOpen(true)}
             disabled={busy}
             skills={{ list: skills, activeId: aiSkillId, onSelect: (sk) => setAiPrompt(sk.content) }}
@@ -2978,12 +2979,12 @@ export default function BgRemover() {
                           <ToggleGroupItem value="custom">Custom</ToggleGroupItem>
                         </ToggleGroup>
                         {bgChoice === 'custom' && (
-                          <Input
-                            type="color"
+                          <ColorPicker
                             aria-label="Custom output background"
-                            className="h-7 w-12 p-1"
+                            showValue={false}
+                            className="h-7"
                             value={outputBg}
-                            onChange={(e) => setOutputBg(e.target.value)}
+                            onChange={setOutputBg}
                           />
                         )}
                       </div>

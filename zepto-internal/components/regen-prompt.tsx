@@ -98,9 +98,9 @@ export function RegenPrompt({
   return (
     // Open by default: this dialog is opened to inspect one row, and a prompt behind a click is
     // a prompt nobody reads. The trigger still collapses it out of the way.
-    <Collapsible defaultOpen className="rounded-lg border">
+    <Collapsible defaultOpen className="overflow-hidden rounded-lg border">
       {/* Chevron rotation: a static rule in base.css keys off Base UI's data-panel-open. */}
-      <CollapsibleTrigger className="flex w-full cursor-pointer items-center gap-2 px-3 py-2 text-sm font-medium">
+      <CollapsibleTrigger className="flex w-full cursor-pointer items-center gap-2 px-3 py-2 text-sm font-medium transition-colors outline-none hover:bg-muted/50 focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:ring-inset">
         <ChevronRightIcon className="size-4 transition-transform" />
         <SparklesIcon className="size-4 text-primary" />
         {title}

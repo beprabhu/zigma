@@ -59,20 +59,42 @@ function proxied(url: string): string {
   return '/api/fetch-image?url=' + encodeURIComponent(url);
 }
 
+/** The batch-wide text a row falls back on when its own cells are blank. */
+export interface TileTextRules {
+  fallbackTitle: string;
+  fallbackOffer: string;
+  offerToggle: boolean;
+  hasOfferCol: boolean;
+}
+
+/**
+ * What one row renders as. Stated once and read by the grid cell, the compare dialog and the
+ * export — three places that have to agree, since the whole promise of the grid is that the
+ * tile you looked at is the tile you get.
+ *
+ * Note the offer rule: where an offer column IS mapped, a row with a blank cell renders with no
+ * bar rather than falling back. The fallback is for sheets with no offer column at all, where one
+ * offer applies to every tile.
+ */
+export function tileOptsFor(item: QueueItem, rules: TileTextRules) {
+  return {
+    title: item.title || rules.fallbackTitle,
+    offerText: item.offer || rules.fallbackOffer,
+    offerVisible: rules.offerToggle && (!!item.offer.trim() || !rules.hasOfferCol),
+  };
+}
+
 /** Renders the composited tile — shared by the grid cell and the dialog's "after" pane. */
 function TileCanvas({
-  id,
   image,
   extraImages,
   template,
   title,
   offerText,
   offerVisible,
-  registerCanvas,
   className,
   style,
 }: {
-  id: number;
   /** null draws the template's own "image" placeholder — the tile minus its picture. */
   image: HTMLImageElement | (HTMLImageElement | null)[] | null;
   /** Sources past the four the image box can hold; drawn as a "+N" chip. */
@@ -81,18 +103,11 @@ function TileCanvas({
   title: string;
   offerText: string;
   offerVisible: boolean;
-  registerCanvas?: (id: number, canvas: HTMLCanvasElement | null) => void;
   className?: string;
   style?: React.CSSProperties;
 }) {
   const ref = React.useRef<HTMLCanvasElement>(null);
   const fontsReady = useTileFontsReady();
-
-  React.useEffect(() => {
-    if (!registerCanvas) return;
-    registerCanvas(id, ref.current);
-    return () => registerCanvas(id, null);
-  }, [id, registerCanvas]);
 
   React.useEffect(() => {
     if (!ref.current) return;
@@ -118,9 +133,8 @@ const PREVIEW_CELLS = 4;
  * upstream, so remapping the image columns starts a clean load rather than leaving stale photos.
  */
 function SourceTilePreview({
-  id, urls, template, title, offerText, offerVisible, className, style,
+  urls, template, title, offerText, offerVisible, className, style,
 }: {
-  id: number;
   urls: string[];
   template: TileTemplate;
   title: string;
@@ -143,7 +157,6 @@ function SourceTilePreview({
   return (
     <>
       <TileCanvas
-        id={id}
         image={images}
         extraImages={urls.length - shown.length}
         template={template}
@@ -186,7 +199,6 @@ function TileCell({
   running,
   checked,
   selectionActive,
-  registerCanvas,
   onOpen,
   onRemove,
   onToggleSelect,
@@ -199,7 +211,6 @@ function TileCell({
   running: boolean;
   checked: boolean;
   selectionActive: boolean;
-  registerCanvas: (id: number, canvas: HTMLCanvasElement | null) => void;
   onOpen: (item: QueueItem) => void;
   onRemove: (item: QueueItem) => void;
   onToggleSelect: (id: number, shiftKey: boolean) => void;
@@ -222,13 +233,11 @@ function TileCell({
         {item.resultImage ? (
           // The canvas stays mounted for export even while a regenerate is in flight.
           <TileCanvas
-            id={item.id}
             image={item.resultImage}
             template={template}
             title={title}
             offerText={offerText}
             offerVisible={offerVisible}
-            registerCanvas={registerCanvas}
             className="block w-full"
             style={{ borderRadius: frameRadius(template) }}
           />
@@ -238,7 +247,6 @@ function TileCell({
           // The ring is the tell that this one is a stand-in: a generated tile has no edge.
           <SourceTilePreview
             key={item.urls.join('|')}
-            id={item.id}
             urls={item.urls.map(proxied)}
             template={template}
             title={title}
@@ -273,7 +281,6 @@ interface TileGridProps {
   hasOfferCol: boolean;
   running: boolean;
   selected: ReadonlySet<number>;
-  registerCanvas: (id: number, canvas: HTMLCanvasElement | null) => void;
   onOpen: (item: QueueItem) => void;
   onRemove: (item: QueueItem) => void;
   onToggleSelect: (id: number, shiftKey: boolean) => void;
@@ -281,7 +288,7 @@ interface TileGridProps {
 
 export function TileGrid({
   items, template, fallbackTitle, fallbackOffer, offerToggle, hasOfferCol,
-  running, selected, registerCanvas, onOpen, onRemove, onToggleSelect,
+  running, selected, onOpen, onRemove, onToggleSelect,
 }: TileGridProps) {
   return (
     <div className="grid grid-cols-3 gap-3.5 xl:grid-cols-4">
@@ -290,13 +297,10 @@ export function TileGrid({
           key={item.id}
           item={item}
           template={template}
-          title={item.title || fallbackTitle}
-          offerText={item.offer || fallbackOffer}
-          offerVisible={offerToggle && (!!item.offer.trim() || !hasOfferCol)}
+          {...tileOptsFor(item, { fallbackTitle, fallbackOffer, offerToggle, hasOfferCol })}
           running={running}
           checked={selected.has(item.id)}
           selectionActive={selected.size > 0}
-          registerCanvas={registerCanvas}
           onOpen={onOpen}
           onRemove={onRemove}
           onToggleSelect={onToggleSelect}
@@ -341,6 +345,8 @@ export interface TileDialogProps {
   running: boolean;
   /** The composite prompt every row shares — the seed and Reset target for this row's copy. */
   prompt: string;
+  /** Export multiplier, so a single Download PNG matches what the ZIP would contain. */
+  exportScale: number;
   onClose: () => void;
   onRegenerate: (item: QueueItem, promptOverride?: string) => void;
   /** Restores the tile the last regenerate replaced. Shown only while item.prev exists. */
@@ -353,7 +359,7 @@ export interface TileDialogProps {
  */
 export function TileDialog({
   item, template, fallbackTitle, fallbackOffer, offerToggle, hasOfferCol,
-  running, prompt, onClose, onRegenerate, onUndo,
+  running, prompt, exportScale, onClose, onRegenerate, onUndo,
 }: TileDialogProps) {
   const [saving, setSaving] = React.useState(false);
 
@@ -369,12 +375,11 @@ export function TileDialog({
       renderTile(
         canvas,
         {
-          title: item.title || fallbackTitle,
-          offerText: item.offer || fallbackOffer,
-          offerVisible: offerToggle && (!!item.offer.trim() || !hasOfferCol),
+          ...tileOptsFor(item, { fallbackTitle, fallbackOffer, offerToggle, hasOfferCol }),
           image: item.resultImage,
         },
         template,
+        exportScale,
       );
       const blob = await tileToPngBlob(canvas);
       await saveTo(dest, blob, fileName);
@@ -435,12 +440,9 @@ export function TileDialog({
                 <div className="text-xs font-medium text-muted-foreground">Generated tile</div>
                 {item.resultImage ? (
                   <TileCanvas
-                    id={item.id}
                     image={item.resultImage}
                     template={template}
-                    title={item.title || fallbackTitle}
-                    offerText={item.offer || fallbackOffer}
-                    offerVisible={offerToggle && (!!item.offer.trim() || !hasOfferCol)}
+                    {...tileOptsFor(item, { fallbackTitle, fallbackOffer, offerToggle, hasOfferCol })}
                     className="block w-full"
                     style={{ borderRadius: frameRadius(template) }}
                   />

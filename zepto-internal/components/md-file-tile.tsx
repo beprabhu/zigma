@@ -5,34 +5,41 @@
 // lives in a roomy modal. Shared by Compose (composite prompt), Cleanup (default AI-edit
 // prompt) and Generate (brief) so the three products present prompts identically.
 //
-// With `skills` set, the tile also carries the prompt switcher: an up/down-caret button
-// (matching the Select trigger convention) opening a menu of the skills managed in
-// Settings → Skills. Picking one hands the skill to the owner, which copies its content
-// into the surface's own prompt state — selection stays content-derived (matchSkill),
-// preset-style, exactly like Compose pioneered.
+// With `skills` set, the tile also carries the prompt switcher: a caret button opening a
+// searchable list of the skills managed in Settings → Skills. Picking one hands the skill to
+// the owner, which copies its content into the surface's own prompt state — selection stays
+// content-derived (matchSkill), preset-style, exactly like Compose pioneered.
 //
 // Composed from the shadcn Item primitive. Without `skills` the whole tile is a <button>
 // (via Base UI's render prop); with `skills` the tile is a div holding two siblings — the
-// clickable body and the caret menu — because button-in-button is invalid HTML.
+// clickable body and the switcher — because button-in-button is invalid HTML.
 
 import * as React from 'react';
-import { ChevronsUpDownIcon } from 'lucide-react';
 
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
-import { Badge } from '@/components/ui/badge';
+import { Badge, TAG_TONES } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
-  DropdownMenu, DropdownMenuContent, DropdownMenuRadioGroup, DropdownMenuRadioItem,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu';
+  Combobox, ComboboxContent, ComboboxEmpty, ComboboxInput, ComboboxItem, ComboboxList,
+  ComboboxTrigger,
+} from '@/components/ui/combobox';
 import {
   Item, ItemActions, ItemContent, ItemDescription, ItemMedia, ItemTitle,
 } from '@/components/ui/item';
-import { CUSTOM_SKILL_ID, type PromptSkill } from '@/lib/skills';
+import { CUSTOM_SKILL_ID, type PromptSkill, type SkillTag } from '@/lib/skills';
 import { cn } from '@/lib/utils';
+
+/** A skill's tag, wherever skills are listed: Settings, the switcher menu, the panel tile. */
+export function SkillTagBadge({ tag, className }: { tag: SkillTag; className?: string }) {
+  return (
+    <Badge variant="chip" className={cn('shrink-0', TAG_TONES[tag.color], className)}>
+      {tag.label}
+    </Badge>
+  );
+}
 
 /** Markdown-mark file icon (the "M↓" badge) — lucide has no markdown glyph, so this matches
     its stroke style and is shared everywhere a .md file is represented. */
@@ -77,8 +84,12 @@ export function MdFileTile({
   name: string;
   /** Full text; the tile previews its first non-empty line. */
   text: string;
-  /** Short status chip: "Default", "Customised", "1,240 chars", … */
-  badge: string;
+  /**
+   * Short status chip for something the tile cannot work out for itself — Generate's character
+   * count, say. Omit it: naming the active skill "Skill" only restated the section it sits in,
+   * and that slot is worth more carrying the skill's own tag.
+   */
+  badge?: string;
   onClick: () => void;
   disabled?: boolean;
   /** Enables the skill-switcher caret; omit for a plain click-to-edit tile. */
@@ -88,7 +99,23 @@ export function MdFileTile({
   // A skill picked while the text is in the unsaved Edited state waits here for the
   // overwrite confirm; null whenever no confirm is pending.
   const [pendingSkill, setPendingSkill] = React.useState<PromptSkill | null>(null);
+  const [switcherOpen, setSwitcherOpen] = React.useState(false);
   const preview = text.split('\n').find((line) => line.trim()) ?? '';
+
+  // What the tile puts in its chip slot, derived rather than passed: the active skill's tag
+  // when it has one, then whatever the owner asked for, and failing both the one state the
+  // owner could not see for itself — text that matches no saved skill.
+  const activeSkill = skills?.list.find((sk) => sk.id === skills.activeId);
+  const chips = (
+    <>
+      {activeSkill?.tag?.label.trim() && <SkillTagBadge tag={activeSkill.tag} />}
+      {badge ? (
+        <Badge variant="chip" className="shrink-0">{badge}</Badge>
+      ) : skills?.activeId === CUSTOM_SKILL_ID ? (
+        <Badge variant="chip" className="shrink-0">Edited</Badge>
+      ) : null}
+    </>
+  );
   const body = (
     <>
       <ItemMedia variant="icon">
@@ -112,11 +139,18 @@ export function MdFileTile({
         )}
       >
         {body}
-        <ItemActions>
-          <Badge variant="chip">{badge}</Badge>
-        </ItemActions>
+        <ItemActions>{chips}</ItemActions>
       </Item>
     );
+  }
+
+  function choose(skill: PromptSkill) {
+    setSwitcherOpen(false);
+    // Edited text matches no skill, so switching would overwrite work that is saved nowhere —
+    // that one deserves a confirm. Skill-to-skill is lossless (the current text IS a skill)
+    // and applies immediately.
+    if (skills!.activeId === CUSTOM_SKILL_ID && text.trim()) setPendingSkill(skill);
+    else skills!.onSelect(skill);
   }
 
   return (
@@ -133,54 +167,59 @@ export function MdFileTile({
         className="flex min-w-0 flex-1 cursor-pointer items-center gap-2.5 self-stretch rounded-l-lg py-2.5 pl-3 pr-1.5 text-left transition-colors duration-100 outline-none hover:bg-accent focus-visible:ring-[3px] focus-visible:ring-ring/50"
       >
         {body}
-        <Badge variant="chip" className="shrink-0">{badge}</Badge>
+        {chips}
       </button>
       <ItemActions className="shrink-0 gap-0 pr-1.5">
-        <DropdownMenu>
-          <DropdownMenuTrigger
+        {/* A searchable list, not a menu: skills accumulate, and past a screenful a menu's only
+            affordance for finding one is to read every row. The search field sits inside the
+            popup because the trigger is a caret button, not a text field — Base UI's
+            "input inside popup" arrangement. */}
+        <Combobox
+          items={skills.list}
+          value={activeSkill ?? null}
+          onValueChange={(sk: PromptSkill | null) => sk && choose(sk)}
+          // What the filter reads. Including the tag is most of why tags are worth having:
+          // typing "banner" finds every skill tagged banner, not just the one named after it.
+          itemToStringLabel={(sk: PromptSkill) => `${sk.name} ${sk.tag?.label ?? ''}`}
+          open={switcherOpen}
+          onOpenChange={setSwitcherOpen}
+          disabled={disabled}
+        >
+          <ComboboxTrigger
             render={
               <Button
                 variant="ghost"
                 size="icon-sm"
-                disabled={disabled}
                 // The wrapper already dims the whole tile when disabled.
                 className="disabled:opacity-100"
                 aria-label="Switch prompt skill"
               />
             }
-          >
-            <ChevronsUpDownIcon className="text-muted-foreground" />
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="min-w-56 max-w-72">
-            <DropdownMenuRadioGroup
-              value={skills.activeId}
-              onValueChange={(v) => {
-                const skill = skills.list.find((sk) => sk.id === v);
-                if (!skill) return;
-                // Edited text matches no skill, so switching would overwrite work that is
-                // saved nowhere — that one deserves a confirm. Skill-to-skill is lossless
-                // (the current text IS a skill) and applies immediately.
-                if (skills.activeId === CUSTOM_SKILL_ID && text.trim()) setPendingSkill(skill);
-                else skills.onSelect(skill);
-              }}
-            >
-              {skills.list.map((sk) => (
-                // closeOnClick: picking a prompt is a one-shot switch, not a toggle session —
-                // the menu closing is the confirmation, Select-style.
-                <DropdownMenuRadioItem key={sk.id} value={sk.id} closeOnClick>
+          />
+          <ComboboxContent align="end" className="w-72">
+            <ComboboxInput placeholder="Search skills…" showTrigger={false} />
+            <ComboboxEmpty>No skill matches.</ComboboxEmpty>
+            <ComboboxList>
+              {(sk: PromptSkill) => (
+                <ComboboxItem key={sk.id} value={sk}>
                   <span className="truncate">{sk.name}</span>
-                </DropdownMenuRadioItem>
-              ))}
-              {/* Indicator, not an action: it becomes selected by editing the prompt.
-                  Note a duplicate whose content still equals its source resolves to the
-                  source (matchSkill is content-derived, first match wins) — it gains its
-                  own identity the moment its content is edited. */}
-              <DropdownMenuRadioItem value={CUSTOM_SKILL_ID} disabled>
-                Custom
-              </DropdownMenuRadioItem>
-            </DropdownMenuRadioGroup>
-          </DropdownMenuContent>
-        </DropdownMenu>
+                  {/* The tag earns its place most here: this is the list you pick from. */}
+                  {sk.tag?.label.trim() && <SkillTagBadge tag={sk.tag} />}
+                </ComboboxItem>
+              )}
+            </ComboboxList>
+            {/* "Custom" used to be a disabled row in the menu. In a searchable list a row that
+                cannot be picked AND vanishes as soon as you type is worse than a line that
+                simply stays put and says what the state is. Note a duplicate whose content
+                still equals its source resolves to the source (matchSkill is content-derived,
+                first match wins) — it gains its own identity once its content is edited. */}
+            {skills.activeId === CUSTOM_SKILL_ID && (
+              <p className="border-t px-3 py-2 text-xs text-muted-foreground">
+                This text matches no saved skill.
+              </p>
+            )}
+          </ComboboxContent>
+        </Combobox>
       </ItemActions>
       <AlertDialog open={pendingSkill !== null} onOpenChange={(open) => !open && setPendingSkill(null)}>
         <AlertDialogContent>

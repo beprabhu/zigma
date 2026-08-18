@@ -47,10 +47,44 @@ function imageOnly(width: number, height: number): TileTemplate {
   };
 }
 
+/**
+ * The banner tile, as tuned on the 1:1 preset. All three ratios share this vertical design and
+ * differ only in width, so the numbers here are stated once at the square's 100×100 and the
+ * ratio supplies the rest. Frame units are relative — export is EXPORT_WIDTH-scaled whatever
+ * they say — so 100 is simply the least noisy space to state them in.
+ *
+ * `image.bottom` of 20 places the image directly under a ONE-line title (title y 8 + lineHeight
+ * 12 = 20). A title that wraps to two lines pushes the image down by another lineHeight at draw
+ * time — see titlePush() in lib/tile.ts. That is per-row, so it cannot live here.
+ */
+function bannerTile(width: number, height = 100): TileTemplate {
+  // Only widths follow the ratio; every vertical number is shared across the three.
+  const sx = width / 100;
+  const r = (n: number) => Math.round(n * 100) / 100;
+  return {
+    frame: { width, height, radius: 12, bg: '#ffffff' },
+    layerOrder: ['image', 'title', 'offer'],
+    title: {
+      visible: true, xOffset: 0, y: 8, width: r(90 * sx),
+      size: 11, lineHeight: 12, weight: 600, color: '#424957', maxLines: 2, align: 'center',
+    },
+    image: { visible: true, xOffset: 0, bottom: 20, width, height, fit: 'cover' },
+    offer: {
+      visible: true, xOffset: 0, bottom: 0, width, height: 20, radius: 0, pad: 3,
+      bg: '#ef4372', color: '#ffffff', size: 12, weight: 700,
+    },
+  };
+}
+
 export const TILE_PRESETS: TilePreset[] = [
   // Banner tiles — full template (image + title + offer). More ratios land here as they are
   // defined; each is one entry with its own template snapshot.
   { id: 'sku-tile', type: 'banner', ratio: 'Default · 75×96', template: DEFAULT_TEMPLATE },
+  // The three shipping ratios, all 100 tall so they stay directly comparable: square, the 5:6
+  // portrait (100 × 5/6) and the 6:5 landscape (100 × 6/5).
+  { id: 'banner-square', type: 'banner', ratio: 'Square · 1:1', template: bannerTile(100) },
+  { id: 'banner-portrait', type: 'banner', ratio: 'Portrait · 5:6', template: bannerTile(83.33) },
+  { id: 'banner-landscape', type: 'banner', ratio: 'Landscape · 6:5', template: bannerTile(120) },
   // Image — the three ratios gpt-image-2 generates natively, same set as Generate's Size
   // dropdown. Image container only; the matching azureSize keeps output and frame 1:1.
   { id: 'image-square', type: 'image', ratio: '1024×1024 (square)', template: imageOnly(100, 100), azureSize: '1024x1024' },

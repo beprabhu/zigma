@@ -98,7 +98,8 @@ export function tileFontsReady(): Promise<void> {
     .then(() => undefined)
     .catch(() => undefined);
 }
-const EXPORT_WIDTH = 600; // output PNG width in px regardless of tile width
+/** Output PNG width at 1×, regardless of the tile's frame units. Multiplied by renderTile's scale. */
+export const EXPORT_WIDTH = 600;
 
 function roundedRectPath(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
   r = Math.min(r, w / 2, h / 2);
@@ -222,8 +223,32 @@ function drawCountCell(
   ctx.fillText(`+${n}`, x + w / 2, y + h / 2);
 }
 
-function drawImageLayer(ctx: CanvasRenderingContext2D, tpl: TileTemplate, opts: TileOpts) {
-  const r = tileLayerRect(tpl, 'image');
+/**
+ * How far a wrapped title pushes the image down.
+ *
+ * The image is positioned to sit directly under a one-line title. A second line grows the title
+ * block downwards by exactly one lineHeight, and without this the image would simply be drawn
+ * over it. So the image follows the text instead: one line, no push; two lines, one lineHeight.
+ *
+ * It is measured at draw time rather than stored, because it is a property of the ROW, not of
+ * the template — two products in the same sheet wrap differently, and each tile has to answer
+ * for its own title.
+ */
+function titlePush(ctx: CanvasRenderingContext2D, tpl: TileTemplate, opts: TileOpts): number {
+  const t = tpl.title;
+  if (!t.visible) return 0;
+  ctx.save();
+  ctx.font = `${t.weight} ${t.size}px ${FONT_STACK}`;
+  const lines = wrapText(ctx, opts.title || '', t.width, t.maxLines).length;
+  ctx.restore();
+  return Math.max(0, lines - 1) * t.lineHeight;
+}
+
+function drawImageLayer(
+  ctx: CanvasRenderingContext2D, tpl: TileTemplate, opts: TileOpts, push = 0,
+) {
+  const base = tileLayerRect(tpl, 'image');
+  const r = { ...base, y: base.y + push };
   const list = Array.isArray(opts.image) ? opts.image : opts.image ? [opts.image] : [];
   const extra = opts.extraImages ?? 0;
   const cells = Math.min(list.length + (extra > 0 ? 1 : 0), IMAGE_PACKS.length);
@@ -289,9 +314,16 @@ function drawOfferLayer(ctx: CanvasRenderingContext2D, tpl: TileTemplate, opts: 
   ctx.fillText(text, r.x + r.w / 2, r.y + r.h / 2 + 0.5);
 }
 
-export function renderTile(canvas: HTMLCanvasElement, opts: TileOpts, tpl: TileTemplate = DEFAULT_TEMPLATE) {
+/**
+ * @param scale Export multiplier, Figma-style: 1× is EXPORT_WIDTH across, 3× is three times
+ * that. Frame units stay the same — only the pixels the tile is rasterised into change — so a
+ * template tuned at 1× needs no adjustment to ship at 3×.
+ */
+export function renderTile(
+  canvas: HTMLCanvasElement, opts: TileOpts, tpl: TileTemplate = DEFAULT_TEMPLATE, scale = 1,
+) {
   const W = tpl.frame.width, H = tpl.frame.height;
-  const S = EXPORT_WIDTH / W;
+  const S = (EXPORT_WIDTH * scale) / W;
   canvas.width = Math.round(W * S);
   canvas.height = Math.round(H * S);
   const ctx = canvas.getContext('2d');
@@ -306,9 +338,13 @@ export function renderTile(canvas: HTMLCanvasElement, opts: TileOpts, tpl: TileT
   ctx.fillStyle = tpl.frame.bg;
   ctx.fillRect(0, 0, W, H);
 
+  // Measured before anything is drawn: the image's position depends on how the title wrapped,
+  // and the layer order does not guarantee the title is measured first.
+  const push = titlePush(ctx, tpl, opts);
+
   for (const name of tpl.layerOrder) {
     if (!tpl[name].visible) continue;
-    if (name === 'image') drawImageLayer(ctx, tpl, opts);
+    if (name === 'image') drawImageLayer(ctx, tpl, opts, push);
     else if (name === 'title') drawTitleLayer(ctx, tpl, opts);
     else if (name === 'offer' && opts.offerVisible) drawOfferLayer(ctx, tpl, opts);
   }

@@ -27,6 +27,7 @@ import { Slider } from '@/components/ui/slider';
 import { Switch } from '@/components/ui/switch';
 import { Toggle } from '@/components/ui/toggle';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
+import { ColorPicker } from '@/components/color-picker';
 import { cn } from '@/lib/utils';
 import {
   ANCHORS,
@@ -496,17 +497,16 @@ export function SafeAreaControls({
             <ToggleGroupItem value="white">White</ToggleGroupItem>
             <ToggleGroupItem value="custom">Custom</ToggleGroupItem>
           </ToggleGroup>
-          <Input
-            type="color"
+          <ColorPicker
             aria-label="Custom background colour"
+            showValue={false}
             disabled={disabled}
             value={colorValue}
-            onChange={(e) => {
-              const next = e.target.value;
+            onChange={(next) => {
               setCustomBg(next);
               patch({ background: next });
             }}
-            className="h-7 w-10 shrink-0 cursor-pointer p-1"
+            className="h-7 shrink-0"
           />
         </div>
       </Field>

@@ -13,6 +13,22 @@
 import { usePersistedState } from '@/hooks/use-persisted-state';
 import { DEFAULT_PROMPT } from '@/lib/types';
 
+/**
+ * The tag palette. Deliberately short: a tag exists to be recognised at a glance in a list,
+ * and a dozen near-neighbour hues stop being tellable apart — which is the whole job. The
+ * class recipes for these names live in components/ui/badge.tsx, once.
+ */
+export const TAG_COLORS = [
+  'slate', 'blue', 'teal', 'green', 'amber', 'red', 'purple', 'pink',
+] as const;
+export type TagColor = (typeof TAG_COLORS)[number];
+
+export interface SkillTag {
+  /** Free text, kept short by the editor — "banner", "aisle", "packshot". */
+  label: string;
+  color: TagColor;
+}
+
 export interface PromptSkill {
   id: string;
   /** File-style display name, e.g. "shelf-composite.md". */
@@ -21,6 +37,11 @@ export interface PromptSkill {
   builtin?: boolean;
   /** ISO timestamp of the last saved change. Absent on built-ins and pre-existing skills. */
   updatedAt?: string;
+  /**
+   * Optional label for spotting this skill in a long list. Absent on every skill saved before
+   * tags existed, so every reader treats "no tag" as ordinary rather than as missing data.
+   */
+  tag?: SkillTag;
 }
 
 export interface DiffStat {

@@ -30,14 +30,14 @@ import { BatchPromptDialog } from '@/components/regen-prompt';
 import { ColumnPicker } from '@/components/column-picker';
 import { CsvDropzone, CsvFileTile } from '@/components/csv-dropzone';
 import { SessionHeader, type SessionChip } from '@/components/session-header';
-import { TileGrid, TileDialog } from '@/components/tile-grid';
+import { TileGrid, TileDialog, tileOptsFor } from '@/components/tile-grid';
 import { ClearAllButton, SelectionBar, useGridSelection } from '@/components/selection';
 import { Canvas, CanvasToolbar, LeftPanel, PanelSection, RightPanel, StudioShell } from '@/components/pane-layout';
 import { useProcessing } from '@/components/process-panel';
 import { BudgetControls } from '@/components/budget-controls';
 import { MdFileIcon, MdFileTile } from '@/components/md-file-tile';
 
-import { DEFAULT_TEMPLATE, TileTemplate, tileToPngBlob } from '@/lib/tile';
+import { DEFAULT_TEMPLATE, EXPORT_WIDTH, TileTemplate, renderTile, tileToPngBlob } from '@/lib/tile';
 import {
   CUSTOM_PRESET_ID, PRESET_TYPES, TILE_PRESETS as TEMPLATE_PRESETS, matchPreset,
 } from '@/lib/tile-presets';
@@ -49,15 +49,16 @@ import { loadImageFromUrl, callAzure, mockComposite } from '@/lib/pipeline';
 import {
   BG_MODELS, BG_MODEL_ORDER, DEFAULT_MODEL_ID, probeServerModel, removeBackground, type BgModelId,
 } from '@/lib/bg/engine';
-import { isAbortError, mapWithLimit, pickSave, saveTo } from '@/lib/bg/batch';
+import { isAbortError, mapWithLimit, pickSave, releaseCanvas, saveTo } from '@/lib/bg/batch';
 import { readParallel } from '@/lib/rate';
 import { describeBudget, fitToBudget, type BudgetResult } from '@/lib/bg/budget';
 import { isPng8Supported } from '@/lib/bg/png8';
-import { TILE_PRESETS } from '@/lib/bg/safe-area';
 import { QueueItem, DEFAULT_ENDPOINT, DEFAULT_PROMPT } from '@/lib/types';
 import { usePersistedState } from '@/hooks/use-persisted-state';
 
 const NONE = '__none__';
+/** Figma's export scales. 1x is EXPORT_WIDTH across; the template itself never changes. */
+const EXPORT_SCALES = [1, 2, 3];
 // Bounds how many tile canvases encode at once on export; TinyPNG stays narrower (rate limits).
 const ENCODE_CONCURRENCY = 8;
 const COMPRESS_CONCURRENCY = 4;
@@ -92,6 +93,9 @@ export default function Compositor() {
     const first = TEMPLATE_PRESETS.find((p) => p.type === type);
     if (first) applyPreset(first.id);
   }
+  // The 1:1 preset's geometry is settled, so it offers colours and nothing else. Every other
+  // preset — including the two ratios still being worked out — keeps the full editor.
+  const colorsOnly = presetId === 'banner-square';
   const [tplTitle, setTplTitle] = React.useState('Tile name');
   const [tplOffer, setTplOffer] = React.useState('20% OFF');
   const [offerVisible, setOfferVisible] = React.useState(true);
@@ -104,6 +108,7 @@ export default function Compositor() {
   const [budgetKb, setBudgetKb] = usePersistedState('skuc_bgBudgetKb', 150);
   const [budgetShrink, setBudgetShrink] = usePersistedState('skuc_bgBudgetShrink', true);
   const [numberFiles, setNumberFiles] = usePersistedState('skuc_coNumberFiles', true);
+  const [exportScale, setExportScale] = usePersistedState('skuc_coExportScale', 1);
   const [prompt, setPrompt] = usePersistedState('skuc_prompt', DEFAULT_PROMPT);
   const [promptEditorOpen, setPromptEditorOpen] = React.useState(false);
   // The wand asks before it spends: pressing it opens the batch prompt rather than firing.
@@ -169,12 +174,6 @@ export default function Compositor() {
   // Stop button: one controller per run; aborting skips rows not yet started and cancels the
   // in-flight fetches (the proxy forwards the abort to Azure).
   const genAbortRef = React.useRef<AbortController | null>(null);
-
-  const canvases = React.useRef(new Map<number, HTMLCanvasElement>());
-  const registerCanvas = React.useCallback((id: number, canvas: HTMLCanvasElement | null) => {
-    if (canvas) canvases.current.set(id, canvas);
-    else canvases.current.delete(id);
-  }, []);
 
   const proc = useProcessing({ prefix: 'skuc_co', busy: running });
 
@@ -284,6 +283,36 @@ export default function Compositor() {
     setItems((prev) => prev.map((it) => (it.id === id ? { ...it, ...patch } : it)));
   }
 
+  /**
+   * The optional background pass, shared by BOTH Azure round trips. Whatever comes back from
+   * Azure is a fresh picture with a fresh background of its own, so the wand's AI edit needs
+   * this every bit as much as a first composite does — it used to skip it, which is how a tile
+   * got its background back with the toggle still switched on.
+   *
+   * Returns the image untouched when the toggle is off, or when the model cannot run: a missing
+   * model or a downed sidecar must cost us the cutout, never the composite.
+   */
+  async function stripBackground(image: HTMLImageElement, item: QueueItem): Promise<HTMLImageElement> {
+    if (!removeBg) return image;
+    patchItem(item.id, { status: 'removing-bg' });
+    // Yield once so the badge paints before inference blocks the main thread.
+    await new Promise((r) => setTimeout(r, 0));
+    try {
+      // zoomPass runs a whole second inference to sharpen edges at ~2x resolution. Tiles
+      // export at 600px wide, where that detail is invisible, so it is not worth doubling
+      // the wall-clock of every row in a CSV.
+      const turn = bgLock.current.then(() =>
+        removeBackground(image, { model: activeModel, refine: false, zoomPass: false }),
+      );
+      bgLock.current = turn.catch(() => {});
+      const { canvas } = await turn;
+      return await canvasToImage(canvas);
+    } catch (e) {
+      toast.warning(`Row ${item.id + 1}: tile generated without background removal — ${(e as Error).message}`);
+      return image;
+    }
+  }
+
   /** `promptOverride` is one row's edit from its dialog — it never touches the shared prompt. */
   async function generateItem(item: QueueItem, signal?: AbortSignal, promptOverride?: string) {
     patchItem(item.id, { status: 'fetching', errorMsg: undefined });
@@ -298,29 +327,7 @@ export default function Compositor() {
     } else {
       resultImage = await callAzure(images, { endpoint, apiKey: azureKey, prompt: runPrompt, size: presetSize, signal });
     }
-    if (removeBg) {
-      patchItem(item.id, { status: 'removing-bg' });
-      // Yield once so the badge paints before inference blocks the main thread.
-      await new Promise((r) => setTimeout(r, 0));
-      try {
-        // zoomPass runs a whole second inference to sharpen edges at ~2x resolution. Tiles
-        // export at 600px wide, where that detail is invisible, so it is not worth doubling
-        // the wall-clock of every row in a CSV.
-        const turn = bgLock.current.then(() =>
-          removeBackground(resultImage, {
-            model: activeModel,
-            refine: false,
-            zoomPass: false,
-          }),
-        );
-        bgLock.current = turn.catch(() => {});
-        const { canvas } = await turn;
-        resultImage = await canvasToImage(canvas);
-      } catch (e) {
-        // A missing model or a downed sidecar must not cost us the composite.
-        toast.warning(`Row ${item.id + 1}: tile generated without background removal — ${(e as Error).message}`);
-      }
-    }
+    resultImage = await stripBackground(resultImage, item);
     patchItem(item.id, {
       status: 'done',
       resultImage,
@@ -364,6 +371,7 @@ export default function Compositor() {
         endpoint, apiKey: azureKey, prompt: runPrompt, size: presetSize, signal,
       });
     }
+    edited = await stripBackground(edited, item);
     patchItem(item.id, {
       status: 'done',
       resultImage: edited,
@@ -515,7 +523,17 @@ export default function Compositor() {
 
   // ---- Export: budget → shared local compress → ZIP, one action ----
   async function handleExport() {
-    const done = items.filter((it) => it.status === 'done' && canvases.current.has(it.id));
+    // Anything generated, whether or not its cell is currently mounted — export rasterises its
+    // own canvas now, so it no longer depends on the grid having one on screen.
+    const done = items.filter((it) => it.status === 'done' && it.resultImage);
+    // The grid's rules, snapshotted for the whole export: the tile you looked at is the tile
+    // that ships, and editing a field mid-encode must not give the ZIP two different answers.
+    const textRules = {
+      fallbackTitle: tplTitle,
+      fallbackOffer: tplOffer,
+      offerToggle: offerVisible,
+      hasOfferCol: !!offerCol,
+    };
     if (!done.length) return;
     // Save dialog first, while the click still counts as user activation — TinyPNG passes can
     // take minutes, after which Chrome would refuse to open it. Cancelling cancels the export.
@@ -546,15 +564,30 @@ export default function Compositor() {
         // The cached TinyPNG bytes were negotiated under no budget, so a budgeted run encodes
         // fresh from the canvas instead of trusting them.
         if (!budget && item.compressed) return item.compressed.data;
-        const canvas = canvases.current.get(item.id)!;
+        // Rasterised here rather than lifted off the grid: the cell on screen is sized for
+        // looking at, and export resolution is a separate decision. Same template, same row
+        // text (tileOptsFor is the one rule), just more pixels.
+        const canvas = document.createElement('canvas');
+        renderTile(
+          canvas,
+          { ...tileOptsFor(item, textRules), image: item.resultImage },
+          template,
+          exportScale,
+        );
         let data: Uint8Array;
-        if (budget) {
-          const result = await fitToBudget(canvas, budget);
-          outcomes[n] = result;
-          data = result.bytes;
-        } else {
-          const blob = await tileToPngBlob(canvas);
-          data = new Uint8Array(await blob.arrayBuffer());
+        try {
+          if (budget) {
+            const result = await fitToBudget(canvas, budget);
+            outcomes[n] = result;
+            data = result.bytes;
+          } else {
+            const blob = await tileToPngBlob(canvas);
+            data = new Uint8Array(await blob.arrayBuffer());
+          }
+        } finally {
+          // A 3x tile is ~13MB of canvas; eight in flight is worth handing back promptly
+          // rather than waiting on GC part-way through a thousand-row sheet.
+          releaseCanvas(canvas);
         }
         encoded++;
         const left = encodeEta.remaining(encoded, done.length);
@@ -676,9 +709,13 @@ export default function Compositor() {
   const aiReady = mock || (endpoint.trim().length > 0 && azureKey.trim().length > 0);
 
   // The template preview answers "what will my tiles look like", so once a sheet is in it
-  // renders the first row by the same rules the grid uses — the row's own title and offer,
-  // the typed text only where the row is blank, and no offer bar on a row that has none.
-  // Without a sheet the typed text IS the tile, exactly as before.
+  // renders the first row by exactly the rules the grid and the export use. With no sheet there
+  // is nothing to render, so SAMPLE_* stands in — placeholder for a preview, never for a tile.
+  const exportPx = {
+    w: Math.round(EXPORT_WIDTH * exportScale),
+    h: Math.round((EXPORT_WIDTH * exportScale * template.frame.height) / template.frame.width),
+  };
+
   const previewRow = items[0];
   const previewTitle = previewRow?.title || tplTitle;
   const previewOffer = previewRow?.offer || tplOffer;
@@ -728,7 +765,7 @@ export default function Compositor() {
             </div>
           }
         >
-          <PanelSection title="Template" hint="Click a layer in the preview to edit it." className="space-y-4">
+          <PanelSection title="Template" hint="Pick a ratio; the layout comes with it. Colours are the part that varies per batch." className="space-y-4">
               <FieldGroup className="grid grid-cols-2 gap-3">
                 <Field>
                   <FieldLabel htmlFor="tpl-preset-type">Preset</FieldLabel>
@@ -780,8 +817,9 @@ export default function Compositor() {
                 previewOffer={previewOffer}
                 previewOfferVisible={previewOfferVisible}
                 minimal={presetSize !== undefined}
+                colorsOnly={colorsOnly}
               >
-                {presetSize !== undefined ? null : (
+                {presetSize !== undefined || colorsOnly ? null : (
                 <FieldGroup className="gap-2">
                   <div className="grid grid-cols-2 gap-3">
                     <Field>
@@ -922,11 +960,12 @@ export default function Compositor() {
           <PanelSection title="Prompt" hint="What the model is told to do, for composites and for the wand's AI edit. Skills are managed in Settings.">
               <FieldGroup className="gap-4">
                 {/* The tile carries the skill switcher (the caret menu) — same control on
-                    Cleanup's AI-edit prompt and Generate's brief. */}
+                    Cleanup's AI-edit prompt and Generate's brief. No `badge`: the tile shows
+                    the active skill's own tag, or "Edited" when the text matches no skill at
+                    all. A chip reading "Skill" only repeated the section it sits in. */}
                 <MdFileTile
                   name={activeSkill?.name ?? 'custom-prompt.md'}
                   text={prompt}
-                  badge={activeSkill ? (activeSkill.builtin ? 'Skill' : 'Custom skill') : 'Edited'}
                   onClick={() => setPromptEditorOpen(true)}
                   disabled={running}
                   skills={{ list: skills, activeId: skillId, onSelect: (sk) => setPrompt(sk.content) }}
@@ -986,7 +1025,6 @@ export default function Compositor() {
                   hasOfferCol={!!offerCol}
                   running={running}
                   selected={sel.checked}
-                  registerCanvas={registerCanvas}
                   onOpen={(item) => setOpenId(item.id)}
                   onRemove={(item) => {
                     setItems((prev) => prev.filter((it) => it.id !== item.id));
@@ -1100,35 +1138,31 @@ export default function Compositor() {
           <FieldGroup className="gap-4">
                     <Field>
                       <FieldLabel>
-                        <Hint hint="Sets the template frame — fine-tune width, height and corners in the Design pane. Layers keep their positions, so check the preview after a big jump.">Tile size</Hint>
+                        <Hint hint="Figma's export scale. The template is unchanged — only the pixels it is rasterised into. 1x is 600px on the tile's long-ish edge; 3x is 1800.">Export scale</Hint>
                       </FieldLabel>
-                      {/* Exclusive choice, so a toggle group — not styled Buttons. */}
+                      {/* Replaces the old Tile size group, which wrote frame width and height
+                          straight into the template and so knocked whichever preset was active
+                          into "Custom". Geometry belongs to the preset now; resolution is the
+                          thing that actually varies per batch. */}
                       <ToggleGroup
                         size="sm"
                         variant="outline"
                         className="flex-wrap justify-start"
-                        value={[
-                          TILE_PRESETS.find(
-                            (preset) =>
-                              template.frame.width === preset.width &&
-                              template.frame.height === preset.height,
-                          )?.id ?? '',
-                        ]}
+                        value={[String(exportScale)]}
                         onValueChange={(next) => {
-                          const preset = TILE_PRESETS.find((pr) => pr.id === next[0]);
-                          if (!preset || running) return;
-                          setTemplate((t) => ({
-                            ...t,
-                            frame: { ...t.frame, width: preset.width, height: preset.height },
-                          }));
+                          const n = Number(next[0]);
+                          if (EXPORT_SCALES.includes(n) && !running) setExportScale(n);
                         }}
                       >
-                        {TILE_PRESETS.map((preset) => (
-                          <ToggleGroupItem key={preset.id} value={preset.id} disabled={running}>
-                            {preset.width}×{preset.height}
+                        {EXPORT_SCALES.map((n) => (
+                          <ToggleGroupItem key={n} value={String(n)} disabled={running}>
+                            {n}x
                           </ToggleGroupItem>
                         ))}
                       </ToggleGroup>
+                      <FieldDescription>
+                        PNGs export at {exportPx.w.toLocaleString()} × {exportPx.h.toLocaleString()} px.
+                      </FieldDescription>
                     </Field>
 
                     <BudgetControls
@@ -1227,6 +1261,7 @@ export default function Compositor() {
         hasOfferCol={!!offerCol}
         running={running}
         prompt={prompt}
+        exportScale={exportScale}
         onClose={() => setOpenId(null)}
         onRegenerate={handleRegenerate}
         onUndo={(item) => undoItem(item.id)}

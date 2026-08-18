@@ -10,18 +10,20 @@
 
 import * as React from 'react';
 import {
-  ChartColumnIcon, CopyIcon, KeyRoundIcon, PencilIcon, PlugZapIcon, PlusIcon, Settings2Icon,
-  SlidersHorizontalIcon, SparklesIcon, Trash2Icon, UploadIcon,
+  ChartColumnIcon, CopyIcon, DownloadIcon, KeyRoundIcon, LockIcon, PencilIcon, PlugZapIcon,
+  PlusIcon,
+  Settings2Icon, SlidersHorizontalIcon, SparklesIcon, Trash2Icon, UploadIcon,
 } from 'lucide-react';
 
-import { Badge } from '@/components/ui/badge';
+import { TAG_DOTS } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Hint } from '@/components/hint';
 import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog';
 import { Textarea } from '@/components/ui/textarea';
-import { MdFileIcon } from '@/components/md-file-tile';
+import { MdFileIcon, SkillTagBadge } from '@/components/md-file-tile';
+import { SkillTagPicker, tagsInUse } from '@/components/skill-tag-picker';
 import { Field, FieldContent, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
 import { Spinner } from '@/components/ui/spinner';
@@ -33,9 +35,13 @@ import {
   Sidebar, SidebarContent, SidebarGroup, SidebarGroupContent, SidebarMenu, SidebarMenuButton,
   SidebarMenuItem, SidebarProvider,
 } from '@/components/ui/sidebar';
+import { pickSave, saveTo } from '@/lib/bg/batch';
+import { buildZipStream } from '@/lib/zip';
 import { usePersistedState } from '@/hooks/use-persisted-state';
 import { DEFAULT_SEAL_SIZE } from '@/lib/bg/ledger';
-import { diffStat, newSkillId, useSkills, type PromptSkill } from '@/lib/skills';
+import {
+  TAG_COLORS, diffStat, newSkillId, useSkills, type PromptSkill, type SkillTag,
+} from '@/lib/skills';
 import { azureImageUrl } from '@/lib/pipeline';
 import { QUALITIES, QUALITY_BLURB, useImageQuality, type ImageQuality } from '@/lib/quality';
 import { clampParallel, clampRpm, useParallel, useRpm } from '@/lib/rate';
@@ -95,7 +101,15 @@ export function SettingsDialog({
               </SidebarGroup>
             </SidebarContent>
           </Sidebar>
-          <div className="min-w-0 flex-1 self-stretch overflow-y-auto p-6">
+          {/* Skills owns its own padding: a sticky footer is clamped by its containing block,
+              so a bottom padding here would strand it 24px up with rows scrolling through the
+              gap underneath. Every other pane keeps the shared inset. */}
+          <div
+            className={cn(
+              'min-w-0 flex-1 self-stretch overflow-y-auto',
+              tab === 'skills' ? 'px-0 py-0' : 'p-6',
+            )}
+          >
             {tab === 'api-keys' && <ApiKeysPane />}
             {tab === 'image-model' && <ImageModelPane />}
             {tab === 'skills' && <SkillsPane />}
@@ -364,6 +378,21 @@ function DefaultsPane() {
   );
 }
 
+/**
+ * A skill's file name on disk. The stored name is already file-shaped ("shelf-composite.md"),
+ * so this only has to survive a save dialog: strip what a filesystem will not take, and put the
+ * extension back if stripping or a rename removed it.
+ */
+function skillFileName(name: string): string {
+  const safe = name.trim().replace(/[\\/:*?"<>|]+/g, '-').replace(/^\.+/, '') || 'skill';
+  return /\.(md|markdown|txt)$/i.test(safe) ? safe : `${safe}.md`;
+}
+
+/** The .md itself — what Upload takes back in, so a download round-trips. */
+function skillBlob(skill: PromptSkill): Blob {
+  return new Blob([skill.content], { type: 'text/markdown;charset=utf-8' });
+}
+
 function SkillsPane() {
   const { skills, setCustom } = useSkills();
   const fileRef = React.useRef<HTMLInputElement>(null);
@@ -373,18 +402,31 @@ function SkillsPane() {
   const [draft, setDraft] = React.useState<{
     skill: PromptSkill;
     fresh: boolean;
-    original: { name: string; content: string };
+    original: { name: string; content: string; tag?: SkillTag };
   } | null>(null);
   const stat = draft ? diffStat(draft.original.content, draft.skill.content) : null;
+  // Built-ins carry no tag, but they are in the list on purpose: the day they can be tagged,
+  // their tags are suggestions too, and nothing here has to change.
+  const tagOptions = React.useMemo(() => tagsInUse(skills), [skills]);
 
   function saveDraft() {
     if (!draft) return;
     const name = draft.skill.name.trim() || 'untitled.md';
+    // A tag IS its label: blank means no tag, so picking a colour and then clearing the name
+    // leaves nothing behind rather than an empty pill nobody can see or get rid of.
+    const label = draft.skill.tag?.label.trim() ?? '';
+    const tag: SkillTag | undefined =
+      label && draft.skill.tag ? { label, color: draft.skill.tag.color } : undefined;
     const changed =
-      draft.fresh || draft.skill.content !== draft.original.content || name !== draft.original.name;
-    const skill = {
+      draft.fresh ||
+      draft.skill.content !== draft.original.content ||
+      name !== draft.original.name ||
+      tag?.label !== draft.original.tag?.label ||
+      tag?.color !== draft.original.tag?.color;
+    const skill: PromptSkill = {
       ...draft.skill,
       name,
+      tag,
       ...(changed ? { updatedAt: new Date().toISOString() } : null),
     };
     setCustom((prev) => {
@@ -398,12 +440,38 @@ function SkillsPane() {
     setDraft(null);
   }
 
+  async function downloadSkill(skill: PromptSkill) {
+    const fileName = skillFileName(skill.name);
+    const dest = await pickSave(fileName);
+    if (dest === 'cancelled') return;
+    await saveTo(dest, skillBlob(skill), fileName);
+  }
+
+  /**
+   * Every skill as one .md apiece inside a ZIP. Repeated names get -2, -3 rather than
+   * overwriting each other — nothing in the list forbids two skills sharing a name.
+   */
+  async function downloadAll() {
+    const zipName = 'zesku-skills.zip';
+    const dest = await pickSave(zipName);
+    if (dest === 'cancelled') return;
+    const used = new Map<string, number>();
+    const files = skills.map((skill) => {
+      const base = skillFileName(skill.name);
+      const seen = (used.get(base) ?? 0) + 1;
+      used.set(base, seen);
+      const name = seen === 1 ? base : base.replace(/(\.[^.]+)$/, `-${seen}$1`);
+      return { name, data: skillBlob(skill) };
+    });
+    await saveTo(dest, await buildZipStream(files), zipName);
+  }
+
   function removeSkill(id: string) {
     setCustom((prev) => (Array.isArray(prev) ? prev.filter((s) => s.id !== id) : []));
   }
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 px-6 pt-6">
       <p className="text-xs text-muted-foreground">
         Reusable prompts for the whole suite — pick them from any product&rsquo;s prompt
         dropdown. Built-ins are read-only; duplicate one to make your own version.
@@ -413,7 +481,10 @@ function SkillsPane() {
           <div key={skill.id} className="flex items-center gap-2.5 rounded-lg border px-3 py-2">
             <MdFileIcon className="size-4 shrink-0 text-muted-foreground" />
             <div className="min-w-0 flex-1">
-              <div className="truncate text-sm">{skill.name}</div>
+              <div className="flex min-w-0 items-center gap-1.5">
+                <span className="truncate text-sm">{skill.name}</span>
+                {skill.tag?.label.trim() && <SkillTagBadge tag={skill.tag} />}
+              </div>
               <div className="truncate text-xs text-muted-foreground">
                 {/* Custom skills show when they last changed; built-ins (and skills saved
                     before updatedAt existed) keep the first-line preview. */}
@@ -424,9 +495,31 @@ function SkillsPane() {
                   : skill.content.split('\n').find((l) => l.trim()) || 'Empty'}
               </div>
             </div>
+            {/* Download sits on every row, built-in included: a built-in is exactly what you
+                want a copy of to hand to someone or keep alongside a batch. */}
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              title="Download as .md"
+              onClick={() => void downloadSkill(skill)}
+            >
+              <DownloadIcon />
+            </Button>
             {skill.builtin ? (
               <>
-                <Badge variant="chip" className="shrink-0">Built-in</Badge>
+                {/* A lock, not the word "Built-in". The word restated a label the pane's own
+                    description already gives, and it sat in the row's action column where
+                    everything else is a 32px icon — so the built-in rows' controls lined up
+                    against nothing. What it has to convey is "read-only", which is what a lock
+                    says without spending a column on it. */}
+                <span
+                  role="img"
+                  aria-label="Built-in, read-only"
+                  title="Built-in — read-only. Duplicate it to make an editable copy."
+                  className="flex size-8 shrink-0 items-center justify-center text-muted-foreground"
+                >
+                  <LockIcon className="size-3.5" />
+                </span>
                 <Button
                   variant="ghost"
                   size="icon-sm"
@@ -450,7 +543,11 @@ function SkillsPane() {
                   size="icon-sm"
                   title="Edit"
                   onClick={() =>
-                    setDraft({ fresh: false, skill, original: { name: skill.name, content: skill.content } })
+                    setDraft({
+                      fresh: false,
+                      skill,
+                      original: { name: skill.name, content: skill.content, tag: skill.tag },
+                    })
                   }
                 >
                   <PencilIcon />
@@ -469,7 +566,12 @@ function SkillsPane() {
           </div>
         ))}
       </div>
-      <div className="flex items-center gap-2">
+      {/* Sticky footer. The scroll container is the settings pane itself (p-6, overflow-y-auto),
+          so `bottom-0` pins to the scrollport while the skill list runs under it. The negative
+          margins let it span the pane's full width and sit flush in its bottom padding rather
+          than floating inset, and bg-popover matches DialogContent so rows genuinely disappear
+          beneath it instead of showing through. */}
+      <div className="sticky bottom-0 -mx-6 flex items-center gap-2 border-t bg-popover px-6 py-3">
         <Button
           variant="outline"
           size="sm"
@@ -489,6 +591,17 @@ function SkillsPane() {
         <Button variant="outline" size="sm" onClick={() => fileRef.current?.click()}>
           <UploadIcon data-icon="inline-start" />
           Upload .md
+        </Button>
+        {/* The mirror of Upload, so the pair reads as one round trip. */}
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={skills.length === 0}
+          title="Every skill as a .md inside one ZIP"
+          onClick={() => void downloadAll()}
+        >
+          <DownloadIcon data-icon="inline-start" />
+          Download all
         </Button>
         <input
           ref={fileRef}
@@ -538,6 +651,69 @@ function SkillsPane() {
                   onChange={(e) => setDraft({ ...draft, skill: { ...draft.skill, name: e.target.value } })}
                 />
               </Field>
+              {/* Tag and colour share the row: they are two halves of one thing, where the
+                  name has nothing to do with either. Pairing name with tag put a divider
+                  through the middle of the tag instead of around it. */}
+              <div className="grid grid-cols-2 gap-3">
+                <Field>
+                  <FieldLabel htmlFor="skill-tag">Tag</FieldLabel>
+                  <SkillTagPicker
+                    id="skill-tag"
+                    value={draft.skill.tag}
+                    options={tagOptions}
+                    onChange={(tag) => setDraft({ ...draft, skill: { ...draft.skill, tag } })}
+                  />
+                </Field>
+                {/* Only once there is a tag to colour. A palette beside a blank tag is eight
+                    controls that cannot change anything, and picking one used to invent a
+                    labelless tag that saving then silently threw away. */}
+                {draft.skill.tag?.label.trim() && (
+                <Field>
+                <FieldLabel>Colour</FieldLabel>
+                {/* h-9 matches the combobox beside it, so the two controls sit on one baseline
+                    rather than the dots floating against the taller field. Radio semantics, not
+                    toggles: a tag has exactly one colour. The dot IS the label — a swatch named
+                    "violet" would say less than the violet itself. */}
+                <div role="radiogroup" aria-label="Tag colour" className="flex h-9 items-center gap-1.5">
+                  {TAG_COLORS.map((color) => {
+                    const active = (draft.skill.tag?.color ?? 'slate') === color;
+                    return (
+                      <button
+                        key={color}
+                        type="button"
+                        role="radio"
+                        aria-checked={active}
+                        aria-label={color}
+                        title={color}
+                        onClick={() =>
+                          setDraft({
+                            ...draft,
+                            skill: {
+                              ...draft.skill,
+                              tag: { label: draft.skill.tag?.label ?? '', color },
+                            },
+                          })
+                        }
+                        className={cn(
+                          'size-5 cursor-pointer rounded-full outline-none transition-transform',
+                          TAG_DOTS[color],
+                          active
+                            ? 'ring-2 ring-ring ring-offset-2 ring-offset-background'
+                            : 'opacity-70 hover:scale-110 hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring',
+                        )}
+                      />
+                    );
+                  })}
+                </div>
+                </Field>
+                )}
+              </div>
+              {/* Under both, because it describes the pair. */}
+              <FieldDescription>
+                Shown beside this skill in the list above and in every product&rsquo;s prompt
+                switcher. Pick a tag already in use to reuse it — including its colour — or type
+                a new name to create one.
+              </FieldDescription>
               <Textarea
                 value={draft.skill.content}
                 onChange={(e) => setDraft({ ...draft, skill: { ...draft.skill, content: e.target.value } })}
