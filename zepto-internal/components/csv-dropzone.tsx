@@ -29,6 +29,24 @@ interface CsvDropzoneProps {
 
 /** Spreadsheet-mark file icon — same hand-drawn stroke style as MdFileIcon, so a .csv card and
     a .md card sit side by side as siblings rather than strangers. */
+export function DocFileIcon(props: React.SVGProps<SVGSVGElement>) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.75"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      {...props}
+    >
+      <rect x="4" y="3" width="16" height="18" rx="2.5" />
+      <path d="M8 8h8M8 12h8M8 16h5" />
+    </svg>
+  );
+}
+
 export function CsvFileIcon(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg
@@ -141,7 +159,7 @@ export function CsvFileTile({
         className="flex min-w-0 flex-1 cursor-pointer items-center gap-2.5 self-stretch rounded-l-lg py-2.5 pl-3 pr-1.5 text-left transition-colors duration-100 outline-none hover:bg-accent focus-visible:ring-[3px] focus-visible:ring-ring/50"
       >
         <ItemMedia variant="icon">
-          <CsvFileIcon className="text-muted-foreground" />
+          <DocFileIcon className="text-muted-foreground" />
         </ItemMedia>
         <ItemContent className="min-w-0 gap-0">
           <ItemTitle className="w-full truncate">{name}</ItemTitle>

@@ -8,7 +8,6 @@ import {
   CloudDownloadIcon,
   DownloadIcon,
   FrameIcon,
-  ImagesIcon,
   RefreshCwIcon,
   SaveIcon,
   TriangleAlertIcon,
@@ -25,13 +24,9 @@ import {
 } from '@/components/ui/alert-dialog';
 import { SessionHeader, type SessionChip } from '@/components/session-header';
 
-import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Hint } from '@/components/hint';
 import { Checkbox } from '@/components/ui/checkbox';
-import {
-  Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle,
-} from '@/components/ui/empty';
 import {
   Field, FieldContent, FieldDescription, FieldGroup, FieldLabel,
 } from '@/components/ui/field';
@@ -2093,6 +2088,24 @@ export default function BgRemover() {
     }
   }
 
+  // Loading starts on choosing, not on a second click. The picker already stated the cost
+  // (size is in every option), and the old flow made "chose a model" and "can use it" two
+  // separate acts — so the first run of a batch was the thing that discovered the weights had
+  // never been fetched. Server models are skipped: their weights live in the sidecar.
+  //
+  // The ref, not `warming`, is the re-entrancy guard: state has not committed yet when a
+  // remount or a fast second change re-enters, and two warms of one model race the cache.
+  const autoWarmedRef = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    if (spec.server || modelReady || busy) return;
+    if (autoWarmedRef.current === modelId) return;
+    autoWarmedRef.current = modelId;
+    void handleWarm();
+    // handleWarm closes over the current model and is redeclared every render; the ref above is
+    // what makes re-firing a no-op, so it is deliberately not a dependency.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [modelId, modelReady, busy, spec.server]);
+
   async function handleWarm() {
     if (spec.server || modelReady || busy) return;
     setWarming(true);
@@ -2108,6 +2121,9 @@ export default function BgRemover() {
       const message = errorMessage(e);
       if (looksLikeMissingWeights(message)) setSetupError(message);
       toast.error(`${spec.label}: ${message}`);
+      // Let the button offer a retry: without this the auto-warm would never fire again for
+      // this model and the only affordance would be switching away and back.
+      autoWarmedRef.current = null;
     } finally {
       setDownload(null);
       setWarming(false);
@@ -2385,9 +2401,7 @@ export default function BgRemover() {
 
   const inputCard = (
     <>
-    <PanelSection title="Images" hint="Files, a clipboard paste, or a CSV of image URLs.">
-        <ImageDropzone onAdd={handleAdd} onCsv={handleCsv} onProject={(file) => void handleProject(file)} itemCount={items.length} disabled={busy} />
-    </PanelSection>
+
         {csvInfo && (
           <PanelSection title="CSV">
           <div className="space-y-4">
@@ -2529,19 +2543,17 @@ export default function BgRemover() {
             </Field>
           )}
           <Field orientation="horizontal">
-            <Checkbox
+            <FieldLabel htmlFor="bg-ai-focus-crop" className="font-normal">
+              <Hint hint="Crops the reference to the main product before sending it to the model, so bowls, props and scattered pieces can't be copied back into the result. Falls back to the full image when there's nothing to crop away.">
+                Focus on main subject
+              </Hint>
+            </FieldLabel>
+            <Switch
               id="bg-ai-focus-crop"
               checked={aiFocusCrop}
               disabled={busy}
               onCheckedChange={(checked) => setAiFocusCrop(checked === true)}
             />
-            <FieldContent>
-              <FieldLabel htmlFor="bg-ai-focus-crop" className="font-normal">
-                <Hint hint="Crops the reference to the main product before sending it to the model, so bowls, props and scattered pieces can't be copied back into the result. Falls back to the full image when there's nothing to crop away.">
-                  Focus on main subject
-                </Hint>
-              </FieldLabel>
-            </FieldContent>
           </Field>
           {/* The action lives with the prompt and the skill it will actually send, rather than
               floating in the grid toolbar between a filter and a sort control where its cost —
@@ -2807,19 +2819,17 @@ export default function BgRemover() {
     </div>
   );
 
+  // The empty canvas IS the dropzone. Drop and paste were already bound to the window, so this
+  // moves the affordance to where the eye goes rather than changing how a file gets in.
   const emptyState = (
-    <Empty className="h-full min-h-60">
-      <EmptyHeader>
-        <EmptyMedia variant="icon">
-          <ImagesIcon />
-        </EmptyMedia>
-        <EmptyTitle>Nothing queued yet</EmptyTitle>
-        <EmptyDescription>
-          Drop or browse image files, paste an image straight from the clipboard, or drop a CSV
-          and every image URL in it becomes its own queue item.
-        </EmptyDescription>
-      </EmptyHeader>
-    </Empty>
+    <ImageDropzone
+      size="canvas"
+      onAdd={handleAdd}
+      onCsv={handleCsv}
+      onProject={(file) => void handleProject(file)}
+      itemCount={items.length}
+      disabled={busy}
+    />
   );
 
   const setupBanner = setupError && (
@@ -2859,105 +2869,134 @@ export default function BgRemover() {
               }
             >
               {inputCard}
-              <PanelSection title="Model" hint="Weights download once, then stay cached.">
-                  <div className="mb-3">
-                    <Badge variant={modelReady ? 'default' : 'outline'}>
-                      {spec.label}
-                      {modelReady
-                        ? ` · ready${backendLabel ? ` · ${backendLabel}` : ''}`
-                        : spec.approxSizeMb
-                          ? ` · ${spec.approxSizeMb} MB`
-                          : ''}
-                    </Badge>
-                  </div>
+              <PanelSection
+                title="Model"
+                hint="Weights download once, then stay cached. Choosing a model starts loading it."
+                action={
+                  // The section heading IS this control's label, so the select sits on the
+                  // heading's row rather than under a second "Model" label repeating it.
+                  <Select
+                    value={modelId}
+                    onValueChange={(value) => setModelId(value as BgModelId)}
+                    disabled={busy}
+                  >
+                    <SelectTrigger id="bg-model" aria-label="Model" className="h-8 w-44">
+                      <SelectValue>
+                        {(value) => (
+                          <span className="flex min-w-0 items-center gap-1.5">
+                            {/* The dot is the state at a glance; the words after it are for
+                                when a glance is not enough, and truncate first. */}
+                            <span
+                              aria-hidden
+                              className={cn(
+                                'size-1.5 shrink-0 rounded-full',
+                                modelReady
+                                  ? 'bg-emerald-500'
+                                  : warming
+                                    ? 'animate-pulse bg-amber-500'
+                                    : 'bg-muted-foreground/40',
+                              )}
+                            />
+                            <span className="truncate">
+                              {BG_MODELS[value as BgModelId]?.label ?? 'Choose a model'}
+                            </span>
+                            <span className="shrink truncate text-muted-foreground">
+                              {modelReady
+                                ? backendLabel || 'ready'
+                                : warming
+                                  ? 'loading'
+                                  : spec.approxSizeMb
+                                    ? `${spec.approxSizeMb} MB`
+                                    : ''}
+                            </span>
+                          </span>
+                        )}
+                      </SelectValue>
+                    </SelectTrigger>
+                    <SelectContent align="end">
+                      {BG_MODEL_ORDER.map((id) => {
+                        const option = BG_MODELS[id];
+                        const offline = option.server === true && serverUp !== true;
+                        return (
+                          <SelectItem key={id} value={id} disabled={offline}>
+                            <span className="flex min-w-0 flex-col gap-0.5 py-0.5">
+                              <span>
+                                {option.label}
+                                {/* Loaded weights cost nothing to switch to; unloaded ones cost
+                                    their download. Saying which is which here is what stops a
+                                    452 MB choice from being a surprise. */}
+                                {loadedModels.includes(id) || isModelLoaded(id)
+                                  ? ' · loaded'
+                                  : option.approxSizeMb
+                                    ? ` · ${option.approxSizeMb} MB`
+                                    : ''}
+                              </span>
+                              <span className="text-xs text-muted-foreground">
+                                {offline ? 'Local sidecar is not running' : option.description}
+                              </span>
+                            </span>
+                          </SelectItem>
+                        );
+                      })}
+                    </SelectContent>
+                  </Select>
+                }
+              >
                   <FieldGroup className="gap-4">
-                    <Field>
-                      <FieldLabel htmlFor="bg-model" className="sr-only">Model</FieldLabel>
-                      <Select
-                        value={modelId}
-                        onValueChange={(value) => setModelId(value as BgModelId)}
-                        disabled={busy}
-                      >
-                        <SelectTrigger id="bg-model" className="w-full">
-                          <SelectValue>
-                            {(value) => BG_MODELS[value as BgModelId]?.label ?? 'Choose a model'}
-                          </SelectValue>
-                        </SelectTrigger>
-                        <SelectContent>
-                          {BG_MODEL_ORDER.map((id) => {
-                            const option = BG_MODELS[id];
-                            const offline = option.server === true && serverUp !== true;
-                            return (
-                              <SelectItem key={id} value={id} disabled={offline}>
-                                <span className="flex min-w-0 flex-col gap-0.5 py-0.5">
-                                  <span>
-                                    {option.label}
-                                    {option.approxSizeMb ? ` · ${option.approxSizeMb} MB` : ''}
-                                  </span>
-                                  <span className="text-xs text-muted-foreground">
-                                    {offline
-                                      ? 'Local sidecar is not running'
-                                      : option.description}
-                                  </span>
-                                </span>
-                              </SelectItem>
-                            );
-                          })}
-                        </SelectContent>
-                      </Select>
-                      {serverBlocked && (
-                        <FieldDescription>
-                          {`${BG_MODELS[knownModel].label} needs its local sidecar — using ${spec.label} until it answers.`}
-                        </FieldDescription>
-                      )}
-                    </Field>
+                    {serverBlocked && (
+                      <FieldDescription>
+                        {`${BG_MODELS[knownModel].label} needs its local sidecar — using ${spec.label} until it answers.`}
+                      </FieldDescription>
+                    )}
 
+                    {/* Settings rows: the label takes the row and the control sits at the end,
+                        so the whole section scans down one edge. Switches rather than
+                        checkboxes — each of these takes effect on the next run rather than
+                        being submitted, which is what a switch means and a checkbox does not. */}
                     <Field orientation="horizontal">
-                      <Checkbox
+                      <FieldLabel htmlFor="bg-refine" className="font-normal">
+                        <Hint hint="Slower, but much better on hair, fur and soft edges.">
+                          Refine edges
+                        </Hint>
+                      </FieldLabel>
+                      <Switch
                         id="bg-refine"
                         checked={refine}
                         disabled={busy}
                         onCheckedChange={(checked) => setRefine(checked === true)}
                       />
-                      <FieldContent>
-                        <FieldLabel htmlFor="bg-refine" className="font-normal">
-                          <Hint hint="Slower, but much better on hair, fur and soft edges.">
-                            Refine edges
-                          </Hint>
-                        </FieldLabel>
-                      </FieldContent>
                     </Field>
 
                     <Field orientation="horizontal">
-                      <Checkbox
+                      <FieldLabel htmlFor="bg-high-detail" className="font-normal">
+                        <Hint hint="Re-runs the model on a tight crop of the subject for sharper edges — about twice as slow per image.">
+                          High detail (two passes)
+                        </Hint>
+                      </FieldLabel>
+                      <Switch
                         id="bg-high-detail"
                         checked={highDetail}
                         disabled={busy}
                         onCheckedChange={(checked) => setHighDetail(checked === true)}
                       />
-                      <FieldContent>
-                        <FieldLabel htmlFor="bg-high-detail" className="font-normal">
-                          <Hint hint="Re-runs the model on a tight crop of the subject for sharper edges — about twice as slow per image.">
-                            High detail (two passes)
-                          </Hint>
-                        </FieldLabel>
-                      </FieldContent>
                     </Field>
 
+                    {/* Belongs here, not with the AI edit: this runs on EVERY removal and
+                        changes the exported cutout. (The AI card's "Focus on main subject" only
+                        crops the reference sent to Azure and leaves the cutout alone — it reads
+                        this option's region analysis, which is the whole of their relationship.) */}
                     <Field orientation="horizontal">
-                      <Checkbox
+                      <FieldLabel htmlFor="bg-product-only" className="font-normal">
+                        <Hint hint="Drops flat colour strips and badges the model kept, and re-measures the subject without them. Only affects graphics detached from the product.">
+                          Product only
+                        </Hint>
+                      </FieldLabel>
+                      <Switch
                         id="bg-product-only"
                         checked={productOnly}
                         disabled={busy}
                         onCheckedChange={(checked) => setProductOnly(checked === true)}
                       />
-                      <FieldContent>
-                        <FieldLabel htmlFor="bg-product-only" className="font-normal">
-                          <Hint hint="Drops flat colour strips and badges the model kept, and re-measures the subject without them. Only affects graphics detached from the product.">
-                            Product only
-                          </Hint>
-                        </FieldLabel>
-                      </FieldContent>
                     </Field>
 
                     <Field>
@@ -2990,12 +3029,16 @@ export default function BgRemover() {
                       </div>
                     </Field>
 
-                    {!spec.server && (
+                    {/* Only when loading did not happen on its own — a retry after a failed
+                        fetch, or while a run is holding it off. Ready state is the badge's job,
+                        so a permanently disabled "Model loaded" button was a row of chrome
+                        restating it. */}
+                    {!spec.server && !modelReady && (
                       <Button
                         variant="outline"
                         size="sm"
                         className="w-fit"
-                        disabled={busy || modelReady}
+                        disabled={busy}
                         onClick={() => void handleWarm()}
                       >
                         {warming ? (
@@ -3003,9 +3046,9 @@ export default function BgRemover() {
                         ) : (
                           <CloudDownloadIcon data-icon="inline-start" />
                         )}
-                        {modelReady
-                          ? 'Model loaded'
-                          : `Warm up${spec.approxSizeMb ? ` · ${spec.approxSizeMb} MB download` : ''}`}
+                        {warming
+                          ? 'Loading…'
+                          : `Load${spec.approxSizeMb ? ` · ${spec.approxSizeMb} MB` : ''}`}
                       </Button>
                     )}
                   </FieldGroup>
@@ -3032,6 +3075,16 @@ export default function BgRemover() {
                       onSortChange={setQueueSort}
                     />
                     <div className="flex items-center gap-2">
+                      {/* The only thing the window-level drop and paste cannot offer: a click
+                          that opens the file picker. */}
+                      <ImageDropzone
+                        size="button"
+                        onAdd={handleAdd}
+                        onCsv={handleCsv}
+                        onProject={(file) => void handleProject(file)}
+                        itemCount={items.length}
+                        disabled={busy}
+                      />
                       <span className="text-xs text-muted-foreground tabular-nums">
                         {gridSel.active
                           ? `${gridSel.checked.size.toLocaleString()} of ${displayItems.length.toLocaleString()} selected`
@@ -3213,7 +3266,7 @@ export default function BgRemover() {
       {/* Prompt editor — the .md tile in the AI edit card opens this. Edits bind live to the
           persisted default; Reset restores the shipped packshot prompt. */}
       <Dialog open={promptEditorOpen} onOpenChange={setPromptEditorOpen}>
-        <DialogContent className="sm:max-w-2xl">
+        <DialogContent className="sm:max-w-3xl">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <MdFileIcon className="size-4 text-muted-foreground" />

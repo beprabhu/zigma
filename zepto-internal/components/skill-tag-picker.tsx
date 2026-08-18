@@ -50,6 +50,7 @@ export function SkillTagPicker({
   onChange,
   id,
   disabled,
+  className,
 }: {
   /** The draft's tag. A blank label counts as no tag, same rule as saving. */
   value?: SkillTag;
@@ -58,6 +59,8 @@ export function SkillTagPicker({
   onChange: (tag: SkillTag | undefined) => void;
   id?: string;
   disabled?: boolean;
+  /** Lets a caller strip the trigger's own chrome when it sits inside an InputGroup. */
+  className?: string;
 }) {
   const [open, setOpen] = React.useState(false);
   const [query, setQuery] = React.useState('');
@@ -109,7 +112,13 @@ export function SkillTagPicker({
           chosen here is a coloured chip, so the closed state should be that chip. */}
       <ComboboxTrigger
         id={id}
-        render={<Button type="button" variant="outline" className="w-full justify-between font-normal" />}
+        render={
+          <Button
+            type="button"
+            variant="outline"
+            className={cn('w-full justify-between font-normal', className)}
+          />
+        }
       >
         {label && value ? (
           <SkillTagBadge tag={value} />

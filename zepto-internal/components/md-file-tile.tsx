@@ -85,9 +85,9 @@ export function MdFileTile({
   /** Full text; the tile previews its first non-empty line. */
   text: string;
   /**
-   * Short status chip for something the tile cannot work out for itself — Generate's character
-   * count, say. Omit it: naming the active skill "Skill" only restated the section it sits in,
-   * and that slot is worth more carrying the skill's own tag.
+   * Short status chip for something the tile genuinely cannot work out for itself. Omit it in
+   * the ordinary case: the slot is worth more carrying the active skill's tag than a label
+   * restating the section it sits in, or a character count nobody acts on.
    */
   badge?: string;
   onClick: () => void;
@@ -111,7 +111,9 @@ export function MdFileTile({
       {activeSkill?.tag?.label.trim() && <SkillTagBadge tag={activeSkill.tag} />}
       {badge ? (
         <Badge variant="chip" className="shrink-0">{badge}</Badge>
-      ) : skills?.activeId === CUSTOM_SKILL_ID ? (
+      ) : skills?.activeId === CUSTOM_SKILL_ID && text.trim() ? (
+        // Only for text that diverged from a skill. Empty text matches no skill either, but
+        // nothing was edited into it — an "Edited" chip on a blank brief is just wrong.
         <Badge variant="chip" className="shrink-0">Edited</Badge>
       ) : null}
     </>

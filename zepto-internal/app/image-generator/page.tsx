@@ -12,7 +12,7 @@
 import * as React from 'react';
 import { toast } from 'sonner';
 import {
-  CircleStopIcon, DownloadIcon, ImagePlusIcon, RefreshCwIcon, SparklesIcon, UploadCloudIcon,
+  CircleStopIcon, DownloadIcon, RefreshCwIcon, SparklesIcon, UploadCloudIcon,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
@@ -23,12 +23,11 @@ import { Checkbox } from '@/components/ui/checkbox';
 import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog';
-import { CsvFileIcon, CsvFileTile } from '@/components/csv-dropzone';
+import { CsvFileTile } from '@/components/csv-dropzone';
 import { MdFileIcon, MdFileTile } from '@/components/md-file-tile';
 import { createEta } from '@/lib/eta';
 import { matchSkill, useSkills } from '@/lib/skills';
 import { SessionHeader, type SessionChip } from '@/components/session-header';
-import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty';
 import { Field, FieldContent, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field';
 import { Progress } from '@/components/ui/progress';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
@@ -48,9 +47,8 @@ import { readSession, restingStatus, saveSession, sessionKey } from '@/lib/bg/se
 import { processImage } from '@/lib/process';
 import { useProcessing } from '@/components/process-panel';
 import { buildZipStream, type ZipStreamEntry } from '@/lib/zip';
-import { cn } from '@/lib/utils';
 import { usePersistedState } from '@/hooks/use-persisted-state';
-import { DropzoneShell } from '@/components/dropzone';
+import { CanvasDropzone } from '@/components/dropzone';
 
 const NONE = '__none__';
 const SIZES = ['1024x1024', '1536x1024', '1024x1536', 'auto'] as const;
@@ -510,30 +508,6 @@ export default function ImageGenerator() {
 
   // ---- Render ------------------------------------------------------------
 
-  const dropzone = (
-    <DropzoneShell
-      accept=".md,.markdown,.txt,.csv,text/csv,text/markdown"
-      multiple
-      onFiles={handleFiles}
-    >
-      <UploadCloudIcon className="size-6" />
-      <span>
-        Drop the brief (.md) and the rows (.csv), or{' '}
-        <span className="text-primary underline underline-offset-2">browse</span>
-      </span>
-      <span className="flex flex-wrap justify-center gap-2 text-xs">
-        <span className={cn('rounded-md border px-2 py-0.5', briefLabel && 'border-primary text-foreground')}>
-          <MdFileIcon className="mr-1 inline size-3" />
-          {briefLabel ?? 'no brief'}
-        </span>
-        <span className={cn('rounded-md border px-2 py-0.5', csvName && 'border-primary text-foreground')}>
-          <CsvFileIcon className="mr-1 inline size-3" />
-          {csvName ? `${csvName} — ${records.length} rows` : 'no CSV'}
-        </span>
-      </span>
-    </DropzoneShell>
-  );
-
   const runFooter = (
     <div className="flex gap-2">
       <Button className="flex-1" disabled={busy || !items.length} onClick={handleGenerateAll}>
@@ -590,7 +564,6 @@ export default function ImageGenerator() {
           <PanelSection title="Input" hint={<>One image per CSV row. Each prompt is the brief followed by that row&rsquo;s
                 fields, labelled with their column names.</>}>
             <div className="space-y-3">
-              {dropzone}
               {/* Loaded CSV as the suite's file card, matching the brief tile below: click to
                   replace, ✕ to remove. Rows (and their generated images) leave with the sheet,
                   so removal goes through the same confirm copy as Clear all — the brief stays. */}
@@ -621,11 +594,15 @@ export default function ImageGenerator() {
           <PanelSection title="Brief" hint="Leads every row's prompt. Drop a .md file or pick a saved skill; skills are managed in Settings.">
             {/* Same .md tile as the BG Remover's prompt: the brief is configuration, so the
                 panel shows the file card and editing happens in the modal below. Always
-                visible so a brief can start from a skill without dropping a file. */}
+                visible so a brief can start from a skill without dropping a file.
+
+                No `badge`: a character count is not a thing anyone acts on, and it crowded out
+                the skill's tag, which is. The tile falls back to "Edited" when the brief
+                matches no saved skill — the one state it cannot show any other way. The length
+                that DOES matter is the prompt-too-long warning under the columns picker. */}
             <MdFileTile
               name={briefLabel ?? 'brief.md'}
               text={brief}
-              badge={brief.trim() ? `${brief.trim().length.toLocaleString()} chars` : 'empty'}
               onClick={() => setBriefEditorOpen(true)}
               disabled={busy}
               skills={{
@@ -719,18 +696,14 @@ export default function ImageGenerator() {
             </p>
           )}
           {items.length === 0 ? (
-            <Empty className="h-full min-h-60">
-              <EmptyHeader>
-                <EmptyMedia variant="icon">
-                  <ImagePlusIcon />
-                </EmptyMedia>
-                <EmptyTitle>No rows yet</EmptyTitle>
-                <EmptyDescription>
-                  Drop a Markdown brief and a CSV. Every row becomes one image, prompted with the
-                  brief plus that row&rsquo;s own columns.
-                </EmptyDescription>
-              </EmptyHeader>
-            </Empty>
+            <CanvasDropzone
+              icon={<UploadCloudIcon />}
+              title="Drop a brief and a CSV to start"
+              description="Every row becomes one image, prompted with the brief plus that row's own columns."
+              accept=".md,.markdown,.txt,.csv,text/csv,text/markdown"
+              multiple
+              onFiles={handleFiles}
+            />
           ) : (
             <>
               {/* Grid toolbar: count on the left, whole-run reset on the right. */}
@@ -844,7 +817,7 @@ export default function ImageGenerator() {
 
       {/* Brief editor — the .md tile in the Input card opens this. */}
       <Dialog open={briefEditorOpen} onOpenChange={setBriefEditorOpen}>
-        <DialogContent className="sm:max-w-2xl">
+        <DialogContent className="sm:max-w-3xl">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <MdFileIcon className="size-4 text-muted-foreground" />

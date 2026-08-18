@@ -10,44 +10,52 @@
 
 import * as React from 'react';
 import {
-  ChartColumnIcon, CopyIcon, DownloadIcon, KeyRoundIcon, LockIcon, PencilIcon, PlugZapIcon,
-  PlusIcon,
+  ChartColumnIcon, CodeIcon, CopyIcon, DownloadIcon, EyeIcon, KeyRoundIcon, LockIcon,
+  PencilIcon, PlugZapIcon, PlusIcon,
   Settings2Icon, SlidersHorizontalIcon, SparklesIcon, Trash2Icon, UploadIcon,
 } from 'lucide-react';
 
 import { TAG_DOTS } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { Card } from '@/components/ui/card';
 import { Hint } from '@/components/hint';
 import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog';
 import { Textarea } from '@/components/ui/textarea';
+import { Markdown } from '@/components/markdown';
+import {
+  Item, ItemActions, ItemContent, ItemDescription, ItemGroup, ItemMedia, ItemTitle,
+} from '@/components/ui/item';
 import { MdFileIcon, SkillTagBadge } from '@/components/md-file-tile';
 import { SkillTagPicker, tagsInUse } from '@/components/skill-tag-picker';
 import { Field, FieldContent, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
+import { InputGroup, InputGroupAddon } from '@/components/ui/input-group';
 import { Spinner } from '@/components/ui/spinner';
 import { Switch } from '@/components/ui/switch';
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
 import {
-  Sidebar, SidebarContent, SidebarGroup, SidebarGroupContent, SidebarMenu, SidebarMenuButton,
-  SidebarMenuItem, SidebarProvider,
+  Sidebar, SidebarContent, SidebarGroup, SidebarGroupContent, SidebarGroupLabel, SidebarMenu,
+  SidebarMenuButton, SidebarMenuItem, SidebarProvider,
 } from '@/components/ui/sidebar';
 import { pickSave, saveTo } from '@/lib/bg/batch';
 import { buildZipStream } from '@/lib/zip';
 import { usePersistedState } from '@/hooks/use-persisted-state';
 import { DEFAULT_SEAL_SIZE } from '@/lib/bg/ledger';
 import {
-  TAG_COLORS, diffStat, newSkillId, useSkills, type PromptSkill, type SkillTag,
+  TAG_COLORS, diffStat, newSkillId, useSkills,
+  type PromptSkill, type SkillTag, type TagColor,
 } from '@/lib/skills';
 import { azureImageUrl } from '@/lib/pipeline';
 import { QUALITIES, QUALITY_BLURB, useImageQuality, type ImageQuality } from '@/lib/quality';
 import { clampParallel, clampRpm, useParallel, useRpm } from '@/lib/rate';
 import {
-  PRICE_USD_PER_MTOK, PRICING_ASOF, USAGE_KEY, USD_TO_INR, costUsd, emptyLedger, formatInr,
-  resetUsage, type UsageLedger,
+  PRICE_USD_PER_MTOK, PRICING_ASOF, USAGE_KEY, USD_TO_INR, costUsd, dayKey,
+  emptyLedger, formatInr, resetUsage, type UsageLedger, type UsageTotals,
 } from '@/lib/usage';
 import { cn } from '@/lib/utils';
 
@@ -61,6 +69,11 @@ const TABS: { id: SettingsTab; label: string; icon: typeof KeyRoundIcon }[] = [
   { id: 'usage', label: 'Usage', icon: ChartColumnIcon },
 ];
 
+/** A pane's own title. One definition so the five panes cannot drift apart. */
+function PaneHeading({ children, className }: { children: React.ReactNode; className?: string }) {
+  return <h2 className={cn('text-sm font-semibold', className)}>{children}</h2>;
+}
+
 export function SettingsDialog({
   open,
   onOpenChange,
@@ -69,15 +82,18 @@ export function SettingsDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const [tab, setTab] = React.useState<SettingsTab>('api-keys');
+  const paneTitle = TABS.find((t) => t.id === tab)?.label;
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[calc(100dvh-3rem)] grid-rows-[auto_minmax(0,1fr)] gap-0 overflow-hidden p-0 sm:max-w-3xl">
-        <DialogHeader className="border-b px-6 py-3.5">
-          <DialogTitle>Settings</DialogTitle>
-          <DialogDescription className="sr-only">
-            Suite-wide settings: API keys and token usage.
-          </DialogDescription>
-        </DialogHeader>
+      {/* No title bar. "Settings" is the rail's group label — the word belongs with the list it
+          heads, and a full-width bar spent a row restating what the open modal already is. The
+          pane's own heading is then the first thing in the content, which is what the eye is
+          actually looking for. DialogContent keeps its own close button, floating top-right. */}
+      <DialogContent className="max-h-[calc(100dvh-3rem)] gap-0 overflow-hidden p-0 sm:max-w-3xl">
+        <DialogTitle className="sr-only">Settings</DialogTitle>
+        <DialogDescription className="sr-only">
+          Suite-wide settings: API keys, image model, skills, defaults and token usage.
+        </DialogDescription>
         {/* min-w-0: DialogContent lays children on a grid whose track sizes to max-content;
             without this, one long unwrappable line (a skill's preview) widens the whole pane.
             The nav is the real shadcn Sidebar embedded non-collapsible, per its settings-dialog
@@ -86,8 +102,12 @@ export function SettingsDialog({
           <Sidebar collapsible="none" className="h-auto self-stretch border-r">
             <SidebarContent>
               <SidebarGroup>
+                <SidebarGroupLabel>Settings</SidebarGroupLabel>
                 <SidebarGroupContent>
-                  <SidebarMenu>
+                  {/* gap-1 over the primitive's gap-0: the rail's five items are the modal's
+                      only navigation, and packed flush they read as one block rather than five
+                      targets. */}
+                  <SidebarMenu className="gap-1">
                     {TABS.map(({ id, label, icon: Icon }) => (
                       <SidebarMenuItem key={id}>
                         <SidebarMenuButton isActive={tab === id} onClick={() => setTab(id)}>
@@ -101,20 +121,25 @@ export function SettingsDialog({
               </SidebarGroup>
             </SidebarContent>
           </Sidebar>
-          {/* Skills owns its own padding: a sticky footer is clamped by its containing block,
-              so a bottom padding here would strand it 24px up with rows scrolling through the
-              gap underneath. Every other pane keeps the shared inset. */}
-          <div
-            className={cn(
-              'min-w-0 flex-1 self-stretch overflow-y-auto',
-              tab === 'skills' ? 'px-0 py-0' : 'p-6',
-            )}
-          >
-            {tab === 'api-keys' && <ApiKeysPane />}
-            {tab === 'image-model' && <ImageModelPane />}
-            {tab === 'skills' && <SkillsPane />}
-            {tab === 'defaults' && <DefaultsPane />}
-            {tab === 'usage' && <UsagePane />}
+          <div className="flex min-w-0 flex-1 flex-col self-stretch">
+            {/* Skills scrolls internally so its footer can sit OUTSIDE the scrollport — a
+                footer inside it is overrun by the scrollbar, which has to span the full
+                scrollable height. Every other pane scrolls here and keeps the shared inset. */}
+            <div
+              className={cn(
+                'min-h-0 flex-1',
+                tab === 'skills' ? 'overflow-hidden' : 'overflow-y-auto p-6',
+              )}
+            >
+              {/* The heading scrolls with its pane rather than being pinned: it names the
+                  content, and content is what moves. */}
+              {tab !== 'skills' && <PaneHeading className="mb-4 pr-8">{paneTitle}</PaneHeading>}
+              {tab === 'api-keys' && <ApiKeysPane />}
+              {tab === 'image-model' && <ImageModelPane />}
+              {tab === 'skills' && <SkillsPane heading={<PaneHeading className="pr-8">{paneTitle}</PaneHeading>} />}
+              {tab === 'defaults' && <DefaultsPane />}
+              {tab === 'usage' && <UsagePane />}
+            </div>
           </div>
         </SidebarProvider>
       </DialogContent>
@@ -393,7 +418,7 @@ function skillBlob(skill: PromptSkill): Blob {
   return new Blob([skill.content], { type: 'text/markdown;charset=utf-8' });
 }
 
-function SkillsPane() {
+function SkillsPane({ heading }: { heading?: React.ReactNode }) {
   const { skills, setCustom } = useSkills();
   const fileRef = React.useRef<HTMLInputElement>(null);
   // The editor dialog's draft. `fresh` = not yet in the list, so Cancel leaves no trace.
@@ -408,6 +433,12 @@ function SkillsPane() {
   // Built-ins carry no tag, but they are in the list on purpose: the day they can be tagged,
   // their tags are suggestions too, and nothing here has to change.
   const tagOptions = React.useMemo(() => tagsInUse(skills), [skills]);
+  const [docView, setDocView] = React.useState<'preview' | 'source'>('preview');
+  const gutterRef = React.useRef<HTMLDivElement>(null);
+  const lineCount = React.useMemo(
+    () => (draft?.skill.content ?? '').split('\n').length,
+    [draft?.skill.content],
+  );
 
   function saveDraft() {
     if (!draft) return;
@@ -471,21 +502,23 @@ function SkillsPane() {
   }
 
   return (
-    <div className="space-y-4 px-6 pt-6">
-      <p className="text-xs text-muted-foreground">
-        Reusable prompts for the whole suite — pick them from any product&rsquo;s prompt
-        dropdown. Built-ins are read-only; duplicate one to make your own version.
-      </p>
-      <div className="space-y-1.5">
+    <div className="flex h-full flex-col">
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-6 py-6">
+        {heading}
+      <ItemGroup className="gap-2.5">
         {skills.map((skill) => (
-          <div key={skill.id} className="flex items-center gap-2.5 rounded-lg border px-3 py-2">
-            <MdFileIcon className="size-4 shrink-0 text-muted-foreground" />
-            <div className="min-w-0 flex-1">
-              <div className="flex min-w-0 items-center gap-1.5">
-                <span className="truncate text-sm">{skill.name}</span>
+          // shadcn's Item, not a bespoke div — same primitive MdFileTile uses, so a skill row
+          // in Settings and a prompt tile in a panel are the same object.
+          <Item key={skill.id} variant="outline" size="sm">
+            <ItemMedia variant="icon">
+              <MdFileIcon className="text-muted-foreground" />
+            </ItemMedia>
+            <ItemContent className="min-w-0 gap-0">
+              <ItemTitle className="flex min-w-0 items-center gap-1.5">
+                <span className="truncate">{skill.name}</span>
                 {skill.tag?.label.trim() && <SkillTagBadge tag={skill.tag} />}
-              </div>
-              <div className="truncate text-xs text-muted-foreground">
+              </ItemTitle>
+              <ItemDescription className="truncate">
                 {/* Custom skills show when they last changed; built-ins (and skills saved
                     before updatedAt existed) keep the first-line preview. */}
                 {skill.updatedAt
@@ -493,8 +526,9 @@ function SkillsPane() {
                       day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit',
                     })}`
                   : skill.content.split('\n').find((l) => l.trim()) || 'Empty'}
-              </div>
-            </div>
+              </ItemDescription>
+            </ItemContent>
+            <ItemActions>
             {/* Download sits on every row, built-in included: a built-in is exactly what you
                 want a copy of to hand to someone or keep alongside a batch. */}
             <Button
@@ -543,11 +577,14 @@ function SkillsPane() {
                   size="icon-sm"
                   title="Edit"
                   onClick={() =>
-                    setDraft({
-                      fresh: false,
-                      skill,
-                      original: { name: skill.name, content: skill.content, tag: skill.tag },
-                    })
+                    {
+                      setDocView('preview');
+                      setDraft({
+                        fresh: false,
+                        skill,
+                        original: { name: skill.name, content: skill.content, tag: skill.tag },
+                      });
+                    }
                   }
                 >
                   <PencilIcon />
@@ -563,24 +600,31 @@ function SkillsPane() {
                 </Button>
               </>
             )}
-          </div>
+            </ItemActions>
+          </Item>
         ))}
-      </div>
-      {/* Sticky footer. The scroll container is the settings pane itself (p-6, overflow-y-auto),
+      </ItemGroup>
+      {/* Footer. The scroll container is the settings pane itself (p-6, overflow-y-auto),
           so `bottom-0` pins to the scrollport while the skill list runs under it. The negative
           margins let it span the pane's full width and sit flush in its bottom padding rather
           than floating inset, and bg-popover matches DialogContent so rows genuinely disappear
           beneath it instead of showing through. */}
-      <div className="sticky bottom-0 -mx-6 flex items-center gap-2 border-t bg-popover px-6 py-3">
+      </div>
+      {/* Outside the scroller: the list's scrollbar now ends at this bar instead of running
+          down behind it. */}
+      <div className="flex shrink-0 items-center gap-2 border-t px-6 py-3">
         <Button
           variant="outline"
           size="sm"
           onClick={() =>
-            setDraft({
-              fresh: true,
-              skill: { id: newSkillId(), name: 'new-skill.md', content: '' },
-              original: { name: 'new-skill.md', content: '' },
-            })
+            {
+              setDocView('source');
+              setDraft({
+                fresh: true,
+                skill: { id: newSkillId(), name: 'new-skill.md', content: '' },
+                original: { name: 'new-skill.md', content: '' },
+              });
+            }
           }
         >
           <PlusIcon data-icon="inline-start" />
@@ -631,7 +675,7 @@ function SkillsPane() {
           focused layer with its own backdrop dim; narrower than Settings so the elevation
           reads. Base UI nests dialogs cleanly — Escape and the X close only this layer. */}
       <Dialog open={draft !== null} onOpenChange={(open) => !open && setDraft(null)}>
-        <DialogContent className="sm:max-w-xl" forceOverlay>
+        <DialogContent className="sm:max-w-3xl" forceOverlay>
           {draft && (
             <>
               <DialogHeader>
@@ -639,89 +683,146 @@ function SkillsPane() {
                   <MdFileIcon className="size-4 text-muted-foreground" />
                   {draft.fresh ? 'New skill' : 'Edit skill'}
                 </DialogTitle>
-                <DialogDescription>
-                  A reusable prompt, selectable from any product&rsquo;s prompt dropdown.
-                </DialogDescription>
               </DialogHeader>
-              <Field>
-                <FieldLabel htmlFor="skill-name">Name</FieldLabel>
-                <Input
-                  id="skill-name"
-                  value={draft.skill.name}
-                  onChange={(e) => setDraft({ ...draft, skill: { ...draft.skill, name: e.target.value } })}
-                />
-              </Field>
-              {/* Tag and colour share the row: they are two halves of one thing, where the
-                  name has nothing to do with either. Pairing name with tag put a divider
-                  through the middle of the tag instead of around it. */}
               <div className="grid grid-cols-2 gap-3">
                 <Field>
-                  <FieldLabel htmlFor="skill-tag">Tag</FieldLabel>
-                  <SkillTagPicker
-                    id="skill-tag"
-                    value={draft.skill.tag}
-                    options={tagOptions}
-                    onChange={(tag) => setDraft({ ...draft, skill: { ...draft.skill, tag } })}
+                  <FieldLabel htmlFor="skill-name">Name</FieldLabel>
+                  <Input
+                    id="skill-name"
+                    value={draft.skill.name}
+                    onChange={(e) => setDraft({ ...draft, skill: { ...draft.skill, name: e.target.value } })}
                   />
                 </Field>
-                {/* Only once there is a tag to colour. A palette beside a blank tag is eight
-                    controls that cannot change anything, and picking one used to invent a
-                    labelless tag that saving then silently threw away. */}
-                {draft.skill.tag?.label.trim() && (
                 <Field>
-                <FieldLabel>Colour</FieldLabel>
-                {/* h-9 matches the combobox beside it, so the two controls sit on one baseline
-                    rather than the dots floating against the taller field. Radio semantics, not
-                    toggles: a tag has exactly one colour. The dot IS the label — a swatch named
-                    "violet" would say less than the violet itself. */}
-                <div role="radiogroup" aria-label="Tag colour" className="flex h-9 items-center gap-1.5">
-                  {TAG_COLORS.map((color) => {
-                    const active = (draft.skill.tag?.color ?? 'slate') === color;
-                    return (
-                      <button
-                        key={color}
-                        type="button"
-                        role="radio"
-                        aria-checked={active}
-                        aria-label={color}
-                        title={color}
-                        onClick={() =>
-                          setDraft({
-                            ...draft,
-                            skill: {
-                              ...draft.skill,
-                              tag: { label: draft.skill.tag?.label ?? '', color },
-                            },
-                          })
-                        }
-                        className={cn(
-                          'size-5 cursor-pointer rounded-full outline-none transition-transform',
-                          TAG_DOTS[color],
-                          active
-                            ? 'ring-2 ring-ring ring-offset-2 ring-offset-background'
-                            : 'opacity-70 hover:scale-110 hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring',
-                        )}
-                      />
-                    );
-                  })}
-                </div>
+                  <FieldLabel htmlFor="skill-tag">Tag</FieldLabel>
+                  {/* One control, not two fields: the colour belongs to the tag, so it rides in
+                      the same bordered group as an end addon instead of taking a row of eight
+                      swatches below. The addon appears only once there is a tag to colour —
+                      before that it is a control that cannot change anything. */}
+                  <InputGroup>
+                    <SkillTagPicker
+                      id="skill-tag"
+                      value={draft.skill.tag}
+                      options={tagOptions}
+                      onChange={(tag) => setDraft({ ...draft, skill: { ...draft.skill, tag } })}
+                      className="h-full w-auto min-w-0 flex-1 border-0 bg-transparent pr-0 shadow-none focus-visible:ring-0 dark:bg-transparent"
+                    />
+                    {draft.skill.tag?.label.trim() && (
+                      <InputGroupAddon align="inline-end" className="shrink-0 pr-1.5 has-[>button]:mr-0">
+                        <Select
+                          value={draft.skill.tag.color}
+                          onValueChange={(next) => {
+                            const color = String(next ?? '') as TagColor;
+                            if (!TAG_COLORS.includes(color) || !draft.skill.tag) return;
+                            setDraft({
+                              ...draft,
+                              skill: { ...draft.skill, tag: { ...draft.skill.tag, color } },
+                            });
+                          }}
+                        >
+                          <SelectTrigger
+                            aria-label="Tag colour"
+                            className="h-6 w-auto gap-1 border-0 bg-transparent px-1 text-xs shadow-none focus-visible:ring-0 dark:bg-transparent"
+                          >
+                            <SelectValue>
+                              {(value) => (
+                                <span className="flex items-center gap-1.5">
+                                  <span
+                                    className={cn(
+                                      'size-3 shrink-0 rounded-full',
+                                      TAG_DOTS[value as TagColor] ?? TAG_DOTS.slate,
+                                    )}
+                                  />
+                                  <span className="truncate capitalize">{String(value)}</span>
+                                </span>
+                              )}
+                            </SelectValue>
+                          </SelectTrigger>
+                          <SelectContent align="end">
+                            {TAG_COLORS.map((color) => (
+                              <SelectItem key={color} value={color}>
+                                <span className="flex items-center gap-2">
+                                  <span className={cn('size-3 rounded-full', TAG_DOTS[color])} />
+                                  <span className="capitalize">{color}</span>
+                                </span>
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </InputGroupAddon>
+                    )}
+                  </InputGroup>
                 </Field>
+              </div>
+              {/* The document, framed, with its own view control in the corner — the shape a
+                  skill is actually read in. Preview is the default because a skill is read far
+                  more often than it is written; the source view is one click away and is the
+                  only editable one, so there is never a question about which mode is which. */}
+              <div className="relative overflow-hidden rounded-lg border">
+                <div className="absolute top-2 right-2 z-10">
+                  <ToggleGroup
+                    value={[docView]}
+                    onValueChange={(next) => {
+                      const v = next[0];
+                      if (v === 'preview' || v === 'source') setDocView(v);
+                    }}
+                    variant="outline"
+                    size="sm"
+                    spacing={0}
+                  >
+                    <ToggleGroupItem value="preview" aria-label="Preview" title="Preview">
+                      <EyeIcon />
+                    </ToggleGroupItem>
+                    <ToggleGroupItem value="source" aria-label="Edit source" title="Edit source">
+                      <CodeIcon />
+                    </ToggleGroupItem>
+                  </ToggleGroup>
+                </div>
+                {docView === 'preview' ? (
+                  <div className="max-h-[52dvh] min-h-64 overflow-y-auto p-4 pr-24">
+                    {draft.skill.content.trim() ? (
+                      <Markdown source={draft.skill.content} className="space-y-3 text-sm" />
+                    ) : (
+                      <p className="text-sm text-muted-foreground">
+                        Nothing written yet — switch to the source view to start.
+                      </p>
+                    )}
+                  </div>
+                ) : (
+                  // Gutter + source, scrolled as one. The numbers are a plain column beside the
+                  // textarea because a textarea cannot have one of its own.
+                  //
+                  // wrap="off" is what makes them TRUE: with soft wrapping, one logical line can
+                  // occupy three visual rows and every number below it points at the wrong text.
+                  // The cost is horizontal scrolling on long prose lines; a gutter that lies is
+                  // the worse trade.
+                  <div className="flex max-h-[52dvh] min-h-64">
+                    <div
+                      ref={gutterRef}
+                      aria-hidden
+                      className="shrink-0 overflow-hidden border-r bg-muted/30 py-3 text-right font-mono text-xs leading-5 text-muted-foreground/60 select-none"
+                    >
+                      {Array.from({ length: lineCount }, (_, i) => (
+                        <div key={i} className="px-2">{i + 1}</div>
+                      ))}
+                    </div>
+                    <Textarea
+                      value={draft.skill.content}
+                      onChange={(e) => setDraft({ ...draft, skill: { ...draft.skill, content: e.target.value } })}
+                      onScroll={(e) => {
+                        // The gutter has no scrollbar of its own; it follows the source's.
+                        if (gutterRef.current) gutterRef.current.scrollTop = e.currentTarget.scrollTop;
+                      }}
+                      wrap="off"
+                      placeholder="The prompt this skill carries…"
+                      aria-label="Skill prompt"
+                      // Borderless, and leading-5/py-3 matched to the gutter — the two columns
+                      // only line up if their line box and top inset are identical.
+                      className="min-h-0 flex-1 resize-none rounded-none border-0 py-3 pr-24 font-mono text-xs leading-5 shadow-none focus-visible:ring-0"
+                    />
+                  </div>
                 )}
               </div>
-              {/* Under both, because it describes the pair. */}
-              <FieldDescription>
-                Shown beside this skill in the list above and in every product&rsquo;s prompt
-                switcher. Pick a tag already in use to reuse it — including its colour — or type
-                a new name to create one.
-              </FieldDescription>
-              <Textarea
-                value={draft.skill.content}
-                onChange={(e) => setDraft({ ...draft, skill: { ...draft.skill, content: e.target.value } })}
-                rows={12}
-                placeholder="The prompt this skill carries…"
-                aria-label="Skill prompt"
-                className="max-h-[50dvh] min-h-40 overflow-y-auto text-xs"
-              />
               <DialogFooter>
                 {/* Git-style stat against the content the editor opened with — appears only
                     once something actually changed. */}
@@ -750,10 +851,88 @@ const MODE_LABELS: Record<'edits' | 'generations', string> = {
   generations: 'Generations (Generate)',
 };
 
+/** Days in the selected window, newest last. 'all' is the whole calendar the ledger retains. */
+type UsageRange = 'all' | '30d' | '7d';
+const RANGE_DAYS: Record<UsageRange, number> = { all: 182, '30d': 35, '7d': 7 };
+
+/**
+ * Activity as a week grid — GitHub's shape, sized to the selected window so it never needs to
+ * scroll. Columns are calendar weeks, rows are days of the week.
+ *
+ * Colour is SEQUENTIAL: one hue, four rising steps plus an empty step, keyed to the busiest day
+ * in the WHOLE ledger rather than in the window — otherwise every window would renormalise to
+ * its own maximum and switching range would silently redefine what "dark" means.
+ */
+function UsageHeatmap({
+  byDay,
+  days,
+  busiest,
+}: {
+  byDay: Record<string, UsageTotals>;
+  days: number;
+  busiest: number;
+}) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const start = new Date(today);
+  start.setDate(start.getDate() - (days - 1) - today.getDay());
+
+  const weeks: { key: string; date: Date; totals: UsageTotals | null }[][] = [];
+  const cursor = new Date(start);
+  while (cursor <= today) {
+    const week: { key: string; date: Date; totals: UsageTotals | null }[] = [];
+    for (let d = 0; d < 7; d++) {
+      const date = new Date(cursor);
+      week.push({ key: dayKey(date), date, totals: byDay[dayKey(date)] ?? null });
+      cursor.setDate(cursor.getDate() + 1);
+    }
+    weeks.push(week);
+  }
+
+  const step = (t: UsageTotals | null) => {
+    if (!t || t.requests === 0) return 'bg-foreground/10';
+    const q = busiest > 0 ? Math.ceil((t.requests / busiest) * 4) : 1;
+    return ['bg-primary/30', 'bg-primary/50', 'bg-primary/75', 'bg-primary'][Math.min(q, 4) - 1];
+  };
+  const label = (d: Date) =>
+    d.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
+
+  return (
+    <div className="flex flex-wrap gap-[3px]">
+      {weeks.map((week, w) => (
+        <div key={w} className="flex w-3 shrink-0 flex-col gap-[3px]">
+          {week.map((day) => (
+            <div
+              key={day.key}
+              // Data, not a control: the title reads it out, and the Products table is the same
+              // numbers for anyone not using a pointer.
+              title={
+                day.date > today
+                  ? undefined
+                  : day.totals
+                    ? `${label(day.date)} — ${day.totals.requests.toLocaleString()} requests · ${formatInr(costUsd(day.totals))}`
+                    : `${label(day.date)} — no calls`
+              }
+              className={cn(
+                'size-3 rounded-[3px]',
+                day.date > today ? 'bg-transparent' : step(day.totals),
+              )}
+            />
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function UsagePane() {
   const [ledger] = usePersistedState<UsageLedger>(USAGE_KEY, emptyLedger());
+  const [view, setView] = React.useState<'overview' | 'products'>('overview');
+  const [range, setRange] = React.useState<UsageRange>('all');
   const modes = ['edits', 'generations'] as const;
-  const total = modes.reduce(
+  const byDay = React.useMemo(() => ledger.byDay ?? {}, [ledger.byDay]);
+
+  const allTime = modes.reduce(
     (acc, m) => {
       const t = ledger.byMode[m] ?? { requests: 0, inputTokens: 0, outputTokens: 0 };
       return {
@@ -764,55 +943,188 @@ function UsagePane() {
     },
     { requests: 0, inputTokens: 0, outputTokens: 0 },
   );
+
+  const stats = React.useMemo(() => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const windowDays = range === 'all' ? Number.POSITIVE_INFINITY : range === '30d' ? 30 : 7;
+
+    const inWindow: UsageTotals[] = [];
+    const activeKeys = new Set<string>();
+    for (const [key, totals] of Object.entries(byDay)) {
+      if (totals.requests === 0) continue;
+      const [y, m, d] = key.split('-').map(Number);
+      const age = Math.round((today.getTime() - new Date(y, m - 1, d).getTime()) / 86400000);
+      if (age < windowDays) {
+        inWindow.push(totals);
+        activeKeys.add(key);
+      }
+    }
+
+    // Streaks walk backwards a day at a time — the only way to count consecutive days without
+    // assuming the map is dense.
+    let current = 0;
+    for (let i = 0; ; i++) {
+      const probe = new Date(today);
+      probe.setDate(probe.getDate() - i);
+      if (!(byDay[dayKey(probe)]?.requests ?? 0)) {
+        // Today not yet used is a pause, not a broken streak; anything earlier ends it.
+        if (i === 0) continue;
+        break;
+      }
+      current++;
+    }
+    let longest = 0;
+    let run = 0;
+    const sorted = Object.keys(byDay)
+      .filter((k) => byDay[k].requests > 0)
+      .sort();
+    let prev: number | null = null;
+    for (const key of sorted) {
+      const [y, m, d] = key.split('-').map(Number);
+      const t = new Date(y, m - 1, d).getTime();
+      run = prev !== null && t - prev === 86400000 ? run + 1 : 1;
+      longest = Math.max(longest, run);
+      prev = t;
+    }
+
+    const windowed = inWindow.reduce(
+      (acc, t) => ({
+        requests: acc.requests + t.requests,
+        inputTokens: acc.inputTokens + t.inputTokens,
+        outputTokens: acc.outputTokens + t.outputTokens,
+      }),
+      { requests: 0, inputTokens: 0, outputTokens: 0 },
+    );
+
+    return {
+      // 'all' reports the true lifetime figure from byMode; the day map only goes back to when
+      // daily recording started, so using it for "all" would quietly under-report.
+      totals: range === 'all' ? allTime : windowed,
+      activeDays: activeKeys.size,
+      currentStreak: current,
+      longestStreak: longest,
+      busiestDay: Math.max(0, ...Object.values(byDay).map((t) => t.requests)),
+    };
+  }, [byDay, range, allTime]);
+
   const n = (v: number) => v.toLocaleString();
+  const compact = (v: number) =>
+    v >= 1e6 ? `${(v / 1e6).toFixed(1)}M` : v >= 1e3 ? `${(v / 1e3).toFixed(1)}K` : `${v}`;
+  const busierMode =
+    (ledger.byMode.edits?.requests ?? 0) >= (ledger.byMode.generations?.requests ?? 0)
+      ? 'AI edits'
+      : 'Generations';
+
+  const tiles = [
+    { label: 'Requests', value: n(stats.totals.requests) },
+    { label: 'Tokens', value: compact(stats.totals.inputTokens + stats.totals.outputTokens) },
+    { label: 'Est. cost', value: formatInr(costUsd(stats.totals)) },
+    { label: 'Active days', value: n(stats.activeDays) },
+    { label: 'Current streak', value: `${stats.currentStreak}d` },
+    { label: 'Longest streak', value: `${stats.longestStreak}d` },
+    { label: 'Busiest day', value: `${n(stats.busiestDay)} reqs` },
+    { label: 'Most used', value: busierMode },
+  ];
+
   return (
     <div className="space-y-4">
-      <p className="text-xs text-muted-foreground">
-        Tokens reported by Azure per call
-        {ledger.since ? <> since {new Date(ledger.since).toLocaleString()}</> : null}. Counted per
-        person — teammates have their own tallies.
-      </p>
-      <div className="overflow-x-auto">
-        <table className="w-full text-xs tabular-nums">
-          <thead>
-            <tr className="border-b text-left text-muted-foreground">
-              <th className="py-1.5 pr-2 font-normal">Mode</th>
-              <th className="py-1.5 pr-2 text-right font-normal">Requests</th>
-              <th className="py-1.5 pr-2 text-right font-normal">Tokens in</th>
-              <th className="py-1.5 pr-2 text-right font-normal">Tokens out</th>
-              <th className="py-1.5 text-right font-normal">Est. cost</th>
-            </tr>
-          </thead>
-          <tbody>
-            {modes.map((m) => {
-              const t = ledger.byMode[m] ?? { requests: 0, inputTokens: 0, outputTokens: 0 };
-              return (
-                <tr key={m} className="border-b border-border/50">
-                  <td className="py-1.5 pr-2">{MODE_LABELS[m]}</td>
-                  <td className="py-1.5 pr-2 text-right">{n(t.requests)}</td>
-                  <td className="py-1.5 pr-2 text-right">{n(t.inputTokens)}</td>
-                  <td className="py-1.5 pr-2 text-right">{n(t.outputTokens)}</td>
-                  <td className="py-1.5 text-right">{formatInr(costUsd(t))}</td>
-                </tr>
-              );
-            })}
-            <tr className="font-medium">
-              <td className="py-1.5 pr-2">Total</td>
-              <td className="py-1.5 pr-2 text-right">{n(total.requests)}</td>
-              <td className="py-1.5 pr-2 text-right">{n(total.inputTokens)}</td>
-              <td className="py-1.5 pr-2 text-right">{n(total.outputTokens)}</td>
-              <td className="py-1.5 text-right">{formatInr(costUsd(total))}</td>
-            </tr>
-          </tbody>
-        </table>
+      <div className="flex flex-wrap items-center gap-2">
+        <ToggleGroup
+          value={[view]}
+          onValueChange={(next) => {
+            const v = next[0];
+            if (v === 'overview' || v === 'products') setView(v);
+          }}
+          variant="outline"
+          size="sm"
+          spacing={0}
+        >
+          <ToggleGroupItem value="overview">Overview</ToggleGroupItem>
+          <ToggleGroupItem value="products">Products</ToggleGroupItem>
+        </ToggleGroup>
+        <ToggleGroup
+          className="ml-auto"
+          value={[range]}
+          onValueChange={(next) => {
+            const v = next[0];
+            if (v === 'all' || v === '30d' || v === '7d') setRange(v);
+          }}
+          variant="outline"
+          size="sm"
+          spacing={0}
+        >
+          <ToggleGroupItem value="all">All</ToggleGroupItem>
+          <ToggleGroupItem value="30d">30d</ToggleGroupItem>
+          <ToggleGroupItem value="7d">7d</ToggleGroupItem>
+        </ToggleGroup>
       </div>
+
+      {view === 'overview' ? (
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            {tiles.map((tile) => (
+              <Card key={tile.label} size="sm" className="gap-0.5 px-3 py-2">
+                <div className="text-[11px] text-muted-foreground">{tile.label}</div>
+                <div className="truncate text-base tabular-nums">{tile.value}</div>
+              </Card>
+            ))}
+          </div>
+
+          <UsageHeatmap byDay={byDay} days={RANGE_DAYS[range]} busiest={stats.busiestDay} />
+
+          {stats.busiestDay > 0 && (
+            <p className="text-[11px] text-muted-foreground">
+              Requests and cost are lifetime totals; active days and streaks count only days
+              recorded since daily history began
+              {ledger.since ? ` on ${new Date(ledger.since).toLocaleDateString()}` : ''}.
+            </p>
+          )}
+        </div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs tabular-nums">
+            <thead>
+              <tr className="border-b text-left text-muted-foreground">
+                <th className="py-2 pr-3 font-normal">Mode</th>
+                <th className="py-2 pr-3 text-right font-normal">Requests</th>
+                <th className="py-2 pr-3 text-right font-normal">Tokens in</th>
+                <th className="py-2 pr-3 text-right font-normal">Tokens out</th>
+                <th className="py-2 text-right font-normal">Est. cost</th>
+              </tr>
+            </thead>
+            <tbody>
+              {modes.map((m) => {
+                const t = ledger.byMode[m] ?? { requests: 0, inputTokens: 0, outputTokens: 0 };
+                return (
+                  <tr key={m} className="border-b border-border/50">
+                    <td className="py-2.5 pr-3">{MODE_LABELS[m]}</td>
+                    <td className="py-2.5 pr-3 text-right">{n(t.requests)}</td>
+                    <td className="py-2.5 pr-3 text-right">{n(t.inputTokens)}</td>
+                    <td className="py-2.5 pr-3 text-right">{n(t.outputTokens)}</td>
+                    <td className="py-2.5 text-right">{formatInr(costUsd(t))}</td>
+                  </tr>
+                );
+              })}
+              <tr className="font-medium">
+                <td className="py-2.5 pr-3">Total</td>
+                <td className="py-2.5 pr-3 text-right">{n(allTime.requests)}</td>
+                <td className="py-2.5 pr-3 text-right">{n(allTime.inputTokens)}</td>
+                <td className="py-2.5 pr-3 text-right">{n(allTime.outputTokens)}</td>
+                <td className="py-2.5 text-right">{formatInr(costUsd(allTime))}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      )}
+
       <div className="flex flex-wrap items-center gap-3">
         <p className="mr-auto text-[11px] text-muted-foreground">
           gpt-image-2 on Azure: ${PRICE_USD_PER_MTOK.input}/M in · ${PRICE_USD_PER_MTOK.output}/M
           out, at ₹{USD_TO_INR}/$ (as of {PRICING_ASOF}). Estimates — region, deployment type and
           agreement all move the real bill.
         </p>
-        <Button variant="outline" size="sm" disabled={total.requests === 0} onClick={resetUsage}>
+        <Button variant="outline" size="sm" disabled={allTime.requests === 0} onClick={resetUsage}>
           Reset counters
         </Button>
       </div>

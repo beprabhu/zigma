@@ -3,7 +3,7 @@
 import * as React from 'react';
 import { toast } from 'sonner';
 import {
-  CircleStopIcon, DownloadIcon, ImageIcon, RefreshCwIcon, SparklesIcon, WandSparklesIcon,
+  CircleStopIcon, DownloadIcon, RefreshCwIcon, SparklesIcon, UploadCloudIcon, WandSparklesIcon,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Hint } from '@/components/hint';
@@ -11,9 +11,6 @@ import { Checkbox } from '@/components/ui/checkbox';
 import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog';
-import {
-  Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle,
-} from '@/components/ui/empty';
 import { Field, FieldContent, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
 import { Progress } from '@/components/ui/progress';
@@ -28,7 +25,8 @@ import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { TemplateEditor } from '@/components/template-editor';
 import { BatchPromptDialog } from '@/components/regen-prompt';
 import { ColumnPicker } from '@/components/column-picker';
-import { CsvDropzone, CsvFileTile } from '@/components/csv-dropzone';
+import { CsvFileTile } from '@/components/csv-dropzone';
+import { CanvasDropzone } from '@/components/dropzone';
 import { SessionHeader, type SessionChip } from '@/components/session-header';
 import { TileGrid, TileDialog, tileOptsFor } from '@/components/tile-grid';
 import { ClearAllButton, SelectionBar, useGridSelection } from '@/components/selection';
@@ -860,33 +858,30 @@ export default function Compositor() {
                 )}
               </TemplateEditor>
             </PanelSection>
-          <PanelSection title="CSV file">
-              {/* Same slot convention as prompts: empty invites a drop, loaded shows the file
-                  card (click to replace, ✕ to remove). Removing IS clearing the run — every
-                  queue row came from this sheet — so it goes through clearAll's confirm copy. */}
-              {fileName ? (
-                <CsvFileTile
-                  name={fileName}
-                  description={headers.join(', ')}
-                  badge={`${records.length.toLocaleString()} row${records.length === 1 ? '' : 's'}`}
-                  onReplace={handleFile}
-                  onRemove={clearAll}
-                  disabled={running}
-                  removeConfirm={{
-                    title: 'Remove the CSV?',
-                    description: (
-                      <>
-                        Clears all {items.length} row{items.length === 1 ? '' : 's'}
-                        {doneCount > 0 && <> and the {doneCount} generated tile{doneCount === 1 ? '' : 's'} (not exported anywhere yet)</>}
-                        . Your CSV file on disk is untouched — drop it again to rebuild the queue.
-                      </>
-                    ),
-                  }}
-                />
-              ) : (
-                <CsvDropzone fileName={null} rowCount={0} onFile={handleFile} />
-              )}
+          {fileName && (
+            <PanelSection title="CSV file">
+              {/* Only once there IS a file. The drop target lives in the canvas now, so an
+                  empty slot here would offer a second route to the same act. */}
+              <CsvFileTile
+                name={fileName}
+                description={headers.join(', ')}
+                badge={`${records.length.toLocaleString()} row${records.length === 1 ? '' : 's'}`}
+                onReplace={handleFile}
+                onRemove={clearAll}
+                disabled={running}
+                removeConfirm={{
+                  title: 'Remove the CSV?',
+                  description: (
+                    <>
+                      Clears all {items.length} row{items.length === 1 ? '' : 's'}
+                      {doneCount > 0 && <> and the {doneCount} generated tile{doneCount === 1 ? '' : 's'} (not exported anywhere yet)</>}
+                      . Your CSV file on disk is untouched — drop it again to rebuild the queue.
+                    </>
+                  ),
+                }}
+              />
             </PanelSection>
+          )}
 
           {/* The tile above carries the file name; repeating it in this title just made two
               rows disagree about truncation. */}
@@ -982,17 +977,14 @@ export default function Compositor() {
         <Canvas>
 
             {items.length === 0 ? (
-              <Empty className="h-full min-h-40">
-                <EmptyHeader>
-                  <EmptyMedia variant="icon">
-                    <ImageIcon />
-                  </EmptyMedia>
-                  <EmptyTitle>No tiles yet</EmptyTitle>
-                  <EmptyDescription>
-                    Upload a CSV and select Generate &amp; Populate to fill this pane.
-                  </EmptyDescription>
-                </EmptyHeader>
-              </Empty>
+              <CanvasDropzone
+                icon={<UploadCloudIcon />}
+                title="Drop a CSV to start"
+                description="Every row becomes a tile. Map its columns in the panel, then Generate & Populate."
+                accept=".csv,text/csv"
+                disabled={running}
+                onFiles={(files) => handleFile(files[0])}
+              />
             ) : (
               <>
                   {/* Grid toolbar: count on the left, whole-run reset on the right. */}
@@ -1221,7 +1213,7 @@ export default function Compositor() {
 
       {/* Prompt editor — same .md-tile-opens-modal pattern as Cleanup's AI-edit prompt. */}
       <Dialog open={promptEditorOpen} onOpenChange={setPromptEditorOpen}>
-        <DialogContent className="sm:max-w-2xl">
+        <DialogContent className="sm:max-w-3xl">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <MdFileIcon className="size-4 text-muted-foreground" />

@@ -75,7 +75,13 @@
   --primary-foreground: oklch(1 0 0);                        /* figma text-onbrand #ffffff */
   --secondary: oklch(0.3407 0 0);                            /* figma bg-secondary #383838 */
   --secondary-foreground: oklch(1 0 0);
-  --muted: oklch(0.3407 0 0);
+  /* Its own step, distinct from --popover. Both were oklch(0.3407 0 0), which made every
+     bg-muted surface invisible on a dialog: shadcn marks a pressed toggle with bg-muted, so a
+     selected segment was the popover's own colour painted onto itself. Every neighbour here
+     cites a Figma token; this one never did, which is the tell that it was copied from
+     bg-secondary rather than chosen. The value is a step past --border (0.3867) on the same
+     ladder — NOT read from Figma, so confirm it against the design file. */
+  --muted: oklch(0.4 0 0);
   --muted-foreground: oklch(1 0 0 / 0.70);                   /* figma text-secondary #ffffffb2 */
   --accent: oklch(0.4619 0.0553 266.0264);                   /* figma bg-selected #4a5878 */
   --accent-foreground: oklch(1 0 0 / 0.90);                  /* figma text-onselected #ffffffe5 */
@@ -176,5 +182,12 @@
   }
   body {
     @apply bg-background text-foreground;
+  }
+  /* Tailwind's `antialiased` (on <html> in layout.tsx) only emits -webkit-font-smoothing, so
+     macOS Firefox kept subpixel rendering and drew every label heavier than Chrome and Safari
+     did. This is the other half of that pair — set here rather than as a utility so it cannot
+     be left off a surface. */
+  html {
+    -moz-osx-font-smoothing: grayscale;
   }
 }

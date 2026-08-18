@@ -25,6 +25,29 @@ export interface UsageLedger {
   /** Epoch ms of the last reset (or first recorded call). */
   since: number;
   byMode: Record<UsageMode, UsageTotals>;
+  /**
+   * Per-DAY totals, keyed 'YYYY-MM-DD' in local time — what the calendar reads.
+   *
+   * The file's original rule was "aggregates only, because per-request history grows without
+   * bound". That still holds: this is per-day, so it is bounded by the calendar rather than by
+   * how hard the tool is used — a year is ~365 small records, and anything older is pruned on
+   * write. Optional because ledgers written before this existed have no such field.
+   *
+   * Local, not UTC: an 11pm batch in IST belongs to the day the person was working, not to
+   * tomorrow.
+   */
+  byDay?: Record<string, UsageTotals>;
+}
+
+/** Weeks the calendar shows — 53 so a full year always fits, GitHub-style. */
+export const CALENDAR_WEEKS = 53;
+const RETAIN_DAYS = CALENDAR_WEEKS * 7;
+
+/** Local 'YYYY-MM-DD'. toISOString would shift the day for anyone east or west of UTC. */
+export function dayKey(date: Date): string {
+  const m = `${date.getMonth() + 1}`.padStart(2, '0');
+  const d = `${date.getDate()}`.padStart(2, '0');
+  return `${date.getFullYear()}-${m}-${d}`;
 }
 
 const EMPTY_TOTALS: UsageTotals = { requests: 0, inputTokens: 0, outputTokens: 0 };
@@ -33,6 +56,7 @@ export function emptyLedger(since = 0): UsageLedger {
   return {
     since,
     byMode: { edits: { ...EMPTY_TOTALS }, generations: { ...EMPTY_TOTALS } },
+    byDay: {},
   };
 }
 
@@ -51,7 +75,30 @@ export function recordUsage(mode: UsageMode, usage: AzureUsage | null | undefine
   totals.inputTokens += Math.max(0, Math.round(usage?.input_tokens ?? 0));
   totals.outputTokens += Math.max(0, Math.round(usage?.output_tokens ?? 0));
   ledger.byMode[mode] = totals;
+
+  // Same numbers, bucketed by day. Written after the mode totals so a throw here cannot cost
+  // the figure the cost estimate is built from.
+  const key = dayKey(new Date());
+  const byDay = ledger.byDay ?? {};
+  const day = byDay[key] ?? { ...EMPTY_TOTALS };
+  day.requests += 1;
+  day.inputTokens += Math.max(0, Math.round(usage?.input_tokens ?? 0));
+  day.outputTokens += Math.max(0, Math.round(usage?.output_tokens ?? 0));
+  byDay[key] = day;
+  ledger.byDay = pruneDays(byDay);
+
   writePersisted(USAGE_KEY, ledger);
+}
+
+/**
+ * Drops days the calendar can no longer show. Runs on write rather than on read so the stored
+ * object cannot creep upward while the app sits open on a long session.
+ */
+function pruneDays(byDay: Record<string, UsageTotals>): Record<string, UsageTotals> {
+  const keys = Object.keys(byDay);
+  if (keys.length <= RETAIN_DAYS) return byDay;
+  const keep = keys.sort().slice(-RETAIN_DAYS);
+  return Object.fromEntries(keep.map((k) => [k, byDay[k]]));
 }
 
 export function resetUsage(): void {

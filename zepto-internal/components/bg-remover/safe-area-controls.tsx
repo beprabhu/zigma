@@ -57,7 +57,8 @@ const TILE_ITEMS: readonly { label: string; value: string }[] = [
   { label: 'Custom…', value: CUSTOM_TILE },
 ];
 
-const MARGIN_SIDES: readonly (keyof SafeAreaMargins)[] = ['top', 'right', 'bottom', 'left'];
+// Column order, not clock order: the 2x2 reads left|top over right|bottom.
+const MARGIN_SIDES: readonly (keyof SafeAreaMargins)[] = ['left', 'top', 'right', 'bottom'];
 const SIDE_LABELS: Record<keyof SafeAreaMargins, string> = {
   top: 'Top',
   right: 'Right',
@@ -356,74 +357,74 @@ export function SafeAreaControls({
             </ToggleGroup>
           </div>
         </div>
-        <div className="grid grid-cols-2 gap-2">
-          {MARGIN_SIDES.map((side) => (
-            <NumberField
-              key={side}
-              id={`safe-area-margin-${side}`}
-              label={`${SIDE_LABELS[side]} (${unitSuffix})`}
-              value={config.margins[side]}
-              step={config.marginUnit === 'percent' ? 0.5 : 1}
-              disabled={disabled}
-              onValueChange={(v) => handleMargin(side, v)}
-            />
-          ))}
-        </div>
-      </Field>
-
-      <Separator />
-
-      {/* Anchor --------------------------------------------------------------------- */}
-      <Field className="gap-1.5">
-        <FieldTitle className="text-xs">
-          <Hint hint="Where the subject sits inside the safe area once it has been scaled.">
-            Anchor
-          </Hint>
-        </FieldTitle>
-        <div className="flex items-center gap-3">
-          <div
-            className={cn(
-              'w-fit rounded-lg border border-input bg-muted/40 p-1.5',
-              disabled && 'opacity-50',
-            )}
-          >
-            <ToggleGroup
-              size="sm"
-              spacing={1}
-              disabled={disabled}
-              value={[config.anchor]}
-              onValueChange={(next) => {
-                const picked = next[0];
-                // Deselecting the pressed item yields an empty array — the tile always needs
-                // an anchor, so ignore it and keep the current one.
-                if (picked && isAnchor(picked)) patch({ anchor: picked });
-              }}
-              className="grid w-fit grid-cols-3"
-              aria-label="Subject anchor"
+        {/* Anchor and margins share the row. They were stacked with a rule between them, which
+            spent two headings and a divider on eight small controls that are read together —
+            "where does the subject sit, and how much room does it get". Side by side, the whole
+            question fits without scrolling. */}
+        <div className="flex gap-3">
+          <div className="shrink-0 space-y-1">
+            {/* A field label, not a heading. Anchor is a sibling of Left/Top/Right/Bottom —
+                one of the five things being set — so it takes their label style rather than
+                competing with "Margins" for section rank. */}
+            <FieldLabel className="text-[11px] font-normal text-muted-foreground">
+              <Hint hint="Where the subject sits inside the safe area once it has been scaled.">
+                Anchor
+              </Hint>
+            </FieldLabel>
+            <div
+              className={cn(
+                'w-fit rounded-lg border border-input bg-muted/40 p-1.5',
+                disabled && 'opacity-50',
+              )}
             >
-              {ANCHORS.map((anchor) => {
-                const active = config.anchor === anchor;
-                return (
-                  <ToggleGroupItem
-                    key={anchor}
-                    value={anchor}
-                    aria-label={ANCHOR_LABELS[anchor]}
-                    title={ANCHOR_LABELS[anchor]}
-                    className="h-7 w-7 min-w-0 rounded-[6px] p-0 text-muted-foreground hover:bg-primary/10 aria-pressed:bg-primary/15 aria-pressed:text-primary"
-                  >
-                    <span
-                      className={cn(
-                        'block rounded-[2px] bg-current transition-all',
-                        active ? 'size-2.5' : 'size-1.5 opacity-40',
-                      )}
-                    />
-                  </ToggleGroupItem>
-                );
-              })}
-            </ToggleGroup>
+              <ToggleGroup
+                size="sm"
+                spacing={1}
+                disabled={disabled}
+                value={[config.anchor]}
+                onValueChange={(next) => {
+                  const picked = next[0];
+                  // Deselecting the pressed item yields an empty array — the tile always needs
+                  // an anchor, so ignore it and keep the current one.
+                  if (picked && isAnchor(picked)) patch({ anchor: picked });
+                }}
+                className="grid w-fit grid-cols-3"
+                aria-label="Subject anchor"
+              >
+                {ANCHORS.map((anchor) => {
+                  const active = config.anchor === anchor;
+                  return (
+                    <ToggleGroupItem
+                      key={anchor}
+                      value={anchor}
+                      aria-label={ANCHOR_LABELS[anchor]}
+                      title={ANCHOR_LABELS[anchor]}
+                      className="h-6 w-6 min-w-0 rounded-[6px] p-0 text-muted-foreground hover:bg-primary/10 aria-pressed:bg-primary/15 aria-pressed:text-primary"
+                    >
+                      <span
+                        className={cn(
+                          'block rounded-[2px] bg-current transition-all',
+                          active ? 'size-2' : 'size-1.5 opacity-40',
+                        )}
+                      />
+                    </ToggleGroupItem>
+                  );
+                })}
+              </ToggleGroup>
+            </div>
           </div>
-          <div className="min-w-0 flex-1">
-            <div className="text-xs font-medium">{ANCHOR_LABELS[config.anchor]}</div>
+          <div className="grid min-w-0 flex-1 grid-cols-2 gap-2">
+            {MARGIN_SIDES.map((side) => (
+              <NumberField
+                key={side}
+                id={`safe-area-margin-${side}`}
+                label={`${SIDE_LABELS[side]} (${unitSuffix})`}
+                value={config.margins[side]}
+                step={config.marginUnit === 'percent' ? 0.5 : 1}
+                disabled={disabled}
+                onValueChange={(v) => handleMargin(side, v)}
+              />
+            ))}
           </div>
         </div>
       </Field>

@@ -10,6 +10,7 @@ import {
   ClipboardPasteIcon, FileTextIcon, ImagesIcon, UploadCloudIcon, type LucideIcon,
 } from 'lucide-react';
 
+import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import {
   draftsFromCsv,
@@ -49,6 +50,13 @@ interface ImageDropzoneProps {
   /** Queue size, so the zone can say what is loaded overall. */
   itemCount: number;
   disabled?: boolean;
+  /**
+   * 'canvas' fills the empty canvas and speaks up. 'button' is the same zone with its box
+   * taken off — for the queue toolbar, where the only thing still needed is a way to BROWSE,
+   * since drop and paste are already bound to the window.
+   */
+  size?: 'panel' | 'canvas' | 'button';
+  className?: string;
 }
 
 const ICONS: Record<LoadKind, LucideIcon> = {
@@ -61,7 +69,9 @@ function plural(n: number, word: string): string {
   return `${n} ${word}${n === 1 ? '' : 's'}`;
 }
 
-export function ImageDropzone({ onAdd, onCsv, onProject, itemCount, disabled = false }: ImageDropzoneProps) {
+export function ImageDropzone({
+  onAdd, onCsv, onProject, itemCount, disabled = false, size = 'panel', className,
+}: ImageDropzoneProps) {
   const inputRef = React.useRef<HTMLInputElement>(null);
   const pasteCount = React.useRef(0);
   const [drag, setDrag] = React.useState(false);
@@ -209,6 +219,36 @@ export function ImageDropzone({ onAdd, onCsv, onProject, itemCount, disabled = f
     if (!disabled) inputRef.current?.click();
   };
 
+  const fileInput = (
+    <input
+      ref={inputRef}
+      type="file"
+      accept={`image/*,.heic,.heif,.csv,text/csv,${PROJECT_EXTENSION},.zip`}
+      multiple
+      hidden
+      onChange={(e) => {
+        const files = e.target.files ? Array.from(e.target.files) : [];
+        // Reset first: picking the same file twice must still fire a change event.
+        e.target.value = '';
+        void handleFiles(files);
+      }}
+    />
+  );
+
+  // No box, no copy — drop and paste are on the window, so a populated queue only needs the
+  // one affordance those two cannot provide.
+  if (size === 'button') {
+    return (
+      <>
+        {fileInput}
+        <Button variant="outline" size="sm" disabled={disabled} onClick={browse}>
+          <UploadCloudIcon data-icon="inline-start" />
+          Add
+        </Button>
+      </>
+    );
+  }
+
   return (
     <div
       role="button"
@@ -223,24 +263,20 @@ export function ImageDropzone({ onAdd, onCsv, onProject, itemCount, disabled = f
       }}
       className={cn(
         'flex cursor-pointer flex-col items-center gap-2 rounded-lg border-2 border-dashed border-border px-3 py-6 text-center text-sm text-muted-foreground transition-colors outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50',
+        size === 'canvas' && 'h-full min-h-60 flex-1 justify-center px-6 py-12',
         drag && 'border-primary bg-accent',
         disabled && 'pointer-events-none opacity-50',
+        className,
       )}
     >
-      <input
-        ref={inputRef}
-        type="file"
-        accept={`image/*,.heic,.heif,.csv,text/csv,${PROJECT_EXTENSION},.zip`}
-        multiple
-        hidden
-        onChange={(e) => {
-          const files = e.target.files ? Array.from(e.target.files) : [];
-          // Reset first: picking the same file twice must still fire a change event.
-          e.target.value = '';
-          void handleFiles(files);
-        }}
-      />
-      <SummaryIcon className="size-6" />
+      {fileInput}
+      {size === 'canvas' ? (
+        <div className="mb-2 flex size-10 items-center justify-center rounded-lg bg-muted text-foreground">
+          <SummaryIcon className="size-5" />
+        </div>
+      ) : (
+        <SummaryIcon className="size-6" />
+      )}
       {summary ? (
         <div className="space-y-0.5">
           <div className="text-foreground">{summary.text}</div>
