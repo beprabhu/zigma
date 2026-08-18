@@ -89,7 +89,7 @@ import { VERIFY_MODEL_ID, compareCutouts, filteredRects } from '@/lib/bg/verify'
 import { QueueFilters } from '@/components/bg-remover/queue-filters';
 import { ColorPicker } from '@/components/color-picker';
 import { ColumnPicker } from '@/components/column-picker';
-import { BatchPromptDialog } from '@/components/regen-prompt';
+import { BatchPromptDialog, resolvePromptSource, type PromptSource } from '@/components/regen-prompt';
 import { parseCSV } from '@/lib/csv';
 import { buildRowPrompt } from '@/lib/row-prompt';
 import { BatchList } from '@/components/bg-remover/batch-list';
@@ -1733,6 +1733,18 @@ export default function BgRemover() {
     void runBatch(pending, 'Removing');
   }
 
+  /**
+   * What the original/last-generated toggle may offer for one item. An item that has never been
+   * edited has only one picture — `originalSource` is written the first time an edit replaces
+   * the source — so there is nothing to choose between and the control stays hidden.
+   */
+  function aiSourceChoices(item: BgItem) {
+    return {
+      hasLatest: !!item.originalSource,
+      hasOriginal: !!item.originalSource && item.originalSource.kind !== 'archived',
+    };
+  }
+
   function aiEditGuards(): { prompt: string; mock: boolean } | null {
     // aiPrompt always resolves (blank falls back to DEFAULT_AI_PROMPT), so only the
     // credentials can block an edit.
@@ -1757,11 +1769,18 @@ export default function BgRemover() {
     prompt: string,
     mock: boolean,
     signal?: AbortSignal,
+    from: PromptSource = 'latest',
   ): Promise<BgItem | null> {
     patchItem(item.id, { status: 'editing', error: undefined });
     try {
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-      const src = item.source;
+      // 'original' reaches past every edit already applied to the picture this item was
+      // imported with, so a second instruction corrects the import instead of compounding on a
+      // first edit that went wrong. Resolved per item: a selection can offer both while an
+      // individual row has only ever been through one, and an archived original has no pixels
+      // to reference, so both fall back to what the item is carrying now.
+      const chosen = resolvePromptSource(from, aiSourceChoices(item));
+      const src = chosen === 'original' ? (item.originalSource ?? item.source) : item.source;
       if (src.kind === 'archived') return null; // callers exclude this via canRetry
       const loaded =
         src.kind === 'url' ? await loadImageFromUrl(src.url) : await loadImageFromFile(src.file);
@@ -1824,7 +1843,7 @@ export default function BgRemover() {
   }
 
   /** ?mock=1 short-circuits Azure, same as the compositor. */
-  async function handleAiEdit(item: BgItem, promptOverride?: string) {
+  async function handleAiEdit(item: BgItem, promptOverride?: string, from: PromptSource = 'latest') {
     // Same relaxation as aiEditMany: a running removal batch is not a conflict.
     if (aiFixing || exporting || warming || item.status === 'editing' || !canRetry(item)) return;
     const guards = aiEditGuards();
@@ -1841,6 +1860,7 @@ export default function BgRemover() {
         promptOverride?.trim() || guards.prompt,
         guards.mock,
         controller.signal,
+        from,
       );
     } finally {
       // Only while this run still owns the slot — see aiEditMany's teardown.
@@ -1867,15 +1887,15 @@ export default function BgRemover() {
     await aiEditMany(flaggedItems);
   }
 
-  async function handleAiEditSelected(promptOverride: string) {
+  async function handleAiEditSelected(promptOverride: string, from: PromptSource) {
     // Archived sources have no pixels to re-reference; skip them like the per-item edit does.
     const targets = itemsRef.current.filter((it) => gridSel.checked.has(it.id) && canRetry(it));
     gridSel.clear();
-    await aiEditMany(targets, promptOverride);
+    await aiEditMany(targets, promptOverride, from);
   }
 
   /** `promptOverride` is the selection's one-off wording from the batch dialog. */
-  async function aiEditMany(targets: BgItem[], promptOverride?: string) {
+  async function aiEditMany(targets: BgItem[], promptOverride?: string, from: PromptSource = 'latest') {
     // Deliberately NOT gated on `running`: the Azure phase is network-bound and runs fine
     // alongside a removal batch — only the re-removal needs the workers, and that defers.
     if (aiFixing || exporting || warming || !targets.length) return;
@@ -1900,6 +1920,7 @@ export default function BgRemover() {
           promptOverride?.trim() || guards.prompt,
           guards.mock,
           controller.signal,
+          from,
         );
         finished++;
         const left = eta.remaining(finished, targets.length);
@@ -2488,6 +2509,10 @@ export default function BgRemover() {
   // credentials gate AI editing.
   // What the wand will actually touch — the dialog counts these, not the raw selection.
   const aiSelectedCount = items.filter((it) => gridSel.checked.has(it.id) && canRetry(it)).length;
+  /** Of those, the ones that HAVE an earlier import to go back to — what the toggle needs. */
+  const aiEditedSelectedCount = items.filter(
+    (it) => gridSel.checked.has(it.id) && canRetry(it) && aiSourceChoices(it).hasOriginal,
+  ).length;
   const aiReady =
     azureEndpoint.trim().length > 0 && azureKey.trim().length > 0 ||
     (typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('mock'));
@@ -3209,7 +3234,19 @@ export default function BgRemover() {
             ? `${skipped} selected image${skipped === 1 ? ' has' : 's have'} no source left to re-reference and ${skipped === 1 ? 'is' : 'are'} left out.`
             : undefined;
         })()}
-        onRun={(p) => void handleAiEditSelected(p)}
+        source={{
+          latestLabel: 'Last AI result',
+          originalLabel: 'Imported image',
+          // Offered as soon as ANY selected image has an earlier import to go back to; the
+          // rest resolve to their only picture at send time rather than being skipped.
+          hasLatest: aiEditedSelectedCount > 0,
+          hasOriginal: aiEditedSelectedCount > 0,
+          note:
+            aiEditedSelectedCount === aiSelectedCount
+              ? 'Images that have never been AI-edited send the picture they came in with either way.'
+              : `${aiEditedSelectedCount} of ${aiSelectedCount} have been AI-edited before; the rest send the picture they came in with either way.`,
+        }}
+        onRun={(p, from) => void handleAiEditSelected(p, from)}
       />
 
       <CompareDialog
@@ -3235,7 +3272,15 @@ export default function BgRemover() {
           // is what keeps the dialog honest — otherwise the one screen that shows the prompt in
           // full would be showing something other than what gets sent.
           rowContext: compareItem ? rowContextFor(compareItem) : '',
-          onEdit: (item, prompt) => void handleAiEdit(item, prompt),
+          source: compareItem
+            ? {
+                latestLabel: 'Last AI result',
+                originalLabel: 'Imported image',
+                ...aiSourceChoices(compareItem),
+                note: 'This image has been AI-edited before — the original is the picture it was imported with.',
+              }
+            : undefined,
+          onEdit: (item, prompt, from) => void handleAiEdit(item, prompt, from),
         }}
         busy={busy}
       />

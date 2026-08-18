@@ -12,7 +12,7 @@ import {
 
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
-import { RegenPrompt } from '@/components/regen-prompt';
+import { RegenPrompt, type PromptSource, type PromptSourceOptions } from '@/components/regen-prompt';
 import {
   Dialog,
   DialogContent,
@@ -491,16 +491,25 @@ export interface CompareDialogProps {
    * text to onEdit — the product's default prompt is never rewritten from here. Omitted
    * (or ready=false) hides/disables the section.
    */
-  aiEdit?: {
-    ready: boolean;
-    hint: string;
-    defaultPrompt: string;
-    /** The CSV row block the page appends to whatever is typed above; '' when there is none. */
-    rowContext?: string;
-    onEdit: (item: BgItem, prompt: string) => void;
-  };
+  aiEdit?: CompareAiEdit;
   /** A run is in progress; redo stays visible but disabled. */
   busy?: boolean;
+}
+
+/**
+ * The AI-edit section of the compare dialog. One shape, shared by the dialog and the view it
+ * wraps — they render the same block, and two hand-kept copies of its props drifted the moment
+ * one of them gained the source toggle.
+ */
+export interface CompareAiEdit {
+  ready: boolean;
+  hint: string;
+  defaultPrompt: string;
+  /** The CSV row block the page appends to whatever is typed above; '' when there is none. */
+  rowContext?: string;
+  /** Offers "imported image" against "last AI result". Omitted where there is no choice. */
+  source?: PromptSourceOptions;
+  onEdit: (item: BgItem, prompt: string, source: PromptSource) => void;
 }
 
 export interface CompareModelOption {
@@ -580,14 +589,7 @@ function CompareView({
   defaultRefine?: boolean;
   onRedo?: (item: BgItem, options: CompareRedoOptions) => void;
   onUndo?: (item: BgItem) => void;
-  aiEdit?: {
-    ready: boolean;
-    hint: string;
-    defaultPrompt: string;
-    /** The CSV row block the page appends to whatever is typed above; '' when there is none. */
-    rowContext?: string;
-    onEdit: (item: BgItem, prompt: string) => void;
-  };
+  aiEdit?: CompareAiEdit;
   busy?: boolean;
 }) {
   const [saving, setSaving] = React.useState(false);
@@ -815,7 +817,8 @@ function CompareView({
           working={item.status === 'editing'}
           disabled={!aiEdit.ready}
           hint={aiEdit.hint}
-          onRegenerate={(prompt) => aiEdit.onEdit(item, prompt)}
+          source={aiEdit.source}
+          onRegenerate={(prompt, from) => aiEdit.onEdit(item, prompt, from)}
         />
       )}
 

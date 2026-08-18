@@ -3,7 +3,7 @@
 import * as React from 'react';
 import { toast } from 'sonner';
 import {
-  CircleStopIcon, DownloadIcon, PlusIcon, RefreshCwIcon, SparklesIcon, UploadCloudIcon,
+  CircleStopIcon, DownloadIcon, FileSpreadsheetIcon, PlusIcon, RefreshCwIcon, SparklesIcon,
   WandSparklesIcon,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -24,13 +24,13 @@ import { Textarea } from '@/components/ui/textarea';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 
 import { TemplateEditor } from '@/components/template-editor';
-import { BatchPromptDialog } from '@/components/regen-prompt';
+import { BatchPromptDialog, resolvePromptSource, type PromptSource } from '@/components/regen-prompt';
 import { ColumnPicker } from '@/components/column-picker';
 import { CsvFileTile } from '@/components/csv-dropzone';
 import { CanvasDropzone, DropzoneShell } from '@/components/dropzone';
-import { BandCard } from '@/components/grid-bands';
+import { BandCard, RowSizeControls } from '@/components/grid-bands';
 import { SessionHeader, type SessionChip } from '@/components/session-header';
-import { TileGrid, TileDialog, tileOptsFor } from '@/components/tile-grid';
+import { TileGrid, TileGridSkeleton, TileDialog, tileOptsFor } from '@/components/tile-grid';
 import { ClearAllButton, SelectionBar, useGridSelection } from '@/components/selection';
 import { Canvas, CanvasToolbar, LeftPanel, PanelSection, RightPanel, StudioShell } from '@/components/pane-layout';
 import { useProcessing } from '@/components/process-panel';
@@ -356,6 +356,19 @@ export default function Compositor() {
     updateBands((prev) => prev.map((b) => (b.id === id ? { ...b, ...patch } : b)));
   }
 
+  /**
+   * One band patch, routed to whichever handler that field needs. Shared because a band is
+   * now edited from two places — its panel card and its canvas row header — and a patch must
+   * mean the same thing whichever control sent it.
+   */
+  function applyBandPatch(band: GridBand, patch: Partial<GridBand>) {
+    if (patch.presetId !== undefined) setBandPreset(band, patch.presetId);
+    else if (patch.count !== undefined) setBandCount(band, patch.count);
+    else if (patch.fileName === null) clearBandFile(band.id);
+    else if (patch.imageCols || patch.titleCol !== undefined || patch.offerCol !== undefined) remapBand(band, patch);
+    else patchBand(band.id, patch);
+  }
+
   function addBand() {
     updateBands((prev) => [...prev, newBand()]);
   }
@@ -675,13 +688,26 @@ export default function Compositor() {
 
   /** The wand's targets: only rows that HAVE a tile — the tile itself is the input. */
   const aiEditTargets = items.filter((it) => sel.checked.has(it.id) && it.resultImage);
+  /** The same selection seen the other way: rows with photos, which can be built from scratch. */
+  const regenTargets = items.filter((it) => sel.checked.has(it.id) && it.urls.length);
 
-  async function handleAiEditSelected(promptOverride: string) {
+  async function handleAiEditSelected(promptOverride: string, from: PromptSource = 'latest') {
     if (!guards()) return;
-    const todo = aiEditTargets;
+    // 'original' widens the run: rows with photos but no tile yet are legitimate targets for a
+    // recomposite, and excluding them would silently drop rows the toolbar counted as selected.
+    const todo =
+      from === 'original'
+        ? items.filter((it) => sel.checked.has(it.id) && it.urls.length)
+        : aiEditTargets;
     if (!todo.length) return;
-    await runTiles(todo, 'edited', (item, signal) => aiEditItem(item, signal, promptOverride));
-    offerUndo(todo, 'edited');
+    const verb = from === 'original' ? 'regenerated' : 'edited';
+    await runTiles(todo, verb, (item, signal) =>
+      // Per row, not per run: a selection can offer both while one row has only its photos.
+      resolvePromptSource(from, sourceChoices(item)) === 'latest'
+        ? aiEditItem(item, signal, promptOverride)
+        : generateItem(item, signal, promptOverride),
+    );
+    offerUndo(todo, verb);
   }
 
   /** Post-run toast whose Undo restores every tile the run replaced. */
@@ -719,15 +745,33 @@ export default function Compositor() {
     setCompressSummary('');
   }
 
-  async function handleRegenerate(item: QueueItem, promptOverride?: string) {
+  /**
+   * What the original/last-generated toggle may offer for one row. Compose's two candidates are
+   * not two versions of one picture: the original is the row's SOURCE PHOTOS, which rebuild the
+   * tile from scratch, and the latest is the tile itself, which the prompt edits in place.
+   */
+  function sourceChoices(item: QueueItem) {
+    return { hasLatest: !!item.resultImage, hasOriginal: item.urls.length > 0 };
+  }
+
+  async function handleRegenerate(
+    item: QueueItem,
+    promptOverride?: string,
+    from: PromptSource = 'latest',
+  ) {
     if (running) return;
     const controller = new AbortController();
     genAbortRef.current = controller;
     setRunning(true);
-    setProgress({ pct: 50, text: `Regenerating row ${item.row}…` });
+    // 'latest' edits the tile that is on screen; 'original' throws it away and recomposites
+    // from the row's photos. Resolved against what the row actually has, so a row with no tile
+    // yet still runs — as a first composite — instead of failing an edit with no input.
+    const editing = resolvePromptSource(from, sourceChoices(item)) === 'latest';
+    setProgress({ pct: 50, text: `${editing ? 'Editing' : 'Regenerating'} row ${item.row}…` });
     try {
-      await generateItem(item, controller.signal, promptOverride);
-      setProgress({ pct: 100, text: `Row ${item.row} regenerated.` });
+      if (editing) await aiEditItem(item, controller.signal, promptOverride);
+      else await generateItem(item, controller.signal, promptOverride);
+      setProgress({ pct: 100, text: `Row ${item.row} ${editing ? 'edited' : 'regenerated'}.` });
     } catch (e) {
       if (isAbortError(e)) {
         patchItem(item.id, { status: item.status, errorMsg: undefined });
@@ -1121,13 +1165,7 @@ export default function Compositor() {
                   disabled={running}
                   onReplaceCsv={(file) => handleBandFile(band.id, file)}
                   onRemove={() => removeBand(band.id)}
-                  onChange={(patch) => {
-                    if (patch.presetId !== undefined) setBandPreset(band, patch.presetId);
-                    else if (patch.count !== undefined) setBandCount(band, patch.count);
-                    else if (patch.fileName === null) clearBandFile(band.id);
-                    else if (patch.imageCols || patch.titleCol !== undefined || patch.offerCol !== undefined) remapBand(band, patch);
-                    else patchBand(band.id, patch);
-                  }}
+                  onChange={(patch) => applyBandPatch(band, patch)}
                 />
               ))}
               <Button variant="outline" className="w-full" disabled={running} onClick={addBand}>
@@ -1265,14 +1303,23 @@ export default function Compositor() {
                   const bandDone = bandItems.filter((it) => it.status === 'done').length;
                   return (
                     <section key={band.id} aria-label={`Row ${i + 1}`} className="flex flex-col gap-2">
-                      <div className="flex items-baseline gap-2">
+                      {/* Identity on the left, size on the right: the header says which row this
+                          is and what feeds it, then hands you the two numbers that reshape the
+                          grid directly beneath it. min-h-7 so a row with no tile field (no CSV
+                          yet) sits at the same height as one with. */}
+                      <div className="flex min-h-7 flex-wrap items-center gap-x-2 gap-y-1">
                         <h2 className="text-sm font-semibold">Row {i + 1}</h2>
                         <span className="text-xs text-muted-foreground">
                           {preset.ratio}
                           {band.fileName ? ` · ${band.fileName}` : ''}
-                          {bandItems.length ? ` · ${bandItems.length} tile${bandItems.length === 1 ? '' : 's'}` : ''}
                           {bandDone ? ` · ${bandDone} generated` : ''}
                         </span>
+                        <RowSizeControls
+                          band={band}
+                          disabled={running}
+                          onChange={(patch) => applyBandPatch(band, patch)}
+                          className="ml-auto"
+                        />
                       </div>
                       {bandItems.length ? (
                         <TileGrid
@@ -1299,14 +1346,25 @@ export default function Compositor() {
                           onFiles={(files) => handleBandFile(band.id, files[0])}
                           className="min-h-32 justify-center"
                         >
-                          <UploadCloudIcon className="size-6" />
-                          <span className="font-medium text-foreground">
-                            Drop row {i + 1}&rsquo;s CSV here, or{' '}
-                            <span className="font-normal text-primary underline underline-offset-2">browse</span>
-                          </span>
-                          <span className="text-xs">
-                            Its first {band.columns * 2} rows fill this row of the grid; change
-                            the count in the panel.
+                          {/* The row's own shape, at its own ratio and count — an empty dashed
+                              box could not say what picking a ratio had just decided. */}
+                          {/* `count` is 0 until a sheet lands, so an empty band shows the two
+                              full rows it would draw — the same promise the old copy made in
+                              words, made in the tiles themselves instead. */}
+                          <TileGridSkeleton
+                            template={preset.template}
+                            columns={band.columns}
+                            count={band.count || band.columns * 2}
+                            className="mb-1"
+                          />
+                          {/* Preflight makes bare <svg> display:block, so the icon needs its own
+                              flex row to sit beside the copy instead of stacking above it. */}
+                          <span className="flex items-center gap-1.5 font-medium text-foreground">
+                            <FileSpreadsheetIcon className="size-4 shrink-0 text-muted-foreground" />
+                            <span>
+                              Drop row {i + 1}&rsquo;s CSV here, or{' '}
+                              <span className="font-normal text-primary underline underline-offset-2">browse</span>
+                            </span>
                           </span>
                         </DropzoneShell>
                       )}
@@ -1351,7 +1409,7 @@ export default function Compositor() {
               </div>
             ) : activeItems.length === 0 ? (
               <CanvasDropzone
-                icon={<UploadCloudIcon />}
+                icon={<FileSpreadsheetIcon />}
                 title="Drop a CSV to start"
                 description="Every row becomes a tile. Map its columns in the panel, then Generate & Populate."
                 accept=".csv,text/csv"
@@ -1574,16 +1632,24 @@ export default function Compositor() {
         open={aiBatchOpen}
         onOpenChange={setAiBatchOpen}
         defaultPrompt={prompt}
-        count={aiEditTargets.length}
+        count={(from) => (from === 'original' ? regenTargets : aiEditTargets).length}
         noun="tile"
         busy={running}
-        excludedNote={(() => {
-          const skipped = sel.checked.size - aiEditTargets.length;
-          return skipped > 0
-            ? `${skipped} selected row${skipped === 1 ? ' has' : 's have'} no finished tile yet and ${skipped === 1 ? 'is' : 'are'} left out.`
-            : undefined;
-        })()}
-        onRun={(p) => void handleAiEditSelected(p)}
+        excludedNote={(from) => {
+          const reached = (from === 'original' ? regenTargets : aiEditTargets).length;
+          const skipped = sel.checked.size - reached;
+          if (skipped <= 0) return undefined;
+          const missing = from === 'original' ? 'no image URLs' : 'no finished tile yet';
+          return `${skipped} selected row${skipped === 1 ? ' has' : 's have'} ${missing} and ${skipped === 1 ? 'is' : 'are'} left out.`;
+        }}
+        source={{
+          latestLabel: 'Generated tile',
+          originalLabel: 'Source photos',
+          hasLatest: aiEditTargets.length > 0,
+          hasOriginal: regenTargets.length > 0,
+          note: 'The tile edits what is already there; the source photos rebuild it from scratch.',
+        }}
+        onRun={(p, from) => void handleAiEditSelected(p, from)}
       />
 
       {/* Prompt editor — same .md-tile-opens-modal pattern as Cleanup's AI-edit prompt. */}

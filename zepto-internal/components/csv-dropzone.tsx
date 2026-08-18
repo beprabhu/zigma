@@ -6,7 +6,7 @@
 // so a CSV reads the same in Compose, Generate and Cleanup once it is in.
 
 import * as React from 'react';
-import { UploadCloudIcon, XIcon } from 'lucide-react';
+import { FileSpreadsheetIcon, XIcon } from 'lucide-react';
 
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
@@ -80,7 +80,7 @@ export function CsvDropzone({ fileName, rowCount, onFile }: CsvDropzoneProps) {
         </>
       ) : (
         <>
-          <UploadCloudIcon className="size-6" />
+          <FileSpreadsheetIcon className="size-6" />
           <span>Drop CSV here or <span className="text-primary underline underline-offset-2">browse</span></span>
         </>
       )}

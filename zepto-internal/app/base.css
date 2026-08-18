@@ -105,3 +105,18 @@ html {
     background-clip: content-box;
   }
 }
+
+/* Toast close button: sonner ships it grey-scaled off its own --gray vars, which
+   ignore the theme tokens. Repaint it with the popover palette so the cross reads
+   the same in light and dark, and keep it visible rather than hover-only. */
+[data-sonner-toast] [data-close-button] {
+  background: var(--popover);
+  border-color: var(--border);
+  color: var(--muted-foreground);
+  opacity: 1;
+}
+[data-sonner-toast] [data-close-button]:hover {
+  background: var(--accent) !important;
+  border-color: var(--border) !important;
+  color: var(--foreground);
+}

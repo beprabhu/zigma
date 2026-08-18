@@ -19,7 +19,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { Spinner } from '@/components/ui/spinner';
-import { RegenPrompt } from '@/components/regen-prompt';
+import { RegenPrompt, type PromptSource } from '@/components/regen-prompt';
 import { ResultCell } from '@/components/result-cell';
 import { CHECKERBOARD } from '@/components/bg-remover/bg-queue-list';
 import { pickSave, saveTo } from '@/lib/bg/batch';
@@ -27,6 +27,7 @@ import type { QueueItem, ItemStatus } from '@/lib/types';
 import type { TileTemplate } from '@/lib/tile';
 import { renderTile, tileToPngBlob } from '@/lib/tile';
 import { useTileFontsReady } from '@/hooks/use-tile-fonts';
+import { cn } from '@/lib/utils';
 
 /* eslint-disable @next/next/no-img-element */
 
@@ -318,6 +319,45 @@ export function TileGrid({
   );
 }
 
+/**
+ * The shape a band is going to take, before anything is in it: one grey tile per slot, in the
+ * same grid TileGrid lays out, at the chosen preset's own ratio.
+ *
+ * An empty dashed box cannot answer the two questions that picking a ratio is FOR — how many
+ * tiles this row holds and what shape they are. This does, and because it reuses TileGrid's
+ * columns, gap and frame radius, the tiles that arrive land exactly where the grey ones were.
+ */
+export function TileGridSkeleton({
+  template,
+  columns,
+  count,
+  className,
+}: {
+  template: TileTemplate;
+  columns: number;
+  count: number;
+  className?: string;
+}) {
+  return (
+    <div
+      aria-hidden
+      className={cn('grid w-full gap-3.5', className)}
+      style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }}
+    >
+      {Array.from({ length: Math.max(0, count) }, (_, i) => (
+        <div
+          key={i}
+          className="bg-muted-foreground/15"
+          style={{
+            aspectRatio: `${template.frame.width} / ${template.frame.height}`,
+            borderRadius: frameRadius(template),
+          }}
+        />
+      ))}
+    </div>
+  );
+}
+
 /** One-click copy with the same async-clipboard + execCommand fallback the BG remover uses. */
 function CopyUrlButton({ url }: { url: string }) {
   const [copied, setCopied] = React.useState(false);
@@ -356,7 +396,7 @@ export interface TileDialogProps {
   /** Export multiplier, so a single Download PNG matches what the ZIP would contain. */
   exportScale: number;
   onClose: () => void;
-  onRegenerate: (item: QueueItem, promptOverride?: string) => void;
+  onRegenerate: (item: QueueItem, promptOverride?: string, source?: PromptSource) => void;
   /** Restores the tile the last regenerate replaced. Shown only while item.prev exists. */
   onUndo: (item: QueueItem) => void;
 }
@@ -479,13 +519,20 @@ export function TileDialog({
                 item.status === 'generating' ||
                 item.status === 'removing-bg'
               }
-              disabled={!item.urls.length}
+              disabled={!item.urls.length && !item.resultImage}
               hint={
-                item.urls.length
+                item.urls.length || item.resultImage
                   ? 'Run this row through Azure again'
                   : 'This row has no image URLs to send'
               }
-              onRegenerate={(p) => onRegenerate(item, p)}
+              source={{
+                latestLabel: 'Generated tile',
+                originalLabel: 'Source photos',
+                hasLatest: !!item.resultImage,
+                hasOriginal: item.urls.length > 0,
+                note: 'The tile edits what is already there; the source photos rebuild it from scratch.',
+              }}
+              onRegenerate={(p, from) => onRegenerate(item, p, from)}
             />
 
             <DialogFooter className="flex-wrap gap-2">

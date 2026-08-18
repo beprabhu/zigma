@@ -15,7 +15,7 @@ import { Button } from '@/components/ui/button';
 import { ColumnPicker } from '@/components/column-picker';
 import { CsvFileTile } from '@/components/csv-dropzone';
 import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field';
-import { Input } from '@/components/ui/input';
+import { InputGroup, InputGroupAddon, InputGroupInput } from '@/components/ui/input-group';
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
@@ -26,6 +26,7 @@ import {
 } from '@/components/ui/alert-dialog';
 import { BAND_PRESETS, bandPreset } from '@/lib/tile-presets';
 import type { GridBand } from '@/lib/types';
+import { cn } from '@/lib/utils';
 
 const NONE = '__none__';
 
@@ -37,6 +38,101 @@ function clamp(value: string, min: number, max: number, fallback: number): numbe
   const n = Math.round(Number(value));
   if (!Number.isFinite(n)) return fallback;
   return Math.min(max, Math.max(min, n));
+}
+
+/**
+ * A row's size, edited where its effect is.
+ *
+ * Tiles and columns are the only two band settings whose result is entirely visible in the
+ * canvas — everything else in the panel answers "which sheet, which columns". Sitting in the
+ * left panel they made you look three panes away from the grid you were resizing, and the
+ * panel's boxed Field pairs gave two one-digit numbers the same weight as the CSV mapping.
+ * On the row header they are adjacent to their effect, and small enough to read as a caption
+ * with an editable number in it rather than a form.
+ *
+ * The tile field appears only once a sheet is loaded: with no CSV there is no ceiling to clamp
+ * against, so rather than park a dead disabled box in the header the row shows just its column
+ * count — which still shapes the empty row's skeleton in the dropzone below.
+ */
+export function RowSizeControls({
+  band,
+  disabled,
+  onChange,
+  className,
+}: {
+  band: GridBand;
+  disabled: boolean;
+  onChange: (patch: Partial<GridBand>) => void;
+  className?: string;
+}) {
+  const rows = band.records.length;
+
+  return (
+    <div className={cn('flex items-center gap-1', className)}>
+      {rows > 0 && (
+        <RowNumberField
+          id={`row-count-${band.id}`}
+          label={`Tiles in row from ${band.fileName ?? 'this sheet'}`}
+          unit={band.count === 1 ? 'tile' : 'tiles'}
+          value={band.count}
+          min={0}
+          max={rows}
+          disabled={disabled}
+          onCommit={(count) => onChange({ count })}
+        />
+      )}
+      <RowNumberField
+        id={`row-cols-${band.id}`}
+        label="Columns in this row"
+        unit={band.columns === 1 ? 'col' : 'cols'}
+        value={band.columns}
+        min={1}
+        max={MAX_BAND_COLUMNS}
+        disabled={disabled}
+        onCommit={(columns) => onChange({ columns })}
+      />
+    </div>
+  );
+}
+
+/**
+ * One header number: the value, then its unit as the label. Header-height (h-7) and only as
+ * wide as two digits plus the word, so a row of them stays a caption. Native spinners are
+ * suppressed — they only appear on hover, at a size that would dominate the field — while the
+ * arrow keys they stand for keep working.
+ */
+function RowNumberField({
+  id, label, unit, value, min, max, disabled, onCommit,
+}: {
+  id: string;
+  /** Accessible name; the visible unit alone would read as "tiles" for both fields. */
+  label: string;
+  unit: string;
+  value: number;
+  min: number;
+  max: number;
+  disabled: boolean;
+  onCommit: (next: number) => void;
+}) {
+  return (
+    <InputGroup className="h-7 w-auto rounded-md">
+      <InputGroupInput
+        id={id}
+        type="number"
+        inputMode="numeric"
+        aria-label={label}
+        min={min}
+        max={max}
+        value={value}
+        disabled={disabled}
+        onChange={(e) => onCommit(clamp(e.target.value, min, max, value))}
+        className="h-7 w-11 flex-none px-2 py-0 text-sm tabular-nums [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+      />
+      <InputGroupAddon align="inline-end" className="pr-2 pl-0 text-xs font-normal">
+        {unit}
+      </InputGroupAddon>
+    </InputGroup>
+  );
 }
 
 export function BandCard({
@@ -130,40 +226,14 @@ export function BandCard({
           </Select>
         </Field>
 
-        <div className="grid grid-cols-2 gap-3">
-          <Field>
-            <FieldLabel htmlFor={`band-count-${band.id}`}>Tiles</FieldLabel>
-            <Input
-              id={`band-count-${band.id}`}
-              type="number"
-              min={0}
-              max={Math.max(rows, 0)}
-              value={band.count}
-              // No CSV means no ceiling to clamp against, so the field waits for one.
-              disabled={disabled || !rows}
-              onChange={(e) => onChange({ count: clamp(e.target.value, 0, rows, band.count) })}
-            />
-          </Field>
-          <Field>
-            <FieldLabel htmlFor={`band-cols-${band.id}`}>Columns</FieldLabel>
-            <Input
-              id={`band-cols-${band.id}`}
-              type="number"
-              min={1}
-              max={MAX_BAND_COLUMNS}
-              value={band.columns}
-              disabled={disabled}
-              onChange={(e) =>
-                onChange({ columns: clamp(e.target.value, 1, MAX_BAND_COLUMNS, band.columns) })
-              }
-            />
-          </Field>
-        </div>
-        <FieldDescription>
-          {rows
-            ? `${rows.toLocaleString()} row${rows === 1 ? '' : 's'} available — drawing ${band.count} in rows of ${band.columns}.`
-            : 'Drop this row’s CSV in its area on the canvas; the tile count is capped at that sheet’s rows.'}
-        </FieldDescription>
+        {/* Tiles and columns used to sit here as two boxed number fields, three panes away
+            from the grid they resize. They now ride the canvas row header instead — see
+            RowSizeControls — so the panel is only ever about which sheet feeds this row. */}
+        {rows ? (
+          <FieldDescription>
+            {`${rows.toLocaleString()} row${rows === 1 ? '' : 's'} available.`}
+          </FieldDescription>
+        ) : null}
 
         {band.fileName && (
           <>
