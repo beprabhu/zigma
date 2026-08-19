@@ -12,13 +12,13 @@
 import * as React from 'react';
 import { toast } from 'sonner';
 import {
-  CircleStopIcon, DownloadIcon, RefreshCwIcon, SparklesIcon, UploadCloudIcon,
+  CircleStopIcon, DownloadIcon, FileSpreadsheetIcon, RefreshCwIcon, SparklesIcon, UploadCloudIcon,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { ClearAllButton, SelectionBar, useGridSelection } from '@/components/selection';
 import { ColumnPicker } from '@/components/column-picker';
-import { BatchPromptDialog } from '@/components/regen-prompt';
+import { BatchPromptDialog, resolvePromptSource, type PromptSource } from '@/components/regen-prompt';
 import { Checkbox } from '@/components/ui/checkbox';
 import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
@@ -36,11 +36,13 @@ import { Textarea } from '@/components/ui/textarea';
 
 import { Canvas, CanvasToolbar, LeftPanel, PanelSection, RightPanel, StudioShell } from '@/components/pane-layout';
 import { GenDialog, GenGrid } from '@/components/image-generator/gen-grid';
+import { PromptListInput } from '@/components/image-generator/prompt-list';
+import { formatPromptList, parsePromptList } from '@/lib/prompt-list';
 
 import { detectTitleColumn, parseCSV, type CsvRecord } from '@/lib/csv';
-import { createGenItems, genFileStem, type GenItem } from '@/lib/gen';
-import { PROMPT_WARN_CHARS, buildRowPrompt, isPromptEmpty } from '@/lib/row-prompt';
-import { callAzureGenerate, mockGenerate } from '@/lib/pipeline';
+import { GEN_SIZES, createGenItems, genFileStem, reconcileSubjectItems, type GenItem, type GenSize } from '@/lib/gen';
+import { PROMPT_WARN_CHARS, buildRowPrompt, buildSubjectPrompt, isPromptEmpty } from '@/lib/row-prompt';
+import { callAzure, callAzureGenerate, mockGenerate } from '@/lib/pipeline';
 import { readParallel } from '@/lib/rate';
 import { canvasToPngBlob, mapWithLimit, pickSave, releaseCanvas, saveTo } from '@/lib/bg/batch';
 import { readSession, restingStatus, saveSession, sessionKey } from '@/lib/bg/session-store';
@@ -48,11 +50,9 @@ import { processImage } from '@/lib/process';
 import { useProcessing } from '@/components/process-panel';
 import { buildZipStream, type ZipStreamEntry } from '@/lib/zip';
 import { usePersistedState } from '@/hooks/use-persisted-state';
-import { CanvasDropzone } from '@/components/dropzone';
+import { CanvasDropzone, DropzoneShell } from '@/components/dropzone';
 
 const NONE = '__none__';
-const SIZES = ['1024x1024', '1536x1024', '1024x1536', 'auto'] as const;
-type GenSize = (typeof SIZES)[number];
 
 /**
  * Everything a product switch would otherwise destroy. The rail's <Link>s unmount this page, so
@@ -68,6 +68,7 @@ type GenSize = (typeof SIZES)[number];
 interface GenSession {
   brief: string;
   briefName: string | null;
+  subjects: string;
   csvName: string | null;
   sessionName: string;
   headers: string[];
@@ -112,6 +113,11 @@ export default function ImageGenerator() {
   // once something has been typed. null means "no brief at all" for the chips below.
   const briefLabel = activeBriefSkill?.name ?? briefName ?? (brief.trim() ? 'brief.md' : null);
 
+  // The typed row source, beside the CSV: one request per numbered line. Not persisted for the
+  // same reason the brief is not — it belongs to one batch — but it rides the session snapshot
+  // so a product switch does not eat what was typed.
+  const [subjects, setSubjects] = React.useState(() => revived?.subjects ?? '');
+
   const [csvName, setCsvName] = React.useState<string | null>(() => revived?.csvName ?? null);
   // Figma-style session name in the panel header; seeds the export ZIP filename. Auto-seeded
   // from the dropped CSV, but never over a name the user already typed.
@@ -149,6 +155,7 @@ export default function ImageGenerator() {
     sessionRef.current = {
       brief,
       briefName,
+      subjects,
       csvName,
       sessionName,
       headers,
@@ -214,12 +221,34 @@ export default function ImageGenerator() {
     [headers],
   );
 
+  // The two row sources assemble differently, and every screen that shows a prompt — the cell,
+  // the dialog, the length warning, the request itself — goes through here, so neither source
+  // can end up displaying one thing and sending another.
   const promptFor = React.useCallback(
-    (item: GenItem) => buildRowPrompt(brief, headers, item.record, excludedSet),
+    (item: GenItem) => (item.subject !== undefined
+      ? buildSubjectPrompt(brief, item.subject)
+      : buildRowPrompt(brief, headers, item.record, excludedSet)),
     [brief, headers, excludedSet],
   );
+  const promptForRef = React.useRef(promptFor);
+  React.useEffect(() => { promptForRef.current = promptFor; }, [promptFor]);
+
+  /**
+   * The typed list, applied to the queue. A CSV outranks it — a run is driven by one source or
+   * the other — so while a sheet is loaded the box keeps what was typed without touching rows.
+   */
+  const applySubjects = React.useCallback((next: string) => {
+    setSubjects(next);
+    if (csvName) return;
+    setItems((prev) => reconcileSubjectItems(parsePromptList(next), prev));
+  }, [csvName]);
 
   const proc = useProcessing({ prefix: 'skuc_gen', removeBg: true, tileFit: true, busy });
+
+  const subjectCount = React.useMemo(() => parsePromptList(subjects).length, [subjects]);
+  // How many of the selection could be EDITED rather than re-rolled — the batch dialog's
+  // source choice only means something where an image already exists.
+  const regenEditableCount = items.filter((it) => sel.checked.has(it.id) && it.image).length;
 
   const openItem = items.find((it) => it.id === openId) ?? null;
   const doneCount = items.filter((it) => it.status === 'done' && it.image).length;
@@ -295,23 +324,37 @@ export default function ImageGenerator() {
     return true;
   }
 
-  /** `promptOverride` is one row's edit from its dialog — it never touches the brief. */
+  /**
+   * `promptOverride` is one row's edit from its dialog — it never touches the brief.
+   *
+   * `from` picks which Azure API this call is: 'latest' sends the row's current image WITH the
+   * prompt (the edits endpoint — a refinement of what is on screen), 'original' sends the
+   * prompt alone (generations — a fresh sample). A row with no image has only the second, and
+   * resolvePromptSource settles that per row, so a batch mixing generated and never-run rows
+   * does the right thing for each instead of skipping half of them.
+   */
   async function generateOne(
     item: GenItem,
     signal?: AbortSignal,
     promptOverride?: string,
+    from: PromptSource = 'original',
   ): Promise<boolean> {
-    const prompt = promptOverride?.trim() || buildRowPrompt(brief, headers, item.record, excludedSet);
+    const prompt = promptOverride?.trim() || promptForRef.current(item);
     if (isPromptEmpty(prompt)) {
       patchItem(item.id, { status: 'error', errorMsg: 'Nothing to send — no brief and no included columns' });
       return false;
     }
+    const editing = resolvePromptSource(from, { hasLatest: !!item.image, hasOriginal: true }) === 'latest';
     patchItem(item.id, { status: 'generating', errorMsg: undefined });
     const started = performance.now();
     try {
       const image = mock
         ? await mockGenerate(prompt, 1024, signal)
-        : await callAzureGenerate(prompt, { endpoint, apiKey: azureKey, size, signal });
+        : editing
+          // The size the set is being generated at, not 'auto': the input is already that
+          // shape, and letting the model re-pick would break a row out of the set.
+          ? await callAzure([item.image!], { endpoint, apiKey: azureKey, prompt, size, signal })
+          : await callAzureGenerate(prompt, { endpoint, apiKey: azureKey, size, signal });
       patchItem(item.id, {
         status: 'done',
         image,
@@ -342,7 +385,7 @@ export default function ImageGenerator() {
 
   /** One run over `todo` — Generate-all and Regenerate-selected share everything but the verb. */
   /** `promptOverride` is the selection's one-off wording from the batch dialog. */
-  async function runBatch(todo: GenItem[], verb: string, promptOverride?: string) {
+  async function runBatch(todo: GenItem[], verb: string, promptOverride?: string, from?: PromptSource) {
     const controller = new AbortController();
     genAbortRef.current = controller;
     setRunning(true);
@@ -361,7 +404,7 @@ export default function ImageGenerator() {
           finished++;
           return;
         }
-        if (await generateOne(item, controller.signal, promptOverride)) ok++;
+        if (await generateOne(item, controller.signal, promptOverride, from)) ok++;
         finished++;
         const left = eta.remaining(finished, todo.length);
         setProgress({
@@ -380,16 +423,17 @@ export default function ImageGenerator() {
     }
   }
 
-  async function handleRegenerate(id: number, promptOverride?: string) {
+  async function handleRegenerate(id: number, promptOverride?: string, from?: PromptSource) {
     if (busy || !guards()) return;
     const item = itemsRef.current.find((it) => it.id === id);
     if (!item) return;
+    const hadImage = !!item.image;
     const controller = new AbortController();
     genAbortRef.current = controller;
     setRunning(true);
     setProgress({ pct: 50, text: `Regenerating ${item.name}…` });
     try {
-      const ok = await generateOne(item, controller.signal, promptOverride);
+      const ok = await generateOne(item, controller.signal, promptOverride, from);
       setProgress({
         pct: 100,
         text: controller.signal.aborted
@@ -398,21 +442,48 @@ export default function ImageGenerator() {
             ? `${item.name} regenerated.`
             : `${item.name} failed.`,
       });
+      // The dialog's own Undo button covers this row while the dialog is open; the toast is
+      // what makes the undo reachable after it closes — which is when a replaced image is
+      // most likely to be missed, with the grid showing the new one and no way back to the
+      // old but reopening the cell. Same offer the batch path makes, one row wide.
+      //
+      // Keyed off the PRE-RUN snapshot, not itemsRef: generateOne's patch lands a render
+      // later than this await resolves, so reading the item back here finds the row without
+      // its undo slot and the toast never shows. An image before the run is exactly the
+      // condition under which generateOne fills `prev`, so the snapshot answers it directly.
+      if (ok && hadImage) {
+        toast.success(`${item.name} regenerated`, {
+          action: { label: 'Undo', onClick: () => undoItem(id) },
+        });
+      }
     } finally {
       genAbortRef.current = null;
       setRunning(false);
     }
   }
 
+  /**
+   * Deleting cells. On a list-driven run the box is the queue, so the lines go with the rows —
+   * leaving them behind would type the deleted row straight back on the next keystroke. The
+   * text is rewritten canonically numbered, which is the same shape the editor maintains.
+   */
+  function dropItems(gone: ReadonlySet<number>) {
+    const kept = itemsRef.current.filter((it) => !gone.has(it.id));
+    setItems(kept);
+    if (!csvName) {
+      setSubjects(formatPromptList(kept.map((it) => it.subject ?? '').filter(Boolean)));
+    }
+  }
+
   function handleRemove(id: number) {
-    setItems((prev) => prev.filter((it) => it.id !== id));
+    dropItems(new Set([id]));
     setOpenId((prev) => (prev === id ? null : prev));
   }
 
   // ---- Selection ---------------------------------------------------------
 
   function deleteSelected() {
-    setItems((prev) => prev.filter((it) => !sel.checked.has(it.id)));
+    dropItems(sel.checked);
     setOpenId((prev) => (prev !== null && sel.checked.has(prev) ? null : prev));
     sel.clear();
   }
@@ -431,11 +502,11 @@ export default function ImageGenerator() {
     });
   }
 
-  async function handleRegenerateSelected(promptOverride: string) {
+  async function handleRegenerateSelected(promptOverride: string, from: PromptSource) {
     if (busy || !guards()) return;
     const todo = itemsRef.current.filter((it) => sel.checked.has(it.id));
     if (!todo.length) return;
-    await runBatch(todo, 'regenerated', promptOverride);
+    await runBatch(todo, 'regenerated', promptOverride, from);
     const undoable = todo.filter((it) => itemsRef.current.find((n) => n.id === it.id)?.prev);
     if (undoable.length) {
       toast.success(`${undoable.length} regenerated`, {
@@ -448,6 +519,7 @@ export default function ImageGenerator() {
   function clearAll() {
     genAbortRef.current?.abort();
     setItems([]);
+    setSubjects('');
     sel.clear();
     setOpenId(null);
     setCsvName(null);
@@ -456,6 +528,23 @@ export default function ImageGenerator() {
     setNameCol('');
     setExcluded([]);
     setProgress(null);
+  }
+
+  /**
+   * Just the sheet. The typed list was never destroyed when the CSV took over the queue, so
+   * dropping the sheet hands the rows back to it rather than emptying the canvas.
+   */
+  function clearCsv() {
+    genAbortRef.current?.abort();
+    sel.clear();
+    setOpenId(null);
+    setCsvName(null);
+    setHeaders([]);
+    setRecords([]);
+    setNameCol('');
+    setExcluded([]);
+    setProgress(null);
+    setItems(reconcileSubjectItems(parsePromptList(subjects), []));
   }
 
   // ---- Export ------------------------------------------------------------
@@ -550,7 +639,11 @@ export default function ImageGenerator() {
               product="Generate"
               chips={
                 [
-                  items.length > 0 && { label: `${items.length} row${items.length === 1 ? '' : 's'}` },
+                  items.length > 0 && {
+                    label: csvName
+                      ? `${items.length} row${items.length === 1 ? '' : 's'}`
+                      : `${items.length} prompt${items.length === 1 ? '' : 's'}`,
+                  },
                   doneCount > 0 && { label: `${doneCount} generated` },
                   briefLabel !== null && {
                     label: brief.trim() ? 'brief loaded' : 'brief empty',
@@ -561,19 +654,26 @@ export default function ImageGenerator() {
             />
           }
         >
-          <PanelSection title="Input" hint={<>One image per CSV row. Each prompt is the brief followed by that row&rsquo;s
-                fields, labelled with their column names.</>}>
+          <PanelSection
+            title="Input"
+            hint={csvName
+              ? <>One image per CSV row. Each prompt is the brief followed by that row&rsquo;s
+                fields, labelled with their column names.</>
+              : <>One image per prompt. Each is sent with the brief above it — so a run is one
+                skill applied to many subjects.</>}
+          >
             <div className="space-y-3">
               {/* Loaded CSV as the suite's file card, matching the brief tile below: click to
-                  replace, ✕ to remove. Rows (and their generated images) leave with the sheet,
-                  so removal goes through the same confirm copy as Clear all — the brief stays. */}
-              {csvName && (
+                  replace, ✕ to remove. The sheet outranks the typed list while it is here, so
+                  removing it hands the rows back to whatever is still in the box rather than
+                  emptying the run — which is why this no longer goes through Clear all. */}
+              {csvName ? (
                 <CsvFileTile
                   name={csvName}
                   description={headers.join(', ')}
                   badge={`${records.length.toLocaleString()} row${records.length === 1 ? '' : 's'}`}
                   onReplace={(file) => handleFiles([file])}
-                  onRemove={clearAll}
+                  onRemove={clearCsv}
                   disabled={busy}
                   removeConfirm={{
                     title: 'Remove the CSV?',
@@ -581,41 +681,104 @@ export default function ImageGenerator() {
                       <>
                         Clears all {items.length} row{items.length === 1 ? '' : 's'}
                         {doneCount > 0 && <> and the {doneCount} generated image{doneCount === 1 ? '' : 's'} (not exported anywhere yet)</>}
+                        {subjectCount > 0
+                          ? <>, and the run goes back to the {subjectCount} typed prompt{subjectCount === 1 ? '' : 's'} still in the box</>
+                          : null}
                         . The brief stays loaded; your CSV file on disk is untouched — drop it
                         again to rebuild the rows.
                       </>
                     ),
                   }}
                 />
+              ) : (
+                <Field>
+                  <FieldLabel htmlFor="gen-subjects">Prompts</FieldLabel>
+                  <PromptListInput
+                    id="gen-subjects"
+                    value={subjects}
+                    onChange={applySubjects}
+                    disabled={busy}
+                  />
+                </Field>
+              )}
+              {/* The canvas drop target only exists while the run is empty, and the typed list
+                  fills it on the first keystroke — so without this, typing a prompt would take
+                  the CSV route off the screen with no way back to it. */}
+              {!csvName && (
+                <DropzoneShell
+                  accept=".csv,text/csv"
+                  disabled={busy}
+                  onFiles={handleFiles}
+                  className="gap-1 border py-3 text-xs"
+                >
+                  <span className="flex items-center gap-1.5">
+                    <FileSpreadsheetIcon className="size-4 shrink-0 text-muted-foreground" />
+                    <span>
+                      Or drop a CSV, or{' '}
+                      <span className="text-primary underline underline-offset-2">browse</span>
+                    </span>
+                  </span>
+                  <span className="text-muted-foreground">
+                    Every row becomes one image and takes over from the list.
+                  </span>
+                </DropzoneShell>
+              )}
+              {/* Typed prompts are not thrown away by a CSV, so say where they went. */}
+              {csvName && subjectCount > 0 && (
+                <p className="text-xs text-muted-foreground">
+                  {subjectCount} typed prompt{subjectCount === 1 ? ' is' : 's are'} held aside
+                  while the CSV drives this run.
+                </p>
               )}
             </div>
           </PanelSection>
 
           <PanelSection title="Brief" hint="Leads every row's prompt. Drop a .md file or pick a saved skill; skills are managed in Settings.">
-            {/* Same .md tile as the BG Remover's prompt: the brief is configuration, so the
-                panel shows the file card and editing happens in the modal below. Always
-                visible so a brief can start from a skill without dropping a file.
+            <div className="space-y-3">
+              {/* Same .md tile as the BG Remover's prompt: the brief is configuration, so the
+                  panel shows the file card and editing happens in the modal below. Always
+                  visible so a brief can start from a skill without dropping a file.
 
-                No `badge`: a character count is not a thing anyone acts on, and it crowded out
-                the skill's tag, which is. The tile falls back to "Edited" when the brief
-                matches no saved skill — the one state it cannot show any other way. The length
-                that DOES matter is the prompt-too-long warning under the columns picker. */}
-            <MdFileTile
-              name={briefLabel ?? 'brief.md'}
-              text={brief}
-              onClick={() => setBriefEditorOpen(true)}
-              disabled={busy}
-              skills={{
-                list: skills,
-                activeId: briefSkillId,
-                onSelect: (sk) => {
-                  setBrief(sk.content);
-                  // A skill is not a dropped file: the tile derives its name from the live
-                  // match instead, so a rename in Settings can never leave a stale title.
-                  setBriefName(null);
-                },
-              }}
-            />
+                  No `badge`: a character count is not a thing anyone acts on, and it crowded out
+                  the skill's tag, which is. The tile falls back to "Edited" when the brief
+                  matches no saved skill — the one state it cannot show any other way. The length
+                  that DOES matter is the prompt-too-long warning under the columns picker. */}
+              <MdFileTile
+                name={briefLabel ?? 'brief.md'}
+                text={brief}
+                onClick={() => setBriefEditorOpen(true)}
+                disabled={busy}
+                skills={{
+                  list: skills,
+                  activeId: briefSkillId,
+                  onSelect: (sk) => {
+                    setBrief(sk.content);
+                    // A skill is not a dropped file: the tile derives its name from the live
+                    // match instead, so a rename in Settings can never leave a stale title.
+                    setBriefName(null);
+                  },
+                }}
+              />
+              {/* Output size rides with the brief instead of a "Model" section of its own: one
+                  dropdown never justified a heading, and the shape asked for is part of the same
+                  instruction the brief is. The suite-wide knobs it used to sit beside — quality,
+                  parallel requests, the request budget — are in Settings → Image model. */}
+              <Field>
+                <FieldLabel htmlFor="gen-size">Output size</FieldLabel>
+                <Select value={size} onValueChange={(v) => setSize(String(v ?? '1024x1024') as GenSize)} disabled={busy}>
+                  <SelectTrigger id="gen-size">
+                    <SelectValue>{(v) => String(v ?? '1024x1024')}</SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {GEN_SIZES.map((s) => <SelectItem key={s} value={s}>{s}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+                <FieldDescription>
+                  With no input image to follow, &ldquo;auto&rdquo; lets the model choose the
+                  shape — pick a size for a consistent set.
+                </FieldDescription>
+              </Field>
+            </div>
           </PanelSection>
 
           {headers.length > 0 && (
@@ -663,29 +826,6 @@ export default function ImageGenerator() {
                 </FieldGroup>
               </PanelSection>
           )}
-
-          <PanelSection title="Model" hint={<>Calls Azure GPT-Image&rsquo;s generations endpoint. Credentials live in
-                Settings — the gear at the bottom of the rail.</>}>
-              <FieldGroup className="gap-4">
-                <Field>
-                  <FieldLabel htmlFor="gen-size">Size</FieldLabel>
-                  <Select value={size} onValueChange={(v) => setSize(String(v ?? '1024x1024') as GenSize)} disabled={busy}>
-                    <SelectTrigger id="gen-size">
-                      <SelectValue>{(v) => String(v ?? '1024x1024')}</SelectValue>
-                    </SelectTrigger>
-                    <SelectContent>
-                      {SIZES.map((s) => <SelectItem key={s} value={s}>{s}</SelectItem>)}
-                    </SelectContent>
-                  </Select>
-                  <FieldDescription>
-                    With no input image to follow, &ldquo;auto&rdquo; lets the model choose the
-                    shape — pick a size for a consistent set.
-                  </FieldDescription>
-                </Field>
-                {/* Quality and parallel requests moved to Settings → Image model — both are
-                    suite-wide knobs now (lib/quality.ts, lib/rate.ts). */}
-              </FieldGroup>
-            </PanelSection>
         </LeftPanel>
 
         <Canvas scrollRef={resultScrollRef}>
@@ -698,8 +838,8 @@ export default function ImageGenerator() {
           {items.length === 0 ? (
             <CanvasDropzone
               icon={<UploadCloudIcon />}
-              title="Drop a brief and a CSV to start"
-              description="Every row becomes one image, prompted with the brief plus that row's own columns."
+              title="Type your prompts, or drop a CSV"
+              description="Write what to generate in the panel — number the lines for one image each — or drop a CSV and let every row become an image. Either way the brief leads the prompt."
               accept=".md,.markdown,.txt,.csv,text/csv,text/markdown"
               multiple
               onFiles={handleFiles}
@@ -711,7 +851,7 @@ export default function ImageGenerator() {
                 <span className="text-xs text-muted-foreground">
                   {sel.active
                     ? `${sel.checked.size} of ${items.length} selected`
-                    : `${items.length} row${items.length === 1 ? '' : 's'}${doneCount ? ` · ${doneCount} generated` : ''}`}
+                    : `${items.length} ${csvName ? 'row' : 'prompt'}${items.length === 1 ? '' : 's'}${doneCount ? ` · ${doneCount} generated` : ''}`}
                 </span>
                 <ClearAllButton
                   title="Clear this run?"
@@ -730,6 +870,7 @@ export default function ImageGenerator() {
               <GenGrid
                 items={items}
                 promptFor={promptFor}
+                size={size}
                 running={busy}
                 selected={sel.checked}
                 onOpen={setOpenId}
@@ -803,12 +944,25 @@ export default function ImageGenerator() {
         actionLabel="Regenerate"
         busy={busy}
         excludedNote="An edit here replaces the whole prompt for this run — the row's CSV cells are not appended to it."
-        onRun={(p) => void handleRegenerateSelected(p)}
+        source={{
+          // Named for what the cell above calls it, not a synonym invented for this control.
+          latestLabel: 'Generated image',
+          originalLabel: 'Text only',
+          // Offered as soon as ANY selected row has an image to build on; rows without one
+          // resolve to text-only at send time rather than being skipped.
+          hasLatest: regenEditableCount > 0,
+          hasOriginal: true,
+          note: regenEditableCount === sel.checked.size
+            ? 'Sending the image edits what is already there; text only re-runs the prompt from scratch.'
+            : `${regenEditableCount} of ${sel.checked.size} have an image to build on; the rest re-run the prompt from scratch either way.`,
+        }}
+        onRun={(p, from) => void handleRegenerateSelected(p, from)}
       />
 
       <GenDialog
         item={openItem}
         previewPrompt={openItem ? promptFor(openItem) : ''}
+        size={size}
         running={busy}
         onClose={() => setOpenId(null)}
         onRegenerate={handleRegenerate}

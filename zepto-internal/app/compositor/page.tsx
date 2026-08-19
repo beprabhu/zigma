@@ -37,7 +37,7 @@ import { useProcessing } from '@/components/process-panel';
 import { BudgetControls } from '@/components/budget-controls';
 import { MdFileIcon, MdFileTile } from '@/components/md-file-tile';
 
-import { DEFAULT_TEMPLATE, EXPORT_WIDTH, TileTemplate, renderTile, tileToPngBlob } from '@/lib/tile';
+import { DEFAULT_TEMPLATE, EXPORT_SIZE, TileTemplate, renderTile, tileToPngBlob } from '@/lib/tile';
 import {
   CUSTOM_PRESET_ID, DEFAULT_BAND_PRESET_ID, PRESET_TYPES, TILE_PRESETS as TEMPLATE_PRESETS,
   bandPreset, matchPreset, withTileColors,
@@ -58,7 +58,7 @@ import { GridBand, QueueItem, DEFAULT_ENDPOINT, DEFAULT_PROMPT } from '@/lib/typ
 import { usePersistedState } from '@/hooks/use-persisted-state';
 
 const NONE = '__none__';
-/** Figma's export scales. 1x is EXPORT_WIDTH across; the template itself never changes. */
+/** Figma's export scales. 1x fits the tile in an EXPORT_SIZE box; the template never changes. */
 const EXPORT_SCALES = [1, 2, 3];
 // Bounds how many tile canvases encode at once on export; TinyPNG stays narrower (rate limits).
 const ENCODE_CONCURRENCY = 8;
@@ -986,9 +986,12 @@ export default function Compositor() {
   // In grid mode there is no single frame to quote, so the hint speaks for row 1 — the rows
   // differ only in ratio, and the scale is what the control actually sets.
   const exportFrame = (gridMode ? bandPreset(gridBands[0].presetId).template : template).frame;
+  // Same long-side rule renderTile uses, so the quoted size is the size that lands on disk.
+  const exportBox = EXPORT_SIZE * exportScale;
+  const exportLongSide = Math.max(exportFrame.width, exportFrame.height);
   const exportPx = {
-    w: Math.round(EXPORT_WIDTH * exportScale),
-    h: Math.round((EXPORT_WIDTH * exportScale * exportFrame.height) / exportFrame.width),
+    w: Math.round((exportBox * exportFrame.width) / exportLongSide),
+    h: Math.round((exportBox * exportFrame.height) / exportLongSide),
   };
 
   const previewRow = activeItems[0];
@@ -1644,10 +1647,10 @@ export default function Compositor() {
         }}
         source={{
           latestLabel: 'Generated tile',
-          originalLabel: 'Source photos',
+          originalLabel: 'Source images',
           hasLatest: aiEditTargets.length > 0,
           hasOriginal: regenTargets.length > 0,
-          note: 'The tile edits what is already there; the source photos rebuild it from scratch.',
+          note: 'The tile edits what is already there; the source images rebuild it from scratch.',
         }}
         onRun={(p, from) => void handleAiEditSelected(p, from)}
       />

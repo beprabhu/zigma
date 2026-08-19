@@ -3235,8 +3235,11 @@ export default function BgRemover() {
             : undefined;
         })()}
         source={{
-          latestLabel: 'Last AI result',
-          originalLabel: 'Imported image',
+          // Same two words the compare dialog's image panes use. This control used to say
+          // "Last AI result" / "Imported image" for the exact pair the panes above call
+          // "AI edit" / "Original" — one screen, two vocabularies for two pictures.
+          latestLabel: 'AI edit',
+          originalLabel: 'Original',
           // Offered as soon as ANY selected image has an earlier import to go back to; the
           // rest resolve to their only picture at send time rather than being skipped.
           hasLatest: aiEditedSelectedCount > 0,
@@ -3274,10 +3277,10 @@ export default function BgRemover() {
           rowContext: compareItem ? rowContextFor(compareItem) : '',
           source: compareItem
             ? {
-                latestLabel: 'Last AI result',
-                originalLabel: 'Imported image',
+                latestLabel: 'AI edit',
+                originalLabel: 'Original',
                 ...aiSourceChoices(compareItem),
-                note: 'This image has been AI-edited before — the original is the picture it was imported with.',
+                note: 'Original is the picture this row was imported with; AI edit is what the last run produced.',
               }
             : undefined,
           onEdit: (item, prompt, from) => void handleAiEdit(item, prompt, from),

@@ -6,12 +6,42 @@
 
 import type { CsvRecord } from './csv';
 
+/**
+ * The shapes the image endpoints return. Lives here rather than in the page because the results
+ * grid has to reserve the SAME shape the panel is asking for — a square frame around a run of
+ * landscape images letterboxes every one of them.
+ */
+export const GEN_SIZES = ['1024x1024', '1536x1024', '1024x1536', 'auto'] as const;
+export type GenSize = (typeof GEN_SIZES)[number];
+
+/**
+ * The frame a cell reserves for a given output size. Written as literal class names so
+ * Tailwind's scanner still sees them — a class assembled at runtime is never generated.
+ *
+ * 'auto' has no answer to reserve: the model picks per image, and it can pick differently for
+ * two rows of the same run. It keeps the square frame, and object-contain letterboxes whatever
+ * actually lands — which is the honest shape for "unknown until it arrives".
+ */
+export const GEN_ASPECT: Record<GenSize, string> = {
+  '1024x1024': 'aspect-square',
+  '1536x1024': 'aspect-3/2',
+  '1024x1536': 'aspect-2/3',
+  auto: 'aspect-square',
+};
+
 export type GenStatus = 'ready' | 'generating' | 'done' | 'error';
 
 export interface GenItem {
   id: number;
-  /** The CSV row, kept whole so re-mapping columns never needs the file re-read. */
+  /** The CSV row, kept whole so re-mapping columns never needs the file re-read. Empty for a
+   *  typed subject, which has no sheet behind it. */
   record: CsvRecord;
+  /**
+   * One line of the typed prompt list, when that is what made this item. Its presence is what
+   * tells the prompt builder which of the two assembly rules this item follows — a run is
+   * driven by a CSV or by the list, never a mix, so the flag never has to be reconciled.
+   */
+  subject?: string;
   /** Names the tile and the exported file; from the chosen name column. */
   name: string;
   status: GenStatus;
@@ -43,6 +73,43 @@ export function createGenItems(
     status: 'ready',
     image: null,
   }));
+}
+
+/**
+ * The typed list as queue items, reusing the item that already held each subject.
+ *
+ * Matched on the subject TEXT, not position: editing line 3 or inserting a line above it must
+ * not throw away the images lines 1 and 2 already generated. An unmatched line is new and
+ * starts empty, and an item whose line is gone leaves with it.
+ */
+export function reconcileSubjectItems(subjects: string[], existing: GenItem[]): GenItem[] {
+  const spare = new Map<string, GenItem[]>();
+  for (const item of existing) {
+    if (item.subject === undefined) continue;
+    const bucket = spare.get(item.subject);
+    if (bucket) bucket.push(item);
+    else spare.set(item.subject, [item]);
+  }
+  let nextId = nextGenId(existing);
+  return subjects.map((subject, i) => {
+    const reused = spare.get(subject)?.shift();
+    if (reused) return { ...reused, name: subjectName(subject, i) };
+    return {
+      id: nextId++,
+      record: {},
+      subject,
+      name: subjectName(subject, i),
+      status: 'ready' as const,
+      image: null,
+    };
+  });
+}
+
+/** A subject line as a cell title and file stem: its first few words, never the whole prompt. */
+function subjectName(subject: string, index: number): string {
+  const firstLine = subject.split('\n')[0]!.trim();
+  const short = firstLine.length > 48 ? `${firstLine.slice(0, 48).trimEnd()}…` : firstLine;
+  return short || `Prompt ${index + 1}`;
 }
 
 export function nextGenId(items: GenItem[]): number {

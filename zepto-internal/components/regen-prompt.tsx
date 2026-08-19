@@ -60,9 +60,13 @@ export function CopyButton({ text, title }: { text: string; title: string }) {
 export type PromptSource = 'latest' | 'original';
 
 export interface PromptSourceOptions {
-  /** What "latest" is called in this product: "Generated tile", "Last AI result". */
+  /**
+   * What "latest" is called in this product: "Generated tile", "AI edit". Use the product's
+   * OWN name for that picture — the one its compare panes already print above the image —
+   * never a second synonym coined for this control.
+   */
   latestLabel: string;
-  /** What "original" is called: "Source photos", "Imported image". */
+  /** What "original" is called, under the same rule: "Source images", "Original". */
   originalLabel: string;
   /** There is a generated result to send. False locks the choice to the original. */
   hasLatest: boolean;
@@ -108,8 +112,11 @@ function PromptSourcePicker({
           size="sm"
           disabled={disabled}
         >
-          <ToggleGroupItem value="latest">{options.latestLabel}</ToggleGroupItem>
+          {/* Original first, then the result derived from it — the same left-to-right order the
+              compare panes above put them in. Reading order is part of the vocabulary: a toggle
+              that names the same two pictures in the opposite sequence reads as a third pair. */}
           <ToggleGroupItem value="original">{options.originalLabel}</ToggleGroupItem>
+          <ToggleGroupItem value="latest">{options.latestLabel}</ToggleGroupItem>
         </ToggleGroup>
       </div>
       {options.note && <p className="text-[11px] text-muted-foreground">{options.note}</p>}

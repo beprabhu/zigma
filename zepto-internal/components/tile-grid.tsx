@@ -527,10 +527,10 @@ export function TileDialog({
               }
               source={{
                 latestLabel: 'Generated tile',
-                originalLabel: 'Source photos',
+                originalLabel: 'Source images',
                 hasLatest: !!item.resultImage,
                 hasOriginal: item.urls.length > 0,
-                note: 'The tile edits what is already there; the source photos rebuild it from scratch.',
+                note: 'The tile edits what is already there; the source images rebuild it from scratch.',
               }}
               onRegenerate={(p, from) => onRegenerate(item, p, from)}
             />

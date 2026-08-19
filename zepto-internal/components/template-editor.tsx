@@ -55,7 +55,7 @@ const WEIGHTS: [string, string][] = [
 // Ranges are generous rather than tight. They were sized around the original 75x96 frame, where a
 // 400 cap on width was five times the tile; a preset stated at a larger scale lives further out,
 // and a cap that silently rewrites 480 to 400 the first time the field is touched is worse than
-// no cap. Frame units are relative anyway - export is EXPORT_WIDTH-scaled whatever the numbers
+// no cap. Frame units are relative anyway - export fits them in an EXPORT_SIZE box whatever the numbers
 // say - so these exist only to stop a typo becoming a blank canvas.
 const LAYER_PROPS: Record<LayerName, PropDef[]> = {
   frame: [

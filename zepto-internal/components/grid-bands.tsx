@@ -161,74 +161,78 @@ export function BandCard({
 
   return (
     <div className="rounded-lg border bg-card/40 p-3">
-      <div className="mb-3 flex items-center gap-2">
-        <span className="text-sm font-medium">Row {index + 1}</span>
-        <span className="text-xs text-muted-foreground">
-          {band.fileName ? `${tiles} tile${tiles === 1 ? '' : 's'}` : 'no CSV yet'}
-        </span>
-        {/* The last band has nothing to fall back to, so it loses the control rather than
-            offering one that empties the grid. */}
-        {total > 1 && (
-          <AlertDialog>
-            <AlertDialogTrigger
-              render={
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  className="ml-auto"
-                  disabled={disabled}
-                  aria-label={`Remove row ${index + 1}`}
-                />
-              }
-            >
-              <Trash2Icon className="text-muted-foreground" />
-            </AlertDialogTrigger>
-            <AlertDialogContent>
-              <AlertDialogHeader>
-                <AlertDialogTitle>Remove row {index + 1}?</AlertDialogTitle>
-                <AlertDialogDescription>
-                  Drops this row&rsquo;s {tiles} tile{tiles === 1 ? '' : 's'} and its CSV mapping.
-                  The other rows keep theirs, and your CSV file on disk is untouched.
-                </AlertDialogDescription>
-              </AlertDialogHeader>
-              <AlertDialogFooter>
-                <AlertDialogCancel>Cancel</AlertDialogCancel>
-                <AlertDialogAction
-                  onClick={onRemove}
-                  className="bg-destructive text-white hover:bg-destructive/90"
-                >
-                  Remove
-                </AlertDialogAction>
-              </AlertDialogFooter>
-            </AlertDialogContent>
-          </AlertDialog>
-        )}
-      </div>
-
       <FieldGroup className="gap-3">
+        {/* "Row 1" IS the preset field's label. Once tiles and columns moved to the canvas
+            header this card held one control, and a semibold heading, a "Tile preset" label
+            and a select made three stacked lines out of a single question: what shape is this
+            row? The row number labels the select, and the delete sits on the control's line
+            rather than owning a header of its own.
+
+            Dropped with the heading: the "no CSV yet" / "N tiles" chip. It restated the card
+            below it — no CSV means no file tile and no row count here, and the canvas row
+            header prints the filename and tile count in full either way. */}
         <Field>
-          <FieldLabel htmlFor={`band-ratio-${band.id}`}>Tile preset</FieldLabel>
-          <Select
-            value={preset.id}
-            disabled={disabled}
-            onValueChange={(v) => onChange({ presetId: String(v ?? '') })}
-          >
-            <SelectTrigger id={`band-ratio-${band.id}`} className="w-full">
-              <SelectValue>
-                {(v) => BAND_PRESETS.find((p) => p.id === v)?.ratio ?? 'Ratio'}
-              </SelectValue>
-            </SelectTrigger>
-            <SelectContent alignItemWithTrigger={false} sideOffset={4}>
-              {BAND_PRESETS.map((p) => (
-                <SelectItem key={p.id} value={p.id}>{p.ratio}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          <FieldLabel htmlFor={`band-ratio-${band.id}`}>Row {index + 1}</FieldLabel>
+          <div className="flex items-center gap-1.5">
+            <Select
+              value={preset.id}
+              disabled={disabled}
+              onValueChange={(v) => onChange({ presetId: String(v ?? '') })}
+            >
+              <SelectTrigger id={`band-ratio-${band.id}`} className="w-full flex-1">
+                <SelectValue>
+                  {(v) => BAND_PRESETS.find((p) => p.id === v)?.ratio ?? 'Ratio'}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectContent alignItemWithTrigger={false} sideOffset={4}>
+                {BAND_PRESETS.map((p) => (
+                  <SelectItem key={p.id} value={p.id}>{p.ratio}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {/* The last band has nothing to fall back to, so it loses the control rather than
+                offering one that empties the grid. */}
+            {total > 1 && (
+              <AlertDialog>
+                <AlertDialogTrigger
+                  render={
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      className="shrink-0"
+                      disabled={disabled}
+                      aria-label={`Remove row ${index + 1}`}
+                    />
+                  }
+                >
+                  <Trash2Icon className="text-muted-foreground" />
+                </AlertDialogTrigger>
+                <AlertDialogContent>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>Remove row {index + 1}?</AlertDialogTitle>
+                    <AlertDialogDescription>
+                      Drops this row&rsquo;s {tiles} tile{tiles === 1 ? '' : 's'} and its CSV
+                      mapping. The other rows keep theirs, and your CSV file on disk is untouched.
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel>Cancel</AlertDialogCancel>
+                    <AlertDialogAction
+                      onClick={onRemove}
+                      className="bg-destructive text-white hover:bg-destructive/90"
+                    >
+                      Remove
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
+            )}
+          </div>
         </Field>
 
         {/* Tiles and columns used to sit here as two boxed number fields, three panes away
             from the grid they resize. They now ride the canvas row header instead — see
-            RowSizeControls — so the panel is only ever about which sheet feeds this row. */}
+            RowSizeControls — so the panel is only ever about shape and source. */}
         {rows ? (
           <FieldDescription>
             {`${rows.toLocaleString()} row${rows === 1 ? '' : 's'} available.`}

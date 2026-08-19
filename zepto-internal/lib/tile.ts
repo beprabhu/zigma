@@ -98,8 +98,16 @@ export function tileFontsReady(): Promise<void> {
     .then(() => undefined)
     .catch(() => undefined);
 }
-/** Output PNG width at 1×, regardless of the tile's frame units. Multiplied by renderTile's scale. */
-export const EXPORT_WIDTH = 600;
+/**
+ * The square box a tile is exported into at 1×, regardless of its frame units. The tile's LONG
+ * side becomes this many pixels and the short side follows the ratio, so every preset lands
+ * inside the same 600×600 envelope: 1:1 → 600×600, 5:6 → 500×600, 6:5 → 600×500.
+ *
+ * It used to pin the WIDTH instead, which made the box grow downwards for anything taller than
+ * it was wide — the 5:6 banner exported 600×720, half again the area of the square it sits
+ * beside in a grid. Multiplied by renderTile's scale.
+ */
+export const EXPORT_SIZE = 600;
 
 function roundedRectPath(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
   r = Math.min(r, w / 2, h / 2);
@@ -315,15 +323,15 @@ function drawOfferLayer(ctx: CanvasRenderingContext2D, tpl: TileTemplate, opts: 
 }
 
 /**
- * @param scale Export multiplier, Figma-style: 1× is EXPORT_WIDTH across, 3× is three times
- * that. Frame units stay the same — only the pixels the tile is rasterised into change — so a
- * template tuned at 1× needs no adjustment to ship at 3×.
+ * @param scale Export multiplier, Figma-style: 1× fits the tile in an EXPORT_SIZE box, 3× in
+ * three times that. Frame units stay the same — only the pixels the tile is rasterised into
+ * change — so a template tuned at 1× needs no adjustment to ship at 3×.
  */
 export function renderTile(
   canvas: HTMLCanvasElement, opts: TileOpts, tpl: TileTemplate = DEFAULT_TEMPLATE, scale = 1,
 ) {
   const W = tpl.frame.width, H = tpl.frame.height;
-  const S = (EXPORT_WIDTH * scale) / W;
+  const S = (EXPORT_SIZE * scale) / Math.max(W, H);
   canvas.width = Math.round(W * S);
   canvas.height = Math.round(H * S);
   const ctx = canvas.getContext('2d');

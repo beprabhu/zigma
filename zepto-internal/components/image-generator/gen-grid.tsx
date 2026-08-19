@@ -18,10 +18,11 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { Spinner } from '@/components/ui/spinner';
-import { RegenPrompt } from '@/components/regen-prompt';
+import { RegenPrompt, type PromptSource } from '@/components/regen-prompt';
 import { ResultCell } from '@/components/result-cell';
 import { pickSave, saveTo } from '@/lib/bg/batch';
-import { genFileStem, type GenItem, type GenStatus } from '@/lib/gen';
+import { GEN_ASPECT, genFileStem, type GenItem, type GenSize, type GenStatus } from '@/lib/gen';
+import { cn } from '@/lib/utils';
 
 /* eslint-disable @next/next/no-img-element */
 
@@ -43,6 +44,7 @@ export function genStatusLine(item: GenItem): { text: string; error: boolean } {
 const GenCell = React.memo(function GenCell({
   item,
   prompt,
+  size,
   running,
   checked,
   selectionActive,
@@ -53,6 +55,8 @@ const GenCell = React.memo(function GenCell({
   item: GenItem;
   /** Live preview of what this row would send; the sent prompt wins once it exists. */
   prompt: string;
+  /** The panel's output size — the cell reserves that shape before anything is generated. */
+  size: GenSize;
   running: boolean;
   checked: boolean;
   selectionActive: boolean;
@@ -72,7 +76,12 @@ const GenCell = React.memo(function GenCell({
       onRemove={() => onRemove(item.id)}
       removeDisabled={running}
     >
-      <div className="relative grid aspect-square place-items-center overflow-hidden rounded-lg border bg-muted/30 p-2">
+      {/* The frame follows the panel's output size, so a landscape run reads as landscape
+          cells before a single image exists — and the prompt sitting in an empty cell is
+          already occupying the space its image will. Changing the size re-shapes the whole
+          grid, including rows already generated: object-contain letterboxes those rather than
+          distorting them, which is the visible signal that they came from a different shape. */}
+      <div className={cn('relative grid place-items-center overflow-hidden rounded-lg border bg-muted/30 p-2', GEN_ASPECT[size])}>
         {src ? (
           <img src={src} alt="" className="max-h-full max-w-full min-h-0 min-w-0 object-contain" />
         ) : (
@@ -94,6 +103,7 @@ const GenCell = React.memo(function GenCell({
 export function GenGrid({
   items,
   promptFor,
+  size,
   running,
   selected,
   onOpen,
@@ -102,6 +112,7 @@ export function GenGrid({
 }: {
   items: GenItem[];
   promptFor: (item: GenItem) => string;
+  size: GenSize;
   running: boolean;
   selected: ReadonlySet<number>;
   onOpen: (id: number) => void;
@@ -115,6 +126,7 @@ export function GenGrid({
           key={item.id}
           item={item}
           prompt={promptFor(item)}
+          size={size}
           running={running}
           checked={selected.has(item.id)}
           selectionActive={selected.size > 0}
@@ -135,6 +147,7 @@ export function GenGrid({
 export function GenDialog({
   item,
   previewPrompt,
+  size,
   running,
   onClose,
   onRegenerate,
@@ -142,9 +155,10 @@ export function GenDialog({
 }: {
   item: GenItem | null;
   previewPrompt: string;
+  size: GenSize;
   running: boolean;
   onClose: () => void;
-  onRegenerate: (id: number, promptOverride?: string) => void;
+  onRegenerate: (id: number, promptOverride?: string, from?: PromptSource) => void;
   /** Restores the result the last regenerate replaced. Shown only while item.prev exists. */
   onUndo: (id: number) => void;
 }) {
@@ -182,7 +196,7 @@ export function GenDialog({
                 Cleanup put theirs. */}
             <div className="mx-auto w-full max-w-sm space-y-1.5">
               <div className="text-xs font-medium text-muted-foreground">Generated image</div>
-              <div className="grid aspect-square place-items-center overflow-hidden rounded-lg border bg-muted/30 p-2">
+              <div className={cn('grid place-items-center overflow-hidden rounded-lg border bg-muted/30 p-2', GEN_ASPECT[size])}>
                 {item.image ? (
                   <img
                     src={item.image.src}
@@ -198,6 +212,10 @@ export function GenDialog({
             </div>
 
             {/* Keyed by row: a prompt tweaked for one image never opens on the next. */}
+            {/* Generate is the one product where the two sources are not two pictures: this row
+                has no input image, only whatever it produced last. So the choice is edit that
+                result, or re-run the prompt with no image at all — and the picker hides itself
+                on a row that has never generated, where only the second exists. */}
             <RegenPrompt
               key={item.id}
               defaultPrompt={previewPrompt}
@@ -205,7 +223,14 @@ export function GenDialog({
               busy={running}
               working={item.status === 'generating'}
               hint="Send this row to Azure again"
-              onRegenerate={(p) => onRegenerate(item.id, p)}
+              source={{
+                latestLabel: 'Generated image',
+                originalLabel: 'Text only',
+                hasLatest: !!item.image,
+                hasOriginal: true,
+                note: 'The image is sent to be edited; text only re-runs the prompt from scratch.',
+              }}
+              onRegenerate={(p, from) => onRegenerate(item.id, p, from)}
             />
 
             <DialogFooter className="flex-wrap gap-2">

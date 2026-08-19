@@ -42,7 +42,7 @@ export const CUSTOM_PRESET_ID = 'custom';
 
 /**
  * A frame that is ONLY an image container: full-bleed cover image, title and offer hidden.
- * Frame units just set the ratio — the exported pixel size is EXPORT_WIDTH-scaled as usual.
+ * Frame units just set the ratio — the export fits them in an EXPORT_SIZE box as usual.
  */
 function imageOnly(width: number, height: number): TileTemplate {
   return {
@@ -57,7 +57,7 @@ function imageOnly(width: number, height: number): TileTemplate {
 /**
  * The banner tile, as tuned on the 1:1 preset. All three ratios share this vertical design and
  * differ only in width, so the numbers here are stated once at the square's 100×100 and the
- * ratio supplies the rest. Frame units are relative — export is EXPORT_WIDTH-scaled whatever
+ * ratio supplies the rest. Frame units are relative — export is EXPORT_SIZE-boxed whatever
  * they say — so 100 is simply the least noisy space to state them in.
  *
  * `image.bottom` of 20 places the image directly under a ONE-line title (title y 8 + lineHeight

@@ -10,6 +10,9 @@ import type { CsvRecord } from './csv';
 /** Generate's separator line. Visible in its preview, so it is part of that product's API. */
 export const ROW_HEADING = 'Generate an image for this row:';
 
+/** The same line for a typed subject rather than a CSV row. */
+export const SUBJECT_HEADING = 'Generate an image of:';
+
 /**
  * base prompt + the row's cells, each labelled with its column header.
  *
@@ -42,6 +45,22 @@ export function buildRowPrompt(
   if (trimmedBase) parts.push(trimmedBase);
   if (rowBlock) parts.push(`---\n${heading}\n${rowBlock}`);
   return parts.join('\n\n');
+}
+
+/**
+ * base prompt + one typed subject — the list box's equivalent of buildRowPrompt.
+ *
+ * Same shape as a row's prompt (base, rule, then the specific thing) so a subject and a CSV row
+ * reach the model through the same structure, and the assembled string a cell shows reads the
+ * same whichever source it came from. With no base, the subject IS the prompt: the separator
+ * would otherwise open a section with nothing above it.
+ */
+export function buildSubjectPrompt(base: string, subject: string): string {
+  const trimmedBase = base.trim();
+  const trimmedSubject = subject.trim();
+  if (!trimmedBase) return trimmedSubject;
+  if (!trimmedSubject) return trimmedBase;
+  return `${trimmedBase}\n\n---\n${SUBJECT_HEADING}\n${trimmedSubject}`;
 }
 
 /** Rows with nothing to say produce nothing to send — caught before a request is spent. */
