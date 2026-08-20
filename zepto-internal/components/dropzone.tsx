@@ -7,7 +7,9 @@
 // + bg-accent on drag, focus ring); callers supply only their copy as children.
 
 import * as React from 'react';
+import { FolderOpenIcon } from 'lucide-react';
 
+import { filesFromDataTransfer, sortByPath } from '@/lib/drop';
 import { cn } from '@/lib/utils';
 
 export function DropzoneShell({
@@ -48,11 +50,19 @@ export function DropzoneShell({
       }}
       onDragLeave={() => setDrag(false)}
       onDrop={(e) => {
+        // preventDefault is also the SIGNAL to any window-level drop handler that this zone has
+        // taken the drop — they check defaultPrevented and stand down. Deliberately not
+        // stopPropagation: the window listener still needs to see the event to clear its own
+        // drag highlight, which would otherwise stay stuck on after every drop onto a zone.
         e.preventDefault();
         setDrag(false);
         if (disabled) return;
-        const files = [...(e.dataTransfer.files ?? [])];
-        if (files.length) onFiles(files);
+        // Folder-aware: a dropped DIRECTORY is invisible to dataTransfer.files, so the entry
+        // tree is walked instead (lib/drop.ts). The DataTransfer must be handed over before
+        // this handler returns — the util reads the item list synchronously for that reason.
+        void filesFromDataTransfer(e.dataTransfer).then((files) => {
+          if (files.length) onFiles(files);
+        });
       }}
       className={cn(
         'flex cursor-pointer flex-col items-center gap-2 rounded-lg border-2 border-dashed border-border px-3 py-6 text-center text-sm text-muted-foreground transition-colors outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50',
@@ -98,6 +108,7 @@ export function CanvasDropzone({
   multiple = false,
   disabled = false,
   className,
+  children,
 }: {
   icon: React.ReactNode;
   title: React.ReactNode;
@@ -107,6 +118,8 @@ export function CanvasDropzone({
   multiple?: boolean;
   disabled?: boolean;
   className?: string;
+  /** Extra controls under the copy — a folder picker, say. Must stop their own clicks. */
+  children?: React.ReactNode;
 }) {
   return (
     <DropzoneShell
@@ -123,6 +136,72 @@ export function CanvasDropzone({
       </div>
       <div className="text-sm font-medium text-foreground">{title}</div>
       {description && <div className="max-w-sm text-sm text-muted-foreground">{description}</div>}
+      {children}
     </DropzoneShell>
+  );
+}
+
+/**
+ * "Add folder", for callers whose dropzone should also accept a directory by BROWSING.
+ *
+ * A file input cannot offer files and folders at once — `webkitdirectory` turns the picker into
+ * a folder picker outright — so opting into folders means a second input and a second control.
+ * Dropping a folder needs none of this; DropzoneShell walks the entry tree already.
+ *
+ * Sits inside a DropzoneShell, whose whole box is a browse button, so the click must not bubble
+ * or picking a folder would open the file picker behind it.
+ */
+export function FolderInputButton({
+  onFiles,
+  disabled = false,
+  className,
+  children = 'Add folder',
+}: {
+  onFiles: (files: File[]) => void;
+  disabled?: boolean;
+  className?: string;
+  children?: React.ReactNode;
+}) {
+  const inputRef = React.useRef<HTMLInputElement>(null);
+
+  // webkitdirectory/directory are not in React's attribute types; setting them on the node
+  // keeps this free of an `any` cast.
+  React.useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.setAttribute('webkitdirectory', '');
+    el.setAttribute('directory', '');
+  }, []);
+
+  return (
+    <>
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={(e) => {
+          e.stopPropagation();
+          inputRef.current?.click();
+        }}
+        className={cn(
+          'inline-flex items-center gap-1.5 rounded-md px-1.5 py-0.5 text-primary underline underline-offset-2 outline-none transition-colors hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:opacity-50',
+          className,
+        )}
+      >
+        <FolderOpenIcon className="size-3.5 shrink-0" aria-hidden />
+        {children}
+      </button>
+      <input
+        ref={inputRef}
+        type="file"
+        multiple
+        hidden
+        onClick={(e) => e.stopPropagation()}
+        onChange={(e) => {
+          const files = sortByPath([...(e.target.files ?? [])]);
+          e.target.value = '';
+          if (files.length) onFiles(files);
+        }}
+      />
+    </>
   );
 }

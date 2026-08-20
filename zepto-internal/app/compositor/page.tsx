@@ -3,8 +3,8 @@
 import * as React from 'react';
 import { toast } from 'sonner';
 import {
-  CircleStopIcon, DownloadIcon, FileSpreadsheetIcon, PlusIcon, RefreshCwIcon, SparklesIcon,
-  WandSparklesIcon,
+  CircleStopIcon, DownloadIcon, FileSpreadsheetIcon, ImagesIcon, PlusIcon, RefreshCwIcon,
+  SparklesIcon, WandSparklesIcon,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Hint } from '@/components/hint';
@@ -13,6 +13,7 @@ import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog';
 import { Field, FieldContent, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field';
+import { Item, ItemActions, ItemContent, ItemDescription, ItemMedia, ItemTitle } from '@/components/ui/item';
 import { Input } from '@/components/ui/input';
 import { Progress } from '@/components/ui/progress';
 import {
@@ -27,7 +28,7 @@ import { TemplateEditor } from '@/components/template-editor';
 import { BatchPromptDialog, resolvePromptSource, type PromptSource } from '@/components/regen-prompt';
 import { ColumnPicker } from '@/components/column-picker';
 import { CsvFileTile } from '@/components/csv-dropzone';
-import { CanvasDropzone, DropzoneShell } from '@/components/dropzone';
+import { CanvasDropzone, DropzoneShell, FolderInputButton } from '@/components/dropzone';
 import { BandCard, RowSizeControls } from '@/components/grid-bands';
 import { SessionHeader, type SessionChip } from '@/components/session-header';
 import { TileGrid, TileGridSkeleton, TileDialog, tileOptsFor } from '@/components/tile-grid';
@@ -43,6 +44,8 @@ import {
   bandPreset, matchPreset, withTileColors,
 } from '@/lib/tile-presets';
 import { parseCSV, detectImageColumns, detectTitleColumn, detectOfferColumn, CsvRecord } from '@/lib/csv';
+import { normalizeHeicFiles } from '@/lib/bg/heic';
+import { filesFromDataTransfer } from '@/lib/drop';
 import { buildZipStream, ZipStreamEntry } from '@/lib/zip';
 import { createEta } from '@/lib/eta';
 import { matchSkill, useSkills } from '@/lib/skills';
@@ -50,7 +53,10 @@ import { loadImageFromUrl, callAzure, mockComposite } from '@/lib/pipeline';
 import {
   BG_MODELS, BG_MODEL_ORDER, DEFAULT_MODEL_ID, probeServerModel, removeBackground, type BgModelId,
 } from '@/lib/bg/engine';
-import { isAbortError, mapWithLimit, pickSave, releaseCanvas, saveTo } from '@/lib/bg/batch';
+import {
+  isAbortError, isCsvFile, isImageFile, mapWithLimit, pickSave, releaseCanvas, saveTo,
+  stripExtension,
+} from '@/lib/bg/batch';
 import { readParallel } from '@/lib/rate';
 import { describeBudget, fitToBudget, type BudgetResult } from '@/lib/bg/budget';
 import { isPng8Supported } from '@/lib/bg/png8';
@@ -201,6 +207,15 @@ export default function Compositor() {
 
   // Queue / run state
   const [items, setItems] = React.useState<QueueItem[]>([]);
+  /**
+   * What this run is fed by, decided by whatever landed FIRST and held until Clear.
+   *
+   * The two sources are not mixable: a CSV row is a record with mapped columns behind it, an
+   * image row is a file with nothing behind it but its name. Letting both into one queue would
+   * mean a Columns panel that maps half the rows and an export that numbers them from two
+   * different origins. So the first drop picks, and the other kind is refused out loud.
+   */
+  const [mode, setMode] = React.useState<'csv' | 'images' | null>(null);
   const [running, setRunning] = React.useState(false);
   const [progress, setProgress] = React.useState<{ pct: number; text: string } | null>(null);
   const [compressSummary, setCompressSummary] = React.useState('');
@@ -219,6 +234,11 @@ export default function Compositor() {
   const activeItems = React.useMemo(
     () => items.filter((it) => (gridMode ? !!it.bandId : !it.bandId)),
     [items, gridMode],
+  );
+
+  const imageItemCount = React.useMemo(
+    () => activeItems.filter((it) => it.localSources?.length).length,
+    [activeItems],
   );
 
   const itemIds = React.useMemo(() => activeItems.map((it) => it.id), [activeItems]);
@@ -262,9 +282,143 @@ export default function Compositor() {
       setImageCols(imgCols);
       setTitleCol(tCol);
       setOfferCol(oCol);
+      setMode('csv');
       setItems(buildQueue(records, imgCols, tCol, oCol));
     };
     reader.readAsText(file);
+  }
+
+  // ---- Images ----
+
+  /**
+   * A run fed by files. Rows carry the file itself instead of a URL to fetch, and everything
+   * a sheet would have supplied is absent: no record, no offer, and a title taken from the
+   * file name — which is also what names the tile in the export ZIP.
+   */
+  function buildImageQueue(files: File[], rowStart: number): QueueItem[] {
+    return files.map((file, i) => ({
+      id: nextItemId.current++,
+      row: rowStart + i,
+      record: {},
+      urls: [],
+      localSources: [{ name: file.name, url: URL.createObjectURL(file) }],
+      title: stripExtension(file.name),
+      offer: '',
+      status: 'ready' as const,
+      resultImage: null,
+      compressed: null,
+    }));
+  }
+
+  /** The folder a dropped set came from, when it came from one — a nicer run name than a file. */
+  function folderNameOf(files: File[]): string {
+    const segments = files[0]?.webkitRelativePath?.split('/') ?? [];
+    return segments.length > 1 ? segments[0] : '';
+  }
+
+  async function handleImageFiles(files: File[]) {
+    const picked = files.filter(isImageFile);
+    if (!picked.length) { toast.error('No images in that drop.'); return; }
+    // HEIC cannot be decoded by canvas; convert before anything counts it as loaded, the same
+    // way Cleanup's dropzone does.
+    const usable = await normalizeHeicFiles(picked, (file, e) =>
+      toast.error(`Could not convert ${file.name}: ${(e as Error).message}`));
+    if (!usable.length) return;
+    const folder = folderNameOf(usable);
+    setSessionName((prev) => (prev.trim() ? prev : folder || 'Images'));
+    setMode('images');
+    setItems((prev) => {
+      // Row numbers continue from what is already queued — a second folder appends, it does
+      // not restart at 1 and collide with the first in the ZIP.
+      const rowStart = prev.filter((it) => !it.bandId).length + 1;
+      return [...prev, ...buildImageQueue(usable, rowStart)];
+    });
+  }
+
+  /**
+   * Every drop and browse in single-template mode. The FIRST usable file decides what this run
+   * is; after that the other kind is refused rather than silently dropped, because "I dragged
+   * images onto my CSV run and nothing happened" is indistinguishable from a broken dropzone.
+   */
+  function handleDrop(files: File[]) {
+    const csv = files.find(isCsvFile) ?? null;
+    const images = files.filter(isImageFile);
+    if (!csv && !images.length) { toast.error('Drop a CSV or image files.'); return; }
+    const kind = mode ?? (csv ? 'csv' : 'images');
+    if (kind === 'csv') {
+      if (!csv) {
+        toast.error('This run is driven by a CSV. Remove it to start from images instead.');
+        return;
+      }
+      if (images.length) {
+        toast.info(`Loaded ${csv.name} — the ${images.length} dropped image${images.length === 1 ? ' was' : 's were'} ignored.`);
+      }
+      handleFile(csv);
+      return;
+    }
+    if (csv) {
+      toast.error('This run is driven by images. Clear it to start from a CSV instead.');
+      return;
+    }
+    void handleImageFiles(images);
+  }
+
+  // handleDrop closes over `mode`, and re-binding a window listener on every render to keep up
+  // is noise; the ref is read at drop time so the listener never goes stale.
+  const handleDropRef = React.useRef(handleDrop);
+  React.useEffect(() => { handleDropRef.current = handleDrop; });
+
+  const [pageDrag, setPageDrag] = React.useState(false);
+
+  /**
+   * Drop anywhere on the page, not only on the empty canvas. Once the first tiles exist the
+   * canvas dropzone is gone, and a file dropped on the page would be handled by the BROWSER —
+   * which navigates away and takes the whole run with it. Cleanup binds drops the same way.
+   *
+   * Grid mode is excluded deliberately: there, a sheet belongs to one band, and a drop on the
+   * page cannot say which row it was meant for. Those bands keep their own zones.
+   */
+  React.useEffect(() => {
+    if (running || gridMode) return;
+    const hasFiles = (e: DragEvent) => !!e.dataTransfer?.types.includes('Files');
+    const onDragOver = (e: DragEvent) => {
+      if (!hasFiles(e)) return;
+      // A dropzone under the pointer has already claimed this hover (it calls preventDefault),
+      // and it draws its own highlight — two at once reads as two targets.
+      if (e.defaultPrevented) { setPageDrag(false); return; }
+      e.preventDefault();
+      setPageDrag(true);
+    };
+    // relatedTarget is null only when the pointer leaves the WINDOW, not on every child cross.
+    const onDragLeave = (e: DragEvent) => { if (e.relatedTarget === null) setPageDrag(false); };
+    const onDrop = (e: DragEvent) => {
+      // Cleared unconditionally, before any bail-out: the highlight must not survive a drop
+      // that a zone handled.
+      setPageDrag(false);
+      if (!hasFiles(e) || !e.dataTransfer) return;
+      if (e.defaultPrevented) return; // a zone already imported it
+      e.preventDefault();
+      void filesFromDataTransfer(e.dataTransfer).then((files) => {
+        if (files.length) handleDropRef.current(files);
+      });
+    };
+    window.addEventListener('dragover', onDragOver);
+    window.addEventListener('dragleave', onDragLeave);
+    window.addEventListener('drop', onDrop);
+    return () => {
+      window.removeEventListener('dragover', onDragOver);
+      window.removeEventListener('dragleave', onDragLeave);
+      window.removeEventListener('drop', onDrop);
+    };
+  }, [running, gridMode]);
+
+  /**
+   * Frees the blob URLs a set of rows is holding. Every path that drops a row goes through
+   * this: an object URL keeps its image alive until it is revoked, so a cleared run of 500
+   * would otherwise sit in memory until the tab closes.
+   */
+  function releaseLocalSources(rows: QueueItem[]) {
+    rows.forEach((it) => it.localSources?.forEach((src) => URL.revokeObjectURL(src.url)));
   }
 
   /** The row's images under a mapping: every picked column that actually holds an http(s) URL. */
@@ -382,6 +536,12 @@ export default function Compositor() {
 
   /** A CSV dropped in one band's area on the canvas. Only that band is touched. */
   function handleBandFile(bandId: string, file: File) {
+    // Bands are sheet-driven — count, columns and offer text all come from the CSV — so they
+    // stay CSV-only, and an image run must be cleared before one can take a sheet.
+    if (mode === 'images') {
+      toast.error('This run is driven by images. Clear it to load a CSV into a grid row.');
+      return;
+    }
     const reader = new FileReader();
     reader.onload = () => {
       const { headers, records } = parseCSV(String(reader.result));
@@ -479,6 +639,9 @@ export default function Compositor() {
 
   /** One row under a new mapping — the rule updateMapping and remapBand share. */
   function remapItem(it: QueueItem, ic: string[], tc: string, oc: string): QueueItem {
+    // An image row has no record to remap; running the rule over it would read '' out of an
+    // empty record and flip a perfectly loaded tile to 'no-images'.
+    if (it.localSources?.length) return it;
     const urls = rowUrls(it.record, ic);
     const title = tc ? it.record[tc] ?? '' : '';
     const offer = oc ? it.record[oc] ?? '' : '';
@@ -508,6 +671,16 @@ export default function Compositor() {
   // single model instance — two inferences interleaved through one session is undefined
   // behaviour. This chain lets exactly one removal run at a time while the network stays busy.
   const bgLock = React.useRef<Promise<unknown>>(Promise.resolve());
+
+  /** An <img> for a URL this page already owns. Never revokes: the row outlives the run. */
+  function decodeSrc(url: string, name: string): Promise<HTMLImageElement> {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error(`Could not decode ${name}`));
+      img.src = url;
+    });
+  }
 
   function patchItem(id: number, patch: Partial<QueueItem>) {
     setItems((prev) => prev.map((it) => (it.id === id ? { ...it, ...patch } : it)));
@@ -545,6 +718,9 @@ export default function Compositor() {
     patchItem(item.id, { status: 'fetching', errorMsg: undefined });
     const images: HTMLImageElement[] = [];
     for (const u of item.urls) images.push(await loadImageFromUrl(u, signal));
+    // A local row's blob URL is already minted and owned by the row, so this decodes it rather
+    // than creating a second one — and nothing here has to release anything.
+    for (const src of item.localSources ?? []) images.push(await decodeSrc(src.url, src.name));
     patchItem(item.id, { status: 'generating' });
     const runPrompt = promptOverride?.trim() || prompt;
     let resultImage: HTMLImageElement;
@@ -719,14 +895,20 @@ export default function Compositor() {
   }
 
   function deleteSelected() {
-    setItems((prev) => prev.filter((it) => !sel.checked.has(it.id)));
+    setItems((prev) => {
+      releaseLocalSources(prev.filter((it) => sel.checked.has(it.id)));
+      return prev.filter((it) => !sel.checked.has(it.id));
+    });
     setOpenId((prev) => (prev !== null && sel.checked.has(prev) ? null : prev));
     sel.clear();
   }
 
   /** Full reset back to the drop zone. Session name survives, like Generate's clear. */
   function clearAll() {
-    setItems([]);
+    setItems((prev) => {
+      releaseLocalSources(prev);
+      return [];
+    });
     // Emptying the list is what puts grid mode back on its seed row, so a clear still leaves
     // a drop area on the canvas.
     setBands([]);
@@ -738,6 +920,7 @@ export default function Compositor() {
     setImageCols([]);
     setTitleCol('');
     setOfferCol('');
+    setMode(null);
     setProgress(null);
     setCompressSummary('');
   }
@@ -1007,6 +1190,16 @@ export default function Compositor() {
 
   return (
     <div className="flex min-h-dvh flex-col">
+      {/* The only sign that a page-wide drop will be caught. Without it, dragging a folder over
+          a canvas already full of tiles looks exactly like dragging it over a page that will
+          refuse — pointer-events-none so it never eats the drop it is advertising. */}
+      {pageDrag && (
+        <div className="pointer-events-none fixed inset-0 z-50 rounded-lg ring-2 ring-primary ring-inset">
+          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 rounded-lg bg-popover px-3 py-1.5 text-xs text-popover-foreground shadow-md">
+            {mode === 'csv' ? 'Drop a CSV to replace this run' : 'Drop images or a folder'}
+          </div>
+        </div>
+      )}
 
       <StudioShell>
         <LeftPanel
@@ -1174,7 +1367,7 @@ export default function Compositor() {
               </Button>
             </PanelSection>
           )}
-          {!gridMode && fileName && (
+          {!gridMode && mode === 'csv' && fileName && (
             <PanelSection title="CSV file">
               {/* Only once there IS a file. The drop target lives in the canvas now, so an
                   empty slot here would offer a second route to the same act. */}
@@ -1196,6 +1389,41 @@ export default function Compositor() {
                   ),
                 }}
               />
+            </PanelSection>
+          )}
+
+          {!gridMode && mode === 'images' && (
+            <PanelSection
+              title="Images"
+              hint="One tile per image. There are no columns to map — each tile is titled by its file name, which is also what names it in the export."
+            >
+              <Item variant="outline" className="gap-3">
+                <ItemMedia variant="icon">
+                  <ImagesIcon />
+                </ItemMedia>
+                <ItemContent className="min-w-0 gap-0.5">
+                  <ItemTitle>
+                    {imageItemCount.toLocaleString()} image{imageItemCount === 1 ? '' : 's'}
+                  </ItemTitle>
+                  <ItemDescription className="truncate">
+                    Drop more anywhere on the page to add to the run.
+                  </ItemDescription>
+                </ItemContent>
+                <ItemActions>
+                  <ClearAllButton
+                    disabled={running}
+                    onConfirm={clearAll}
+                    title="Clear the images?"
+                    description={
+                      <>
+                        Removes all {activeItems.length} tile{activeItems.length === 1 ? '' : 's'}
+                        {doneCount > 0 && <> and the {doneCount} generated tile{doneCount === 1 ? '' : 's'} (not exported anywhere yet)</>}
+                        . Your files on disk are untouched — drop them again to rebuild the queue.
+                      </>
+                    }
+                  />
+                </ItemActions>
+              </Item>
             </PanelSection>
           )}
 
@@ -1410,12 +1638,17 @@ export default function Compositor() {
             ) : activeItems.length === 0 ? (
               <CanvasDropzone
                 icon={<FileSpreadsheetIcon />}
-                title="Drop a CSV to start"
-                description="Every row becomes a tile. Map its columns in the panel, then Generate & Populate."
-                accept=".csv,text/csv"
+                title="Drop a CSV or images to start"
+                description="A CSV makes one tile per row, from columns you map in the panel. Images make one tile each — drop a folder and everything inside it comes in."
+                accept=".csv,text/csv,image/*"
+                multiple
                 disabled={running}
-                onFiles={(files) => handleFile(files[0])}
-              />
+                onFiles={handleDrop}
+              >
+                {/* Dropping a folder already works; browsing to one needs its own control,
+                    because a file input is either a file picker or a folder picker. */}
+                <FolderInputButton onFiles={handleDrop} disabled={running} className="mt-1" />
+              </CanvasDropzone>
             ) : (
               <>
                   {/* Grid toolbar: count on the left, whole-run reset on the right. */}
@@ -1450,6 +1683,7 @@ export default function Compositor() {
                   selected={sel.checked}
                   onOpen={(item) => setOpenId(item.id)}
                   onRemove={(item) => {
+                    releaseLocalSources([item]);
                     setItems((prev) => prev.filter((it) => it.id !== item.id));
                     setOpenId((prev) => (prev === item.id ? null : prev));
                   }}

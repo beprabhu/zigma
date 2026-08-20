@@ -14,6 +14,19 @@ export interface QueueItem {
   bandId?: string;
   record: CsvRecord;
   urls: string[];
+  /**
+   * Locally dropped images, for a run started from files or a folder instead of a sheet — the
+   * alternative to `urls`, never a supplement to it: a row comes from a sheet or from disk.
+   *
+   * The blob URL is minted ONCE, when the row is built, and is what both the preview and the
+   * generate pass load — so a cell re-rendering never churns object URLs, and nothing has to
+   * hold the File itself. It is released by releaseLocalSources() when the row goes away;
+   * dropping the row without that call leaks the image for the life of the tab.
+   *
+   * Never persisted: a blob URL dies with the document, which is why an image run cannot be
+   * revived from a snapshot the way a CSV one could.
+   */
+  localSources?: { name: string; url: string }[];
   title: string;
   offer: string;
   status: ItemStatus;

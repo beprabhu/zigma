@@ -29,6 +29,7 @@ import { renderTile, tileToPngBlob } from '@/lib/tile';
 import { useTileFontsReady } from '@/hooks/use-tile-fonts';
 import { cn } from '@/lib/utils';
 
+
 /* eslint-disable @next/next/no-img-element */
 
 function fmtKB(n: number) { return (n / 1024).toFixed(1) + ' KB'; }
@@ -218,6 +219,11 @@ function TileCell({
 }) {
   const working =
     item.status === 'fetching' || item.status === 'generating' || item.status === 'removing-bg';
+  // A row is fed by one or the other, never both: a CSV row names URLs, an image row carries
+  // blob URLs minted when it was dropped.
+  const sourceSrcs = item.urls.length
+    ? item.urls.map(proxied)
+    : (item.localSources ?? []).map((src) => src.url);
   const r = template.frame;
   return (
     <ResultCell
@@ -242,13 +248,13 @@ function TileCell({
             className="block w-full"
             style={{ borderRadius: frameRadius(template) }}
           />
-        ) : item.urls.length ? (
+        ) : sourceSrcs.length ? (
           // The source products stand in until the tile replaces them — a cell shows the tile it
           // is going to be from the moment the CSV lands, not only once generation finishes.
           // The ring is the tell that this one is a stand-in: a generated tile has no edge.
           <SourceTilePreview
-            key={item.urls.join('|')}
-            urls={item.urls.map(proxied)}
+            key={sourceSrcs.join('|')}
+            urls={sourceSrcs}
             template={template}
             title={title}
             offerText={offerText}
@@ -259,7 +265,7 @@ function TileCell({
         ) : (
           <div className="grid size-full place-items-center overflow-hidden rounded-lg border bg-muted/30 p-2">
             <span className="px-2 text-center text-xs text-muted-foreground">
-              No image URLs in this row
+              No image in this row
             </span>
           </div>
         )}
@@ -410,6 +416,11 @@ export function TileDialog({
   running, prompt, exportScale, onClose, onRegenerate, onUndo,
 }: TileDialogProps) {
   const [saving, setSaving] = React.useState(false);
+  // What this row is actually made of, whichever way it got here. `sourceCount` is what every
+  // "does this row have something to send" test below reads, so an image row is not mistaken
+  // for an empty one.
+  const localSources = item?.localSources ?? [];
+  const sourceCount = (item?.urls.length ?? 0) + localSources.length;
 
   async function handleDownload() {
     if (!item?.resultImage) return;
@@ -455,32 +466,52 @@ export function TileDialog({
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="min-w-0 space-y-1.5">
                 <div className="text-xs font-medium text-muted-foreground">
-                  Source image{item.urls.length === 1 ? '' : 's'}
+                  Source image{sourceCount === 1 ? '' : 's'}
                 </div>
-                {item.urls.length ? (
-                  item.urls.map((url, i) => (
-                    <div key={i} className="space-y-1">
-                      <div
-                        className="grid place-items-center overflow-hidden rounded-lg border p-2"
-                        style={CHECKERBOARD}
-                      >
-                        <img
-                          src={proxied(url)}
-                          loading="lazy"
-                          alt=""
-                          className="max-h-56 max-w-full min-h-0 min-w-0 object-contain"
-                        />
-                      </div>
-                      <div className="flex items-center gap-1">
-                        <span className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground" title={url}>
-                          {url}
-                        </span>
-                        <CopyUrlButton url={url} />
-                      </div>
+                {item.urls.map((url, i) => (
+                  <div key={url + i} className="space-y-1">
+                    <div
+                      className="grid place-items-center overflow-hidden rounded-lg border p-2"
+                      style={CHECKERBOARD}
+                    >
+                      <img
+                        src={proxied(url)}
+                        loading="lazy"
+                        alt=""
+                        className="max-h-56 max-w-full min-h-0 min-w-0 object-contain"
+                      />
                     </div>
-                  ))
-                ) : (
-                  <p className="text-xs text-muted-foreground">This row has no image URLs.</p>
+                    <div className="flex items-center gap-1">
+                      <span className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground" title={url}>
+                        {url}
+                      </span>
+                      <CopyUrlButton url={url} />
+                    </div>
+                  </div>
+                ))}
+                {/* A dropped file has no URL to copy, so its name takes that row instead. */}
+                {localSources.map((src, i) => (
+                  <div key={src.url + i} className="space-y-1">
+                    <div
+                      className="grid place-items-center overflow-hidden rounded-lg border p-2"
+                      style={CHECKERBOARD}
+                    >
+                      <img
+                        src={src.url}
+                        alt=""
+                        className="max-h-56 max-w-full min-h-0 min-w-0 object-contain"
+                      />
+                    </div>
+                    <span
+                      className="block truncate text-[11px] text-muted-foreground"
+                      title={src.name}
+                    >
+                      {src.name}
+                    </span>
+                  </div>
+                ))}
+                {sourceCount === 0 && (
+                  <p className="text-xs text-muted-foreground">This row has no source image.</p>
                 )}
               </div>
 
@@ -519,17 +550,17 @@ export function TileDialog({
                 item.status === 'generating' ||
                 item.status === 'removing-bg'
               }
-              disabled={!item.urls.length && !item.resultImage}
+              disabled={!sourceCount && !item.resultImage}
               hint={
-                item.urls.length || item.resultImage
+                sourceCount || item.resultImage
                   ? 'Run this row through Azure again'
-                  : 'This row has no image URLs to send'
+                  : 'This row has no source image to send'
               }
               source={{
                 latestLabel: 'Generated tile',
                 originalLabel: 'Source images',
                 hasLatest: !!item.resultImage,
-                hasOriginal: item.urls.length > 0,
+                hasOriginal: sourceCount > 0,
                 note: 'The tile edits what is already there; the source images rebuild it from scratch.',
               }}
               onRegenerate={(p, from) => onRegenerate(item, p, from)}
