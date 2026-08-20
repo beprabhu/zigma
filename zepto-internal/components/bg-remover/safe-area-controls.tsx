@@ -5,7 +5,10 @@
 // custom colour, in-progress number text) that has nowhere to live in SafeAreaConfig.
 
 import * as React from 'react';
-import { LinkIcon, RotateCcwIcon, UnlinkIcon } from 'lucide-react';
+import {
+  LinkIcon, PanelBottomOpenIcon, PanelLeftOpenIcon, PanelRightOpenIcon, PanelTopOpenIcon,
+  RotateCcwIcon, UnlinkIcon,
+} from 'lucide-react';
 import { Hint } from '@/components/hint';
 import { Button } from '@/components/ui/button';
 import {
@@ -15,6 +18,7 @@ import {
   FieldTitle,
 } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
+import { InputGroup, InputGroupAddon, InputGroupInput } from '@/components/ui/input-group';
 import {
   Select,
   SelectContent,
@@ -66,6 +70,29 @@ const SIDE_LABELS: Record<keyof SafeAreaMargins, string> = {
   left: 'Left',
 };
 
+/**
+ * The side each field controls, drawn as the panel that edge pushes IN from — so the left
+ * margin gets the right-opening panel, and so on across the pair. The icon reads as the gap
+ * itself rather than as an arrow pointing somewhere, which is what a margin actually is.
+ *
+ * The label they replace carried the unit ("Left (%)"); that is not lost, because the %/px
+ * toggle sits directly above the four fields and said the same thing four times over. The
+ * text survives as the accessible name and the hover title.
+ */
+const SIDE_ABBR: Record<keyof SafeAreaMargins, string> = {
+  left: 'L',
+  top: 'T',
+  right: 'R',
+  bottom: 'B',
+};
+
+const SIDE_ICONS: Record<keyof SafeAreaMargins, typeof PanelRightOpenIcon> = {
+  left: PanelRightOpenIcon,
+  right: PanelLeftOpenIcon,
+  top: PanelBottomOpenIcon,
+  bottom: PanelTopOpenIcon,
+};
+
 type BackgroundMode = 'transparent' | 'white' | 'custom';
 
 const WHITE = '#ffffff';
@@ -89,7 +116,12 @@ function clamp(value: number, min: number, max: number): number {
 
 interface NumberFieldProps {
   id: string;
+  /** Always the written name. With `abbr` it is what the tooltip and screen reader get. */
   label: string;
+  /** One letter shown in place of the full name: L/T/R/B, where the row would not fit "Left". */
+  abbr?: string;
+  /** Figma-style: the side glyph sits INSIDE the field and replaces the label row. */
+  icon?: typeof PanelRightOpenIcon;
   value: number;
   onValueChange: (next: number) => void;
   min?: number;
@@ -103,6 +135,8 @@ interface NumberFieldProps {
 function NumberField({
   id,
   label,
+  abbr,
+  icon: Icon,
   value,
   onValueChange,
   min,
@@ -122,32 +156,64 @@ function NumberField({
       ? draft
       : String(value);
 
+  const controlProps = {
+    id,
+    type: 'number',
+    inputMode: 'numeric' as const,
+    min,
+    max,
+    step,
+    disabled,
+    value: text,
+    onChange: (e: React.ChangeEvent<HTMLInputElement>) => {
+      const raw = e.target.value;
+      setDraft(raw);
+      if (raw.trim() === '') return;
+      const next = Number(raw);
+      // An empty or half-typed field keeps the previous value rather than emitting NaN.
+      if (!Number.isFinite(next)) return;
+      onValueChange(clamp(next, min ?? -Infinity, max ?? Infinity));
+    },
+    onBlur: () => setDraft(null),
+  };
+
+  // With an icon the label row disappears entirely and the glyph moves inside the box, the way
+  // Figma labels padding. That buys back a whole row per field — the reason to use icons at all
+  // — but an icon names nothing to a screen reader, so the text stays as an sr-only label and
+  // as the hover title.
+  if (Icon) {
+    return (
+      <Field className="gap-1">
+        <FieldLabel
+          htmlFor={id}
+          title={label}
+          className="text-[11px] font-normal text-muted-foreground"
+        >
+          {abbr ?? label}
+        </FieldLabel>
+        <InputGroup title={label}>
+          <InputGroupAddon>
+            <Icon className="size-3.5" aria-hidden />
+          </InputGroupAddon>
+          {/* px-0: the addon already supplies the gap, and the control's own left padding
+              pushed the number away from its icon.
+
+              aria-label carries the written name rather than a hidden twin inside the <label>:
+              "L" is only legible beside its three siblings, and a screen reader reaches the
+              field on its own. Naming the input directly also settles the name outright, where
+              a visible letter plus a hidden phrase leaves it to accname's aria-hidden rules. */}
+          <InputGroupInput {...controlProps} aria-label={label} className="px-0 text-xs" />
+        </InputGroup>
+      </Field>
+    );
+  }
+
   return (
     <Field className="gap-1">
       <FieldLabel htmlFor={id} className="text-[11px] font-normal text-muted-foreground">
         {label}
       </FieldLabel>
-      <Input
-        id={id}
-        type="number"
-        inputMode="numeric"
-        className="h-8 text-xs"
-        min={min}
-        max={max}
-        step={step}
-        disabled={disabled}
-        value={text}
-        onChange={(e) => {
-          const raw = e.target.value;
-          setDraft(raw);
-          if (raw.trim() === '') return;
-          const next = Number(raw);
-          // An empty or half-typed field keeps the previous value rather than emitting NaN.
-          if (!Number.isFinite(next)) return;
-          onValueChange(clamp(next, min ?? -Infinity, max ?? Infinity));
-        }}
-        onBlur={() => setDraft(null)}
-      />
+      <Input {...controlProps} className="h-8 text-xs" />
     </Field>
   );
 }
@@ -360,7 +426,12 @@ export function SafeAreaControls({
         {/* Anchor and margins share the row. They were stacked with a rule between them, which
             spent two headings and a divider on eight small controls that are read together —
             "where does the subject sit, and how much room does it get". Side by side, the whole
-            question fits without scrolling. */}
+            question fits without scrolling.
+
+            Both columns lead with a label row — "Anchor" on one side, L/T/R/B on the other —
+            and that is what holds the anchor box level with the first margin field. Take the
+            letters away and the margin column has no label row to match, so it rides up level
+            with the WORD "Anchor" rather than with the box under it. */}
         <div className="flex gap-3">
           <div className="shrink-0 space-y-1">
             {/* A field label, not a heading. Anchor is a sibling of Left/Top/Right/Bottom —
@@ -371,7 +442,7 @@ export function SafeAreaControls({
                 Anchor
               </Hint>
             </FieldLabel>
-            <div
+          <div
               className={cn(
                 'w-fit rounded-lg border border-input bg-muted/40 p-1.5',
                 disabled && 'opacity-50',
@@ -413,18 +484,24 @@ export function SafeAreaControls({
               </ToggleGroup>
             </div>
           </div>
-          <div className="grid min-w-0 flex-1 grid-cols-2 gap-2">
-            {MARGIN_SIDES.map((side) => (
-              <NumberField
-                key={side}
-                id={`safe-area-margin-${side}`}
-                label={`${SIDE_LABELS[side]} (${unitSuffix})`}
-                value={config.margins[side]}
-                step={config.marginUnit === 'percent' ? 0.5 : 1}
-                disabled={disabled}
-                onValueChange={(v) => handleMargin(side, v)}
-              />
-            ))}
+          {/* self-start: without it the grid stretches to the anchor box's height and pushes
+              the two rows of fields apart to fill it. */}
+          <div className="grid min-w-0 grid-cols-2 gap-2 self-start">
+            {MARGIN_SIDES.map((side) => {
+              return (
+                <NumberField
+                  key={side}
+                  id={`safe-area-margin-${side}`}
+                  label={`${SIDE_LABELS[side]} (${unitSuffix})`}
+                  abbr={SIDE_ABBR[side]}
+                  icon={SIDE_ICONS[side]}
+                  value={config.margins[side]}
+                  step={config.marginUnit === 'percent' ? 0.5 : 1}
+                  disabled={disabled}
+                  onValueChange={(v) => handleMargin(side, v)}
+                />
+              );
+            })}
           </div>
         </div>
       </Field>

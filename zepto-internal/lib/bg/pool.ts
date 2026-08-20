@@ -20,6 +20,7 @@ import type { RefineMode } from './refine';
 import type { SubjectBounds } from './safe-area';
 import type { InkFootprint, OriginalComponentReport, RegionReport } from './regions';
 import type { DetectedBand } from './bands';
+import type { GlassReport } from './glass';
 import type { WorkerRequest, WorkerResponse } from './bg.worker';
 import { MAX_EDGE } from './constants';
 
@@ -44,6 +45,8 @@ export interface PoolCutout {
   originalComponents: OriginalComponentReport[];
   /** Flat edge strips masked from the source. */
   bands: DetectedBand[];
+  /** Outcome of the transparency pass; null when it was off. */
+  glass: GlassReport | null;
   width: number;
   height: number;
   durationMs: number;
@@ -55,8 +58,9 @@ export interface PoolRemoveOptions {
   model: BgModelId;
   refine?: boolean;
   refineMode?: RefineMode;
-  zoomPass?: boolean;
   productOnly?: boolean;
+  /** Rebuild see-through areas the binary matte cut. Opt-in — see glass.ts. */
+  glass?: boolean;
   onLoadProgress?: (p: LoadProgress) => void;
   onStage?: (stage: RemoveStage) => void;
   signal?: AbortSignal;
@@ -172,6 +176,7 @@ function handleMessage(slot: Slot, msg: WorkerResponse) {
         originalInk: msg.originalInk,
         originalComponents: msg.originalComponents,
         bands: msg.bands,
+        glass: msg.glass,
         width: msg.width,
         height: msg.height,
         durationMs: msg.durationMs,
@@ -203,8 +208,8 @@ function pump() {
       bitmap: job.bitmap,
       refine: job.opts.refine ?? false,
       refineMode: job.opts.refineMode ?? 'auto',
-      zoomPass: job.opts.zoomPass ?? false,
       productOnly: job.opts.productOnly ?? false,
+      glass: job.opts.glass ?? false,
     };
     slot.worker.postMessage(req, [job.bitmap]);
   }

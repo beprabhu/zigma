@@ -101,13 +101,11 @@ were learned by exhausting a 24 GB machine on 3000px product photos:
 - **ImageBitmaps and canvases are freed explicitly** (`releaseItem`, `releaseCanvas`). They live
   outside the JS heap, so GC will not reclaim them promptly on its own.
 
-Two more things matter for batch speed, both learned the hard way:
+One more thing matters for batch speed, learned the hard way:
 
 - **Memoise anything rendered per queue item.** Every finished image patches React state, and
   un-memoised rows/cells re-rendered the whole queue on each patch — at ~28 items that cost
   more per image than the inference did.
-- **The second "zoom" pass is off by default.** It re-runs the model on a tight crop for sharper
-  edges at roughly double the cost; the "High detail" checkbox turns it back on.
 
 ### Models
 

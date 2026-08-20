@@ -10,6 +10,7 @@ import type { PreTrainedModel, Processor, RawImage, Tensor } from '@huggingface/
 
 import { BG_MODELS, type BgBackend, type BgModelId } from './engine';
 import { refineAlpha, type RefineMode } from './refine';
+import { recoverTransparency, type GlassReport } from './glass';
 import { detectBands, maskBands, type DetectedBand } from './bands';
 import {
   analyzeRegions, keepProductRegions, labelInkComponents, measureComponentSurvival,
@@ -32,9 +33,10 @@ export interface WorkerRemoveRequest {
   bitmap: ImageBitmap;
   refine: boolean;
   refineMode: RefineMode;
-  zoomPass: boolean;
   /** Drop flat graphic panels the matte kept (colour strips, badges). Opt-in. */
   productOnly?: boolean;
+  /** Rebuild see-through areas the binary matte cut. Opt-in — see glass.ts. */
+  glass?: boolean;
   /** Overrides MAX_EDGE; 0 or undefined means "no cap". */
   maxEdge?: number;
 }
@@ -44,7 +46,7 @@ export type WorkerRequest = WorkerInitRequest | WorkerRemoveRequest;
 export type WorkerResponse =
   | { type: 'ready'; jobId: number; backend: BgBackend }
   | { type: 'progress'; jobId: number; loaded: number; total: number; label: string }
-  | { type: 'stage'; jobId: number; stage: 'loading' | 'inferring' | 'zooming' | 'refining' }
+  | { type: 'stage'; jobId: number; stage: 'loading' | 'inferring' | 'refining' }
   | {
       type: 'done';
       jobId: number;
@@ -65,6 +67,8 @@ export type WorkerResponse =
       originalComponents: OriginalComponentReport[];
       /** Flat edge strips masked from the source before region analysis. */
       bands: DetectedBand[];
+      /** Outcome of the transparency pass; null when it was off. */
+      glass: GlassReport | null;
       width: number;
       height: number;
       durationMs: number;
@@ -212,6 +216,7 @@ async function remove(req: WorkerRemoveRequest): Promise<void> {
     bands: DetectedBand[];
     residueFraction: number;
     originalComponents: OriginalComponentReport[];
+    glass: GlassReport | null;
   }
 
   /**
@@ -235,51 +240,6 @@ async function remove(req: WorkerRemoveRequest): Promise<void> {
 
     const mask = await infer(image, width, height);
 
-    if (req.zoomPass) {
-      ctx.postMessage({ type: 'stage', jobId: req.jobId, stage: 'zooming' } satisfies WorkerResponse);
-      try {
-        let x0 = width;
-        let x1 = 0;
-        let y0 = height;
-        let y1 = 0;
-        for (let y = 0; y < height; y++) {
-          for (let x = 0; x < width; x++) {
-            if (mask.data[y * width + x] > 128) {
-              if (x < x0) x0 = x;
-              if (x > x1) x1 = x;
-              if (y < y0) y0 = y;
-              if (y > y1) y1 = y;
-            }
-          }
-        }
-        const bw = x1 - x0;
-        const bh = y1 - y0;
-        if (bw > 40 && bh > 40 && (bw < width * 0.9 || bh < height * 0.9)) {
-          const zpad = Math.round(Math.max(bw, bh) * 0.08);
-          x0 = Math.max(0, x0 - zpad);
-          y0 = Math.max(0, y0 - zpad);
-          x1 = Math.min(width - 1, x1 + zpad);
-          y1 = Math.min(height - 1, y1 + zpad);
-          const cw = x1 - x0 + 1;
-          const ch = y1 - y0 + 1;
-          const crop = new OffscreenCanvas(cw, ch);
-          crop.getContext('2d')!.drawImage(sourceCanvas, x0, y0, cw, ch, 0, 0, cw, ch);
-          const mask2 = await infer(RawImage.fromCanvas(crop), cw, ch);
-          for (let y = 0; y < ch; y++) {
-            for (let x = 0; x < cw; x++) {
-              const i = (y0 + y) * width + (x0 + x);
-              const a1 = mask.data[i];
-              if (a1 > 30 && a1 < 225) {
-                mask.data[i] = (a1 + mask2.data[y * cw + x]) >> 1;
-              }
-            }
-          }
-        }
-      } catch (e) {
-        console.warn('zoom pass skipped:', e);
-      }
-    }
-
     // A fresh pristine copy per attempt: the alpha write below mutates it, and a retry has to
     // start from the original RGB, not the previous attempt's leavings.
     const pixels = new ImageData(new Uint8ClampedArray(basePixels.data), outW, outH);
@@ -295,6 +255,11 @@ async function remove(req: WorkerRemoveRequest): Promise<void> {
       ctx.postMessage({ type: 'stage', jobId: req.jobId, stage: 'refining' } satisfies WorkerResponse);
       refineAlpha(pixels, outW, outH, { modelId: req.modelId, mode: req.refineMode });
     }
+
+    // Strictly after refine: its decontaminate() repaints any semi-transparent pixel next to a
+    // solid one with the solid neighbour's colour, which would turn recovered glass opaque again.
+    // Strictly before the region pass, so the panels it measures include the glass.
+    const glassReport = req.glass ? recoverTransparency(pixels) : null;
 
     // Survival is measured HERE — post-refine, pre-filter — and nowhere later: the product-only
     // filter is about to delete panels on purpose, and those deletions are already evidenced in
@@ -341,7 +306,10 @@ async function remove(req: WorkerRemoveRequest): Promise<void> {
     // Ghosted overlay graphics live below the alpha threshold where nothing else can see them.
     const residueFraction = measureFaintResidue(pixels, bounds);
 
-    return { pixels, bounds, removedRegions, regionReport, bands, residueFraction, originalComponents };
+    return {
+      pixels, bounds, removedRegions, regionReport, bands, residueFraction, originalComponents,
+      glass: glassReport,
+    };
   };
 
   /**
@@ -404,6 +372,7 @@ async function remove(req: WorkerRemoveRequest): Promise<void> {
     originalInk,
     originalComponents: result.originalComponents,
     bands: result.bands,
+    glass: result.glass,
     width: outW,
     height: outH,
     durationMs: performance.now() - started,

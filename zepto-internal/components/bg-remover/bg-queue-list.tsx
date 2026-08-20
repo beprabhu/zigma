@@ -796,6 +796,24 @@ function CompareView({
         </figure>
       </div>
 
+      {/* Same tie-to-cutout rule as the tables below: the verdict describes one matte, and it
+          is cleared whenever a new one replaces it. */}
+      {item.cutout && item.semantic && (
+        <p
+          className={cn(
+            'rounded-md border px-3 py-2 text-xs',
+            item.semantic.extra
+              ? 'border-destructive/40 bg-destructive/5 text-destructive'
+              : 'border-border bg-muted/40 text-muted-foreground',
+          )}
+        >
+          {item.semantic.extra
+            ? `Semantic check saw something besides the product${item.semantic.what ? `: ${item.semantic.what}` : ''}`
+            : 'Semantic check found nothing besides the product'}
+          <span className="ml-1 opacity-60">({item.semantic.model})</span>
+        </p>
+      )}
+
       {/* Tied to the cutout it measures: the report is never cleared, so an AI edit or a failed
           redo leaves last run's verdicts sitting under a pane that says there is no cutout —
           two contradictory claims about a matte the user can no longer see or download. */}

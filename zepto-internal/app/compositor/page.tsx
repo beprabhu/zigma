@@ -528,11 +528,8 @@ export default function Compositor() {
     // Yield once so the badge paints before inference blocks the main thread.
     await new Promise((r) => setTimeout(r, 0));
     try {
-      // zoomPass runs a whole second inference to sharpen edges at ~2x resolution. Tiles
-      // export at 600px wide, where that detail is invisible, so it is not worth doubling
-      // the wall-clock of every row in a CSV.
       const turn = bgLock.current.then(() =>
-        removeBackground(image, { model: activeModel, refine: false, zoomPass: false }),
+        removeBackground(image, { model: activeModel, refine: false }),
       );
       bgLock.current = turn.catch(() => {});
       const { canvas } = await turn;

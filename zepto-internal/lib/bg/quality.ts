@@ -674,9 +674,28 @@ export function assessQuality(item: BgItem): QualityAssessment {
   // matte (early-returned above), and a verify-sweep disagreement — that one is a PAID second
   // inference by a different architecture, not a threshold heuristic, and the model never saw
   // verify verdicts in training so it has no standing to overrule one.
+  // The semantic sidecar's verdict, when that pass ran. Same standing as the verify sweep: a
+  // paid second inference by a different architecture, and here it answers a question none of
+  // the fitted model's 33 inputs encode at all — nothing in a geometry vector says "a bowl".
+  // Measured zero-shot on 405 labelled catalogue images: 93% recall on exactly these semantic
+  // defects, against roughly 65% for the numbers.
+  //
+  // It may only ADD a flag. A "no extras" answer never clears one, for two reasons: it was
+  // measured at 77% specificity, and it was never asked about the defects the geometry checks
+  // own — halos, crops, vanished elements, over-trimming. Silence from it is not evidence.
+  const semanticExtra = Boolean(item.semantic?.extra);
+  if (semanticExtra) {
+    const what = item.semantic?.what?.trim();
+    reasons.push(
+      what
+        ? `Semantic check saw something besides the product: ${what}`
+        : 'Semantic check saw something besides the product',
+    );
+  }
+
   const verifyDisagree = Boolean(item.verify && !item.verify.agree);
   const prob = qualityModelProbability(item);
-  if (prob !== null && !verifyDisagree) {
+  if (prob !== null && !verifyDisagree && !semanticExtra) {
     if (prob < MODEL_FLAG_THRESHOLD) return OK;
     if (!reasons.length) {
       reasons.push(

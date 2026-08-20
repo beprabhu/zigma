@@ -48,6 +48,7 @@ export function cutoutEvidence(item: BgItem): Omit<NonNullable<BgItem['prev']>, 
     originalInk: item.originalInk,
     originalComponents: item.originalComponents,
     verify: item.verify,
+    semantic: item.semantic,
     bands: item.bands,
   };
 }
@@ -151,6 +152,21 @@ export interface BgCutout {
  * recomputed: the check costs a full BiRefNet inference, and "was already checked" must survive
  * a reload or the sweep would re-bill every ambiguous item on every visit.
  */
+/**
+ * The semantic sidecar's verdict — Qwen2.5-VL, asked the one question the fitted model's 33
+ * geometry numbers structurally cannot answer: is anything in this frame besides the product?
+ * Like BgVerify this is a PAID second inference by a different architecture, so it carries the
+ * same standing: the tree model never saw one in training and may not overrule it.
+ */
+export interface BgSemantic {
+  /** The vision model that answered, stored so a future switch stays auditable. */
+  model: string;
+  /** True when the model reported something present besides the product itself. */
+  extra: boolean;
+  /** What it named, verbatim and short ("scattered ingredients"). Empty when extra is false. */
+  what: string;
+}
+
 export interface BgVerify {
   /** The checker model's id ('birefnet' today; stored so a future switch stays auditable). */
   model: string;
@@ -207,6 +223,7 @@ export interface BgItem {
     originalInk?: InkFootprint;
     originalComponents?: OriginalComponentReport[];
     verify?: BgVerify;
+    semantic?: BgSemantic;
     bands?: DetectedBand[];
   };
   /**
@@ -251,6 +268,12 @@ export interface BgItem {
    * already verified, so the sweep never re-pays for it.
    */
   verify?: BgVerify;
+  /**
+   * The semantic sidecar's verdict for THIS cutout, when the pass ran. Absent means it never
+   * ran (sidecar down, pass off, or an older project) — never "nothing found", which is why
+   * every reader tests for the object before its `extra` field.
+   */
+  semantic?: BgSemantic;
   /**
    * Flat edge strips masked out of the matte (lib/bg/bands.ts). The one removal the pipeline
    * performed no record of: bands run AFTER component survival is measured and BEFORE the

@@ -52,7 +52,7 @@ import {
 } from '@/lib/skills';
 import { azureImageUrl } from '@/lib/pipeline';
 import { QUALITIES, QUALITY_BLURB, useImageQuality, type ImageQuality } from '@/lib/quality';
-import { clampParallel, clampRpm, useParallel, useRpm } from '@/lib/rate';
+import { PARALLEL_MAX, RPM_MAX, clampParallel, clampRpm, useParallel, useRpm } from '@/lib/rate';
 import {
   PRICE_USD_PER_MTOK, PRICING_ASOF, USAGE_KEY, USD_TO_INR, costUsd, dayKey,
   emptyLedger, formatInr, resetUsage, type UsageLedger, type UsageTotals,
@@ -302,7 +302,7 @@ function ImageModelPane() {
           id="settings-parallel"
           type="number"
           min={1}
-          max={8}
+          max={PARALLEL_MAX}
           className="w-40"
           value={parallel}
           onChange={(e) => setParallel(clampParallel(Number(e.target.value)))}
@@ -322,7 +322,7 @@ function ImageModelPane() {
           id="settings-rpm"
           type="number"
           min={0}
-          max={600}
+          max={RPM_MAX}
           className="w-40"
           value={rpm === 0 ? '' : rpm}
           placeholder="Unlimited"

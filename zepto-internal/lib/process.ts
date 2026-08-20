@@ -42,7 +42,6 @@ export async function processCanvas(
     const { canvas } = await removeBackground(current, {
       model: DEFAULT_MODEL_ID,
       refine: false,
-      zoomPass: false,
     });
     current = canvas;
     owned = true;

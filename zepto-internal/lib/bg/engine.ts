@@ -9,6 +9,7 @@
 import type { PreTrainedModel, Processor, RawImage, Tensor } from '@huggingface/transformers';
 
 import { refineAlpha, type RefineMode } from './refine';
+import { recoverTransparency, type GlassReport } from './glass';
 import {
   analyzeRegions, keepProductRegions, labelInkComponents, measureComponentSurvival,
   measureInkFootprint, type InkFootprint, type OriginalComponentReport, type RegionReport,
@@ -133,16 +134,19 @@ export interface RemoveOptions {
   refine?: boolean;
   /** Forces the refinement strategy; 'auto' picks per subject. */
   refineMode?: RefineMode;
-  /** Second inference pass on a tight crop, fused into uncertain regions. */
-  zoomPass?: boolean;
   /** Drop flat graphic panels the matte kept (colour strips, badges). Opt-in. */
   productOnly?: boolean;
+  /**
+   * Rebuild see-through areas a binary matte cut — clear cases, glass, blister packs.
+   * Opt-in, and only meaningful on a near-uniform studio background. See glass.ts.
+   */
+  glass?: boolean;
   onLoadProgress?: (p: LoadProgress) => void;
   onStage?: (stage: RemoveStage) => void;
   signal?: AbortSignal;
 }
 
-export type RemoveStage = 'loading' | 'inferring' | 'zooming' | 'refining' | 'done';
+export type RemoveStage = 'loading' | 'inferring' | 'refining' | 'done';
 
 /** Where a model's inference actually runs: GPU (WebGPU), CPU (threaded WASM), or the sidecar. */
 export type BgBackend = 'webgpu' | 'wasm' | 'server';
@@ -163,6 +167,8 @@ export interface RemoveResult {
   originalInk: InkFootprint;
   /** Per-element survival of the original's ink islands against the PRE-filter matte. */
   originalComponents: OriginalComponentReport[];
+  /** Outcome of the transparency pass; null when it was off. */
+  glass: GlassReport | null;
 }
 
 export type BgSource = Blob | HTMLImageElement | HTMLCanvasElement | ImageBitmap;
@@ -386,7 +392,10 @@ function canvasToBlob(canvas: HTMLCanvasElement, type = 'image/png'): Promise<Bl
  */
 export async function removeBackground(source: BgSource, opts: RemoveOptions = {}): Promise<RemoveResult> {
   const id = opts.model ?? DEFAULT_MODEL_ID;
-  const { refine = false, refineMode = 'auto', zoomPass = true, productOnly = false, signal } = opts;
+  const {
+    refine = false, refineMode = 'auto', productOnly = false,
+    glass = false, signal,
+  } = opts;
   const started = performance.now();
 
   throwIfAborted(signal);
@@ -423,6 +432,9 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
       opts.onStage?.('refining');
       refineAlpha(pixels, outCanvas.width, outCanvas.height, { modelId: id, mode: refineMode });
     }
+    // After refine (its decontaminate would repaint recovered glass with its solid
+    // neighbours' colour), before the region pass reads the matte.
+    const glassReport = glass ? recoverTransparency(pixels) : null;
     // Pre-filter, like the worker: what the SERVER MODEL erased, before deliberate panel
     // drops muddy the question. Guarded on dimensions — the sidecar may return a resized
     // frame, and survival against a mismatched label map would be garbage, not evidence.
@@ -438,7 +450,7 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
     const filtered = productOnly ? keepProductRegions(pixels) : null;
     const removedRegions = filtered?.removed ?? 0;
     const regionReport = filtered ? filtered.regions : analyzeRegions(pixels);
-    if (refine || removedRegions) ctx.putImageData(pixels, 0, 0);
+    if (refine || removedRegions || glassReport?.applied) ctx.putImageData(pixels, 0, 0);
     opts.onStage?.('done');
     return {
       canvas: outCanvas,
@@ -452,6 +464,7 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
       regionReport,
       originalInk,
       originalComponents,
+      glass: glassReport,
     };
   }
 
@@ -484,6 +497,7 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
     removedRegions: number;
     regionReport: RegionReport[];
     originalComponents: OriginalComponentReport[];
+    glass: GlassReport | null;
   }
 
   /**
@@ -511,58 +525,6 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
     const mask = await infer(image, iw, ih);
     throwIfAborted(signal);
 
-    if (zoomPass) {
-      opts.onStage?.('zooming');
-      try {
-        let x0 = iw;
-        let x1 = 0;
-        let y0 = ih;
-        let y1 = 0;
-        for (let y = 0; y < ih; y++) {
-          for (let x = 0; x < iw; x++) {
-            if (mask.data[y * iw + x] > 128) {
-              if (x < x0) x0 = x;
-              if (x > x1) x1 = x;
-              if (y < y0) y0 = y;
-              if (y > y1) y1 = y;
-            }
-          }
-        }
-        const bw = x1 - x0;
-        const bh = y1 - y0;
-        // Only zoom when it meaningfully increases resolution.
-        if (bw > 40 && bh > 40 && (bw < iw * 0.9 || bh < ih * 0.9)) {
-          const zpad = Math.round(Math.max(bw, bh) * 0.08);
-          x0 = Math.max(0, x0 - zpad);
-          y0 = Math.max(0, y0 - zpad);
-          x1 = Math.min(iw - 1, x1 + zpad);
-          y1 = Math.min(ih - 1, y1 + zpad);
-          const cw = x1 - x0 + 1;
-          const ch = y1 - y0 + 1;
-          const crop = document.createElement('canvas');
-          crop.width = cw;
-          crop.height = ch;
-          crop.getContext('2d')!.drawImage(inferCanvas, x0, y0, cw, ch, 0, 0, cw, ch);
-          const cropImg = RawImage.fromCanvas(crop);
-          const mask2 = await infer(cropImg, cw, ch);
-          // Fuse: the zoom pass only refines where pass 1 was uncertain. Where pass 1 is
-          // confident (near 0 or 255) its decision stands — the cropped view can misjudge
-          // large context (e.g. thin frames).
-          for (let y = 0; y < ch; y++) {
-            for (let x = 0; x < cw; x++) {
-              const i = (y0 + y) * iw + (x0 + x);
-              const a1 = mask.data[i];
-              if (a1 > 30 && a1 < 225) {
-                mask.data[i] = (a1 + mask2.data[y * cw + x]) >> 1;
-              }
-            }
-          }
-        }
-      } catch (e) {
-        if ((e as Error)?.name === 'AbortError') throw e;
-        console.warn('zoom pass skipped:', e);
-      }
-    }
     throwIfAborted(signal);
 
     // A fresh pristine copy per attempt: the alpha write mutates it, and a retry must start
@@ -583,6 +545,8 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
       throwIfAborted(signal);
       refineAlpha(pixels, outW, outH, { modelId: id, mode: refineMode });
     }
+    // After refine, before the region pass — same ordering constraint as the worker's.
+    const glassReport = glass ? recoverTransparency(pixels) : null;
     // Post-refine, pre-filter — same contract as the worker: only model-erased content may
     // read as a lost element, never a deliberate panel drop.
     const originalComponents = unscaleComponents(
@@ -595,6 +559,7 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
       removedRegions: browserFiltered?.removed ?? 0,
       regionReport: browserFiltered ? browserFiltered.regions : analyzeRegions(pixels),
       originalComponents,
+      glass: glassReport,
     };
   };
 
@@ -659,6 +624,7 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
     removedRegions: result.removedRegions,
     regionReport: result.regionReport,
     originalComponents: result.originalComponents,
+    glass: result.glass,
   };
 }
 

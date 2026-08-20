@@ -7,27 +7,25 @@
 import * as React from 'react';
 import { toast } from 'sonner';
 import {
-  CircleStopIcon, DownloadIcon, RotateCcwIcon, ShrinkIcon, Trash2Icon,
+  CircleStopIcon, DownloadIcon, RotateCcwIcon, ShrinkIcon, SlidersHorizontalIcon, Trash2Icon,
   TriangleAlertIcon, UploadCloudIcon,
 } from 'lucide-react';
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { Hint } from '@/components/hint';
-import {
-  Field, FieldContent, FieldGroup, FieldLabel,
-} from '@/components/ui/field';
+import { Field, FieldDescription, FieldLabel } from '@/components/ui/field';
+import { Input } from '@/components/ui/input';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { Separator } from '@/components/ui/separator';
+import { Toggle } from '@/components/ui/toggle';
 import { Progress } from '@/components/ui/progress';
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
 import { Spinner } from '@/components/ui/spinner';
-import { Switch } from '@/components/ui/switch';
 
-import { Canvas, LeftPanel, PanelSection, StudioShell } from '@/components/pane-layout';
 import { ClearAllButton } from '@/components/selection';
 import { CanvasDropzone, DropzoneShell } from '@/components/dropzone';
-import { SessionHeader, type SessionChip } from '@/components/session-header';
 import { buildZipStream, type ZipStreamEntry } from '@/lib/zip';
 import { canvasToPngBlob, formatKb, loadImageFromFile, mapWithLimit, releaseCanvas } from '@/lib/bg/batch';
 import { compressPng } from '@/lib/compress';
@@ -194,110 +192,34 @@ export default function PngCompressorPage() {
   }, [items, sessionSlug]);
 
   const doneCount = items.filter((it) => it.status === 'done').length;
+  const pendingCount = items.filter(
+    (it) => it.status === 'queued' || it.status === 'error',
+  ).length;
+  // One primary button doing two jobs: it runs the batch, and once nothing is left to compress
+  // it becomes the export. Dropping more files raises pendingCount and flips it back, so the
+  // button always offers the thing that is actually next rather than two rival CTAs.
+  const exportMode = !running && pendingCount === 0 && doneCount > 0;
   const totalIn = items.reduce((s, it) => s + it.file.size, 0);
   const totalOut = items.reduce(
     (s, it) => s + (it.output ? it.output.size : it.file.size), 0,
   );
 
+  const statusText = running
+    ? progress?.text ?? 'Compressing…'
+    : doneCount
+      ? `${formatKb(totalIn)} → ${formatKb(totalOut)} · ${savingsPct(totalIn, totalOut)}% smaller`
+      : items.length
+        ? `${items.length} file${items.length === 1 ? '' : 's'} queued`
+        : 'Drop PNGs to start';
+
   return (
-    <div className="flex min-h-dvh flex-col">
-      <StudioShell>
-        <LeftPanel
-          title="Process & compress"
-          header={
-            <SessionHeader
-              name={sessionName}
-              onNameChange={setSessionName}
-              placeholder="Untitled batch"
-              product="Compress"
-              chips={
-                [
-                  items.length > 0 && { label: `${items.length} file${items.length === 1 ? '' : 's'}` },
-                  doneCount > 0 && { label: `${doneCount} compressed` },
-                  doneCount > 0 && { label: `${savingsPct(totalIn, totalOut)}% smaller` },
-                ].filter(Boolean) as SessionChip[]
-              }
-            />
-          }
-          footer={
-            <div className="flex flex-col gap-2">
-              {/* No children: the Progress root renders its own track+indicator. */}
-              {progress && <Progress value={progress.pct} />}
-              <p className="text-xs break-words text-muted-foreground">
-                {progress?.text || 'Compressed PNGs export as a ZIP.'}
-              </p>
-              <Button onClick={compressAll} disabled={running || !items.length}>
-                {running ? <Spinner data-icon="inline-start" /> : <ShrinkIcon data-icon="inline-start" />}
-                {running ? 'Compressing…' : 'Compress all'}
-              </Button>
-              {running && (
-                <Button variant="outline" onClick={() => abortRef.current?.abort()}>
-                  <CircleStopIcon data-icon="inline-start" />
-                  Stop
-                </Button>
-              )}
-              {/* Secondary, not primary: unlike the other products this footer also holds the
-                  run button, and two stacked primaries would fight for the eye. Label and icon
-                  match the suite's Export ZIP everywhere else. */}
-              <Button variant="secondary" onClick={downloadZip} disabled={!doneCount}>
-                <DownloadIcon data-icon="inline-start" />
-                Export ZIP{doneCount ? ` (${doneCount})` : ''}
-              </Button>
-            </div>
-          }
-        >
-          {proc.panel}
-          <PanelSection title="Compression" hint="Applied to the next compression run.">
-              <FieldGroup>
-                <Field orientation="horizontal">
-                  <FieldContent>
-                    <FieldLabel htmlFor="lossless"><Hint hint="Skip quantization; oxipng squeeze only.">Lossless only</Hint></FieldLabel>
-                  </FieldContent>
-                  <Switch id="lossless" checked={lossless} disabled={running} onCheckedChange={setLossless} />
-                </Field>
-                {/* Hidden, not greyed, while lossless — matching the shared Compress PNGs step. */}
-                {!lossless && (
-                  <Field>
-                    <FieldLabel htmlFor="colors"><Hint hint="Fewer colors → smaller files, more banding.">Palette colors</Hint></FieldLabel>
-                    <Select
-                      value={String(colors)}
-                      onValueChange={(v) => setColors(Number(v))}
-                      disabled={running}
-                    >
-                      <SelectTrigger id="colors" className="w-full">
-                        <SelectValue>{(v) => `${v} colors`}</SelectValue>
-                      </SelectTrigger>
-                      <SelectContent>
-                        {COLOR_CHOICES.map((c) => (
-                          <SelectItem key={c} value={String(c)}>
-                            {c} colors{c === 256 ? ' (best quality)' : ''}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </Field>
-                )}
-              </FieldGroup>
-            </PanelSection>
-
-          {doneCount > 0 && (
-            <PanelSection className="space-y-2 text-sm">
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Total</span>
-                  <span>
-                    {formatKb(totalIn)} → {formatKb(totalOut)}
-                  </span>
-                </div>
-                <Progress value={savingsPct(totalIn, totalOut)} />
-                <p className="text-xs text-muted-foreground">
-                  {savingsPct(totalIn, totalOut)}% smaller overall
-                </p>
-              </PanelSection>
-          )}
-        </LeftPanel>
-
-        <Canvas>
-          <div className="mx-auto flex max-w-4xl flex-col gap-4">
+    // No panes. Compress has no contents list to browse and no per-item properties to inspect,
+    // so the two 320px columns framed an empty middle and spent the whole left one on four
+    // controls. Those four ride over the canvas instead, Figma-style.
+    <div className="relative flex h-dvh min-w-0 flex-col bg-muted/40">
+      {/* pb-32 so the last queue row clears the bar rather than hiding under it. */}
+      <div className="min-h-0 flex-1 overflow-y-auto p-4 pb-32">
+        <div className="mx-auto flex max-w-4xl flex-col gap-4">
           {/* One surface, not two. An empty queue used to show a dropzone AND an illustration
               telling you to use it; now the empty state IS the target. Once files are in, the
               box shrinks back to a strip so more can still be added. */}
@@ -412,9 +334,131 @@ export default function PngCompressorPage() {
             </ul>
             </>
           )}
-          </div>
-        </Canvas>
-      </StudioShell>
+        </div>
+      </div>
+
+      {/* The floating bar. Frosted and lifted off the canvas rather than docked to an edge, so
+          it reads as a layer over the work — the queue keeps scrolling underneath it. */}
+      <div className="pointer-events-none absolute inset-x-0 bottom-4 z-30 flex justify-center px-4">
+        <div className="pointer-events-auto relative flex max-w-full items-center gap-1.5 overflow-hidden rounded-xl border bg-background/85 p-1.5 shadow-lg backdrop-blur-md">
+          <Popover>
+            <PopoverTrigger
+              render={
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Batch settings"
+                  title="Batch name, remove background, tile fit"
+                />
+              }
+            >
+              <SlidersHorizontalIcon />
+            </PopoverTrigger>
+            {/* side="top": the bar sits at the bottom, so the panel opens upward over the
+                canvas instead of off the bottom of the screen. */}
+            {/* max-h + scroll: Tile fit unfolds a whole safe-area editor in here, which is
+                taller than the viewport once the bar has taken the bottom of it. */}
+            <PopoverContent
+              side="top"
+              align="start"
+              className="max-h-[75dvh] w-80 overflow-y-auto p-0"
+            >
+              <div className="divide-y">
+                <section className="px-4 py-4">
+                  <Field>
+                    <FieldLabel htmlFor="png-batch-name">Batch name</FieldLabel>
+                    <Input
+                      id="png-batch-name"
+                      value={sessionName}
+                      onChange={(e) => setSessionName(e.target.value)}
+                      placeholder="Untitled batch"
+                    />
+                    <FieldDescription>Names the exported ZIP.</FieldDescription>
+                  </Field>
+                </section>
+                {/* Remove background and Tile fit — the pixel steps that run before the bytes
+                    get squeezed. Tile fit alone opens a whole safe-area editor, which is why
+                    these live behind the trigger rather than in the bar itself. */}
+                {proc.panel}
+              </div>
+            </PopoverContent>
+          </Popover>
+
+          <Separator orientation="vertical" className="mx-0.5 h-6" />
+
+          <Toggle
+            size="sm"
+            variant="outline"
+            pressed={lossless}
+            disabled={running}
+            onPressedChange={setLossless}
+            title="Skip quantization; oxipng squeeze only."
+          >
+            Lossless
+          </Toggle>
+
+          {/* Hidden, not greyed, while lossless — there is no palette left to choose. */}
+          {!lossless && (
+            <Select
+              value={String(colors)}
+              onValueChange={(v) => setColors(Number(v))}
+              disabled={running}
+            >
+              <SelectTrigger
+                size="sm"
+                aria-label="Palette colors"
+                title="Fewer colors → smaller files, more banding."
+              >
+                <SelectValue>{(v) => `${v} colors`}</SelectValue>
+              </SelectTrigger>
+              <SelectContent alignItemWithTrigger={false} side="top">
+                {COLOR_CHOICES.map((c) => (
+                  <SelectItem key={c} value={String(c)}>
+                    {c} colors{c === 256 ? ' (best quality)' : ''}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+
+          <Separator orientation="vertical" className="mx-0.5 h-6" />
+
+          <span className="px-1 text-xs whitespace-nowrap text-muted-foreground tabular-nums">
+            {statusText}
+          </span>
+
+          {running && (
+            <Button variant="outline" size="sm" onClick={() => abortRef.current?.abort()}>
+              <CircleStopIcon data-icon="inline-start" />
+              Stop
+            </Button>
+          )}
+
+          <Button
+            size="sm"
+            disabled={running || !items.length}
+            onClick={exportMode ? downloadZip : compressAll}
+          >
+            {running ? (
+              <Spinner data-icon="inline-start" />
+            ) : exportMode ? (
+              <DownloadIcon data-icon="inline-start" />
+            ) : (
+              <ShrinkIcon data-icon="inline-start" />
+            )}
+            {running ? 'Compressing…' : exportMode ? `Export ZIP (${doneCount})` : 'Compress all'}
+          </Button>
+
+          {/* Hairline along the bar's own bottom edge — the run's progress without spending a
+              row on a track. */}
+          {running && progress && (
+            <Progress
+              value={progress.pct}
+              className="absolute inset-x-0 bottom-0 h-0.5 rounded-none"
+            />
+          )}
+        </div>
+      </div>
     </div>
   );
 }

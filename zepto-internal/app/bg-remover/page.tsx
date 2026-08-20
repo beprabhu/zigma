@@ -86,6 +86,7 @@ import {
   type QueueFilter, type QueueSort,
 } from '@/lib/bg/quality';
 import { VERIFY_MODEL_ID, compareCutouts, filteredRects } from '@/lib/bg/verify';
+import { askSemantic, probeSemanticSidecar } from '@/lib/bg/semantic';
 import { QueueFilters } from '@/components/bg-remover/queue-filters';
 import { ColorPicker } from '@/components/color-picker';
 import { ColumnPicker } from '@/components/column-picker';
@@ -316,10 +317,10 @@ export default function BgRemover() {
   const [refine, setRefine] = usePersistedState('skuc_bgRefine', false);
   // Second inference on a tight subject crop for sharper edges. Off by default: it doubles the
   // per-image cost, which is the wrong trade for a batch.
-  const [highDetail, setHighDetail] = usePersistedState('skuc_bgHighDetail', false);
   // Drops flat graphic panels (colour strips, badges) the matte kept as foreground. Off by
   // default: it is a heuristic, so it only ever runs where it was asked for.
   const [productOnly, setProductOnly] = usePersistedState('skuc_bgProductOnly', false);
+  const [glass, setGlass] = usePersistedState('skuc_bgGlass', false);
   // Continuously sends newly flagged cutouts through the AI edit, no button press per wave.
   // Off by default: every send spends Azure money, so the standing order has to be explicit.
   const [autoAiFix, setAutoAiFix] = usePersistedState('skuc_bgAutoAiFix', false);
@@ -327,6 +328,10 @@ export default function BgRemover() {
   // On by default: the ambiguous band is small by construction, so the cost is a handful of
   // BiRefNet inferences per batch — and the failures it catches are the invisible ones.
   const [verifyPass, setVerifyPass] = usePersistedState('skuc_bgVerifyPass', true);
+  // Semantic pass: the optional Qwen sidecar answering "is anything here besides the product?"
+  // Off by default — it needs Ollama running locally and costs a few seconds per image, so it
+  // is opt-in the way the HQ server model is, not a silent tax on every batch.
+  const [semanticPass, setSemanticPass] = usePersistedState('skuc_bgSemanticPass', false);
   const [outputBg, setOutputBg] = usePersistedState('skuc_bgOutput', TRANSPARENT);
   // Save-project scope: embedding dropped files makes a .zesku self-contained (v2); off keeps
   // only cutouts + URLs for huge batches.
@@ -635,6 +640,11 @@ export default function BgRemover() {
   // A sweep that was owed while another was still unwinding. Without it, a batch short enough
   // to finish before the pre-empted sweep unwinds leaves the queue with no sweep at all.
   const verifyPendingRef = React.useRef(false);
+  // Whether the sidecar answered its health probe. Null while unknown, so the switch can stay
+  // hidden rather than offering a pass that would fail on every image.
+  const [semanticReady, setSemanticReady] = React.useState<boolean | null>(null);
+  const semanticAbortRef = React.useRef<AbortController | null>(null);
+  const semanticRef = React.useRef(false);
   // Every id that has been through an AI edit once, manual or auto. The auto-fix watcher never
   // resends one: an image that comes back still flagged after its regeneration would otherwise
   // cycle through Azure forever, spending money on an image the model cannot fix.
@@ -671,6 +681,7 @@ export default function BgRemover() {
       // would walk on after navigation and call ensurePool(), respawning the very workers
       // being torn down two lines below and reloading BiRefNet into them.
       verifyAbortRef.current?.abort();
+      semanticAbortRef.current?.abort();
       // Snapshot BEFORE the teardown below, then hand back every decoded original: releaseItem
       // revokes those blob: URLs and clearPreviews closes the cached bitmaps, so a snapshot that
       // kept them would revive a queue of broken images. `original` re-decodes from `source` on
@@ -1337,6 +1348,7 @@ export default function BgRemover() {
       removedRegions: result.removedRegions,
       originalInk: result.originalInk,
       originalComponents: result.originalComponents,
+      glass: result.glass,
       // The main-thread engine does not run band detection; the pooled worker path does.
       bands: [],
       regionReport: result.regionReport,
@@ -1381,8 +1393,8 @@ export default function BgRemover() {
     const shared = {
       model: runModel,
       refine: runRefine,
-      zoomPass: highDetail,
       productOnly,
+      glass,
       signal,
       onLoadProgress: setDownload,
       onStage: (next: RemoveStage) => {
@@ -1436,6 +1448,9 @@ export default function BgRemover() {
         // that no longer exists. Cleared here, re-earned by the next verify sweep if the new
         // evidence is still ambiguous.
         verify: undefined,
+        // Same reasoning as the cross-check above: the verdict described a picture that no
+        // longer exists, so it cannot ride along to a new matte.
+        semantic: undefined,
         // This row's evidence is no longer missing: the patch above writes the complete set
         // from a live run. Leaving the mark set would keep the row permanently out of the
         // verify band and out of the clean cohorts, for a file it no longer resembles.
@@ -1583,7 +1598,102 @@ export default function BgRemover() {
     // After the lock releases, never inside it: the sweep wants the same workers the batch
     // was saturating, and a cancelled run should not spend more inference on a queue the
     // user just stopped.
-    if (!ctrl.signal.aborted) void runVerifySweep();
+    if (!ctrl.signal.aborted) void runVerifySweep().then(() => runSemanticSweep());
+  }
+
+  // Probe the optional semantic sidecar once on mount, and again whenever the pass is switched
+  // on, so the UI can say "start Ollama" up front instead of failing once per image.
+  React.useEffect(() => {
+    let cancelled = false;
+    void probeSemanticSidecar().then((ok) => {
+      if (!cancelled) setSemanticReady(ok);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [semanticPass]);
+
+  /**
+   * Semantic pass over finished cutouts (lib/bg/semantic): asks the local Qwen sidecar whether
+   * anything besides the product survived the matte — the defect class the fitted model is
+   * structurally blind to, since none of its 33 inputs encode "a bowl".
+   *
+   * Runs AFTER the verify sweep so the two never contend for the machine, and only over items
+   * with no verdict yet; a verdict is cleared whenever a new matte replaces the picture it
+   * described, so a redo re-earns it.
+   *
+   * Sequential on purpose. One vision model is resident in Ollama and the GPU is the
+   * bottleneck, so parallel submission buys no throughput and only makes Stop less responsive.
+   */
+  async function runSemanticSweep() {
+    if (!semanticPass || runningRef.current || semanticRef.current) return;
+    semanticRef.current = true;
+    const ctrl = new AbortController();
+    semanticAbortRef.current = ctrl;
+    let checked = 0;
+    let flagged = 0;
+    try {
+      // Same one-macrotask wait as the verify sweep, for the same reason: itemsRef lags the
+      // commit by one flush, so reading it synchronously drops the batch's last item.
+      await new Promise((r) => setTimeout(r, 0));
+      if (runningRef.current) return;
+      // Re-probe rather than trusting the mount-time answer: Ollama may have been stopped
+      // since, and one health call is cheaper than N failing inferences.
+      if (!(await probeSemanticSidecar(ctrl.signal))) {
+        setSemanticReady(false);
+        return;
+      }
+      setSemanticReady(true);
+      // Already-flagged items are skipped for the same reason the verify sweep skips them, and
+      // here the reason is stronger: this verdict can only ADD a flag, so on an item the rules
+      // or the tree already flagged it cannot change the routing at all — it would be pure
+      // inference spent to confirm a decision that is already made. Measured on the 601-row
+      // labelled set the tree flags ~71%, so checking only the clean pile is roughly a 3x cut
+      // in what the pass costs.
+      const targets = itemsRef.current.filter(
+        (item) =>
+          item.status === 'done' &&
+          item.cutout &&
+          !item.semantic &&
+          assessQuality(item).level === 'ok',
+      );
+      if (!targets.length) return;
+      for (const item of targets) {
+        if (ctrl.signal.aborted || runningRef.current) break;
+        setProgress({
+          pct: (checked / targets.length) * 100,
+          text: `Semantic check ${checked + 1} of ${targets.length}…`,
+        });
+        try {
+          const verdict = await askSemantic(item.cutout!, ctrl.signal);
+          // null is "no answer" — sidecar stopped mid-sweep, or a reply the route would not
+          // strictly parse. Writing a clean verdict there would mark the row checked-and-fine
+          // on no evidence, so it stays unanswered and the next sweep retries it.
+          if (verdict) {
+            patchItem(item.id, { semantic: verdict });
+            if (verdict.extra) flagged += 1;
+          }
+        } catch (e) {
+          if (isAbortError(e)) break;
+          console.warn(`semantic check skipped for ${item.name}:`, errorMessage(e));
+        }
+        checked += 1;
+      }
+      // Same guard as the verify sweep: a pre-empted pass must not write a finished-looking
+      // line onto the progress bar the batch that pre-empted it is about to use.
+      if (checked > 0 && !ctrl.signal.aborted && !runningRef.current) {
+        const done = `Semantic check on ${checked} cutout${checked === 1 ? '' : 's'}`;
+        setProgress({
+          pct: 100,
+          text: flagged
+            ? `${done} — ${flagged} flagged for extras.`
+            : `${done} — nothing extra found.`,
+        });
+      }
+    } finally {
+      semanticRef.current = false;
+      semanticAbortRef.current = null;
+    }
   }
 
   /**
@@ -1641,10 +1751,9 @@ export default function BgRemover() {
           original = await decodeOriginal(item);
           const shared = {
             model: VERIFY_MODEL_ID,
-            // The check compares SHAPES at 512px — refine and the zoom pass sharpen edges
-            // that comparison cannot see, at double the cost.
+            // The check compares SHAPES at 512px — refinement sharpens edges that comparison
+            // cannot see, at extra cost.
             refine: false,
-            zoomPass: false,
             // Deliberately UNFILTERED, whatever the page's current switch says. The filter is
             // a second heuristic on top of the matte, and running it here would make the check
             // answer "do the two models plus two filter passes agree?" — a marketing banner
@@ -2005,6 +2114,7 @@ export default function BgRemover() {
       originalInk: item.prev.originalInk,
       originalComponents: item.prev.originalComponents,
       verify: item.prev.verify,
+      semantic: item.prev.semantic,
       bands: item.prev.bands,
     });
   }
@@ -2622,6 +2732,21 @@ export default function BgRemover() {
               <Switch checked={verifyPass} onCheckedChange={setVerifyPass} />
               Verify
             </label>
+            <label
+              className="flex items-center gap-1.5 text-xs text-muted-foreground"
+              title={
+                semanticReady
+                  ? 'After each batch, ask the local vision model whether anything survived besides the product — props, stands, spilled contents, stray banners. Local and free; a few seconds per image.'
+                  : 'Needs the local vision sidecar. Start it with: ollama serve (and ollama pull qwen2.5vl:7b)'
+              }
+            >
+              <Switch
+                checked={semanticPass}
+                onCheckedChange={setSemanticPass}
+                disabled={semanticReady === false}
+              />
+              Semantic
+            </label>
           </Field>
         </FieldGroup>
       </PanelSection>
@@ -2992,24 +3117,24 @@ export default function BgRemover() {
                       />
                     </Field>
 
-                    <Field orientation="horizontal">
-                      <FieldLabel htmlFor="bg-high-detail" className="font-normal">
-                        <Hint hint="Re-runs the model on a tight crop of the subject for sharper edges — about twice as slow per image.">
-                          High detail (two passes)
-                        </Hint>
-                      </FieldLabel>
-                      <Switch
-                        id="bg-high-detail"
-                        checked={highDetail}
-                        disabled={busy}
-                        onCheckedChange={(checked) => setHighDetail(checked === true)}
-                      />
-                    </Field>
-
                     {/* Belongs here, not with the AI edit: this runs on EVERY removal and
                         changes the exported cutout. (The AI card's "Focus on main subject" only
                         crops the reference sent to Azure and leaves the cutout alone — it reads
                         this option's region analysis, which is the whole of their relationship.) */}
+                    <Field orientation="horizontal">
+                      <FieldLabel htmlFor="bg-glass" className="font-normal">
+                        <Hint hint="For clear plastic, glass and blister packs: rebuilds see-through areas the matte cut as a soft alpha instead of a hole, and strips the studio white out of their colour. Needs a plain, even background.">
+                          Keep transparency
+                        </Hint>
+                      </FieldLabel>
+                      <Switch
+                        id="bg-glass"
+                        checked={glass}
+                        disabled={busy}
+                        onCheckedChange={(checked) => setGlass(checked === true)}
+                      />
+                    </Field>
+
                     <Field orientation="horizontal">
                       <FieldLabel htmlFor="bg-product-only" className="font-normal">
                         <Hint hint="Drops flat colour strips and badges the model kept, and re-measures the subject without them. Only affects graphics detached from the product.">

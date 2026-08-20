@@ -19,7 +19,9 @@ export const RPM_KEY = 'skuc_requestsPerMin';
 /** 0 = unlimited. */
 export const DEFAULT_RPM = 0;
 
-const RPM_MAX = 600; // sanity cap for the input; Azure image deployments sit far below this
+/** Sanity cap for the input; Azure image deployments sit far below this. Exported so the
+ *  Settings input and this clamp cannot drift apart. */
+export const RPM_MAX = 600;
 
 export function clampRpm(v: unknown): number {
   const n = typeof v === 'number' && Number.isFinite(v) ? Math.floor(v) : DEFAULT_RPM;
@@ -43,7 +45,13 @@ export function useRpm() {
 
 export const PARALLEL_KEY = 'skuc_parallelRequests';
 export const DEFAULT_PARALLEL = 3;
-const PARALLEL_MAX = 8;
+/**
+ * Sanity cap only — nothing about Azure or the pipeline breaks above it. It exists so a
+ * mistyped 500 cannot open 500 lanes at once. Exported for the same reason as RPM_MAX: the
+ * Settings input used to repeat the number as a literal, so raising the clamp here left the
+ * field still refusing the value.
+ */
+export const PARALLEL_MAX = 32;
 
 export function clampParallel(v: unknown): number {
   const n = typeof v === 'number' && Number.isFinite(v) ? Math.floor(v) : DEFAULT_PARALLEL;
