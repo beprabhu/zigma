@@ -6,13 +6,15 @@ import * as React from 'react';
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { SettingsIcon } from 'lucide-react';
+import { PlusIcon, SettingsIcon } from 'lucide-react';
 
 import { SettingsDialog } from '@/components/settings-dialog';
 import { ZigmaMark } from '@/components/zigma-mark';
 
 import { ThemeToggle } from '@/components/theme-toggle';
 import { PRODUCTS, productForPathname, productHref } from '@/lib/products';
+import { requestNew } from '@/lib/files/open';
+import type { ToolSlug } from '@/lib/files/types';
 import { cn } from '@/lib/utils';
 
 export function AppSidebar() {
@@ -61,7 +63,9 @@ export function AppSidebar() {
           the extra top/bottom margin separates "logo" from "navigation". */}
       <Link
         href="/"
-        title="Zigma — all products"
+        // The mark is the way back to the file browser, so it says so: home stopped being a
+        // launcher when it became the grid of everything the user has worked on.
+        title="Zigma — your files"
         className="mt-2 mb-4 flex size-11 items-center justify-center rounded-xl outline-none transition-colors hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-sidebar-ring"
       >
         <ZigmaMark className="size-8" />
@@ -70,20 +74,42 @@ export function AppSidebar() {
       {PRODUCTS.map((product) => {
         const active = current?.slug === product.slug;
         return (
-          <Link
-            key={product.slug}
-            href={productHref(product)}
-            aria-current={active ? 'page' : undefined}
-            className={cn(
-              'flex w-16 flex-col items-center gap-1 rounded-lg px-1 py-2 text-sidebar-foreground/70 outline-none transition-colors',
-              'hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring',
-              active && 'bg-sidebar-accent text-sidebar-accent-foreground',
-            )}
-          >
-            <product.icon className="size-5" />
-            {/* Two centred lines max; 10px is the Figma-rail size and stays legible at w-16. */}
-            <span className="line-clamp-2 text-center text-[10px] leading-tight">{product.name}</span>
-          </Link>
+          <div key={product.slug} className="group/rail relative">
+            <Link
+              href={productHref(product)}
+              aria-current={active ? 'page' : undefined}
+              className={cn(
+                'flex w-16 flex-col items-center gap-1 rounded-lg px-1 py-2 text-sidebar-foreground/70 outline-none transition-colors',
+                'hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring',
+                active && 'bg-sidebar-accent text-sidebar-accent-foreground',
+              )}
+            >
+              <product.icon className="size-5" />
+              {/* Two centred lines max; 10px is the Figma-rail size and stays legible at w-16. */}
+              <span className="line-clamp-2 text-center text-[10px] leading-tight">{product.name}</span>
+            </Link>
+            {/*
+              A plain click resumes whatever file this tool had open, which is the right default and
+              on its own a dead end — there would be no way to ever have a second file in a tool.
+              This is that way out. Hover-revealed rather than always on, because it is the rarer of
+              the two actions and the rail is 64px wide; it stays reachable from the keyboard through
+              focus-within, so it is not mouse-only.
+            */}
+            <Link
+              href={productHref(product)}
+              onClick={() => requestNew(product.slug as ToolSlug)}
+              title={`New ${product.name} file`}
+              className={cn(
+                'absolute top-1 right-0 flex size-5 items-center justify-center rounded-md border bg-sidebar text-sidebar-foreground/70',
+                'opacity-0 transition-opacity outline-none',
+                'group-hover/rail:opacity-100 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-sidebar-ring',
+                'hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
+              )}
+            >
+              <PlusIcon className="size-3" />
+              <span className="sr-only">New {product.name} file</span>
+            </Link>
+          </div>
         );
       })}
 

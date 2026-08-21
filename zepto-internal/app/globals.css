@@ -75,13 +75,20 @@
   --primary-foreground: oklch(1 0 0);                        /* figma text-onbrand #ffffff */
   --secondary: oklch(0.3407 0 0);                            /* figma bg-secondary #383838 */
   --secondary-foreground: oklch(1 0 0);
-  /* Its own step, distinct from --popover. Both were oklch(0.3407 0 0), which made every
-     bg-muted surface invisible on a dialog: shadcn marks a pressed toggle with bg-muted, so a
-     selected segment was the popover's own colour painted onto itself. Every neighbour here
-     cites a Figma token; this one never did, which is the tell that it was copied from
-     bg-secondary rather than chosen. The value is a step past --border (0.3867) on the same
-     ladder — NOT read from Figma, so confirm it against the design file. */
-  --muted: oklch(0.4 0 0);
+  /* BELOW --background, like this file's own light mode (0.9702 under 1.0). bg-muted has to
+     stay legible against FOUR different grounds at once, and the neighbours here (bg 44,
+     bg-secondary 56, border 68 in 8-bit) leave a very narrow lane between them:
+       · page panel — 44 — pressed Toggle, dropzone chip
+       · combobox field — 51 — the chip inside it, over an input/30 fill
+       · dialog — 56 — the TabsList track, which must read recessed
+       · the track itself — the active tab lifts off it via bg-input/30
+     Anything BETWEEN 44 and 56 collides with the 51 field fill (0.3169 measured 1/255 off it,
+     hiding every combobox chip), and anything at or above 56 flattens the tab lift (0.4 left
+     the active tab 1/255 from its own strip). Dropping below the panel clears all four:
+     measured margins 10 / 17 / 22 / 10. Pressed states then read INSET rather than raised,
+     which is the trade this palette's spacing forces. No Figma token sits under bg, so this
+     value is chosen, not cited — the margins above are what justify it. */
+  --muted: oklch(0.25 0 0);
   --muted-foreground: oklch(1 0 0 / 0.70);                   /* figma text-secondary #ffffffb2 */
   --accent: oklch(0.4619 0.0553 266.0264);                   /* figma bg-selected #4a5878 */
   --accent-foreground: oklch(1 0 0 / 0.90);                  /* figma text-onselected #ffffffe5 */

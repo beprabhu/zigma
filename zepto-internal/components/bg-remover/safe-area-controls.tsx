@@ -49,6 +49,73 @@ export interface SafeAreaControlsProps {
   onChange: (next: SafeAreaConfig) => void;
   onReset: () => void;
   disabled?: boolean;
+  /**
+   * Whether to render the background picker inside this block. Default true, which is what
+   * every caller that only ever shows these controls WITH tile fit on wants. Cleanup passes
+   * false: there the background applies to untiled exports and previews too, so its control
+   * has to stay on screen when tile fit is off — it renders <BackgroundField> itself, above
+   * this block, and the two would otherwise be the same setting drawn twice.
+   */
+  showBackground?: boolean;
+}
+
+export interface BackgroundFieldProps {
+  value: string;
+  onChange: (next: string) => void;
+  disabled?: boolean;
+  /** Field title. "Background" inside the tile controls; callers outside may want more. */
+  label?: string;
+}
+
+/**
+ * The background picker, on its own so it can be mounted outside the tile-fit block.
+ * Owns the remembered custom colour, so switching Transparent -> Custom returns to the shade
+ * that was picked rather than to the default.
+ */
+export function BackgroundField({
+  value, onChange, disabled, label = 'Background',
+}: BackgroundFieldProps): React.JSX.Element {
+  const [customBg, setCustomBg] = React.useState(() =>
+    backgroundMode(value) === 'custom' && HEX6.test(value) ? value : FALLBACK_CUSTOM_BG,
+  );
+  const mode = backgroundMode(value);
+  const colorValue = mode === 'custom' && HEX6.test(value) ? value : customBg;
+
+  return (
+    <Field className="gap-1.5">
+      <FieldTitle className="text-xs font-normal">{label}</FieldTitle>
+      <div className="flex items-center gap-2">
+        <ToggleGroup
+          size="sm"
+          variant="outline"
+          spacing={0}
+          disabled={disabled}
+          value={[mode]}
+          onValueChange={(next) => {
+            const picked = next[0];
+            if (picked === 'transparent') onChange(TRANSPARENT);
+            else if (picked === 'white') onChange(WHITE);
+            else if (picked === 'custom') onChange(customBg);
+          }}
+        >
+          <ToggleGroupItem value="transparent">Transparent</ToggleGroupItem>
+          <ToggleGroupItem value="white">White</ToggleGroupItem>
+          <ToggleGroupItem value="custom">Custom</ToggleGroupItem>
+        </ToggleGroup>
+        <ColorPicker
+          aria-label="Custom background colour"
+          showValue={false}
+          disabled={disabled}
+          value={colorValue}
+          onChange={(next) => {
+            setCustomBg(next);
+            onChange(next);
+          }}
+          className="h-7 shrink-0"
+        />
+      </div>
+    </Field>
+  );
 }
 
 // Sentinel select value. No TilePreset uses this id, so it can never shadow a real preset.
@@ -70,15 +137,9 @@ const SIDE_LABELS: Record<keyof SafeAreaMargins, string> = {
   left: 'Left',
 };
 
-/**
- * The side each field controls, drawn as the panel that edge pushes IN from — so the left
- * margin gets the right-opening panel, and so on across the pair. The icon reads as the gap
- * itself rather than as an arrow pointing somewhere, which is what a margin actually is.
- *
- * The label they replace carried the unit ("Left (%)"); that is not lost, because the %/px
- * toggle sits directly above the four fields and said the same thing four times over. The
- * text survives as the accessible name and the hover title.
- */
+// One letter over each field — the row is too narrow for "Left". It carries no unit ("Left"
+// not "Left (%)"): the %/px toggle sits directly above the four fields and would otherwise say
+// the same thing four times. The full side name survives as the accessible name and the title.
 const SIDE_ABBR: Record<keyof SafeAreaMargins, string> = {
   left: 'L',
   top: 'T',
@@ -86,6 +147,12 @@ const SIDE_ABBR: Record<keyof SafeAreaMargins, string> = {
   bottom: 'B',
 };
 
+/**
+ * The side each field controls, drawn as the panel that edge pushes IN from — so the left
+ * margin gets the right-opening panel, and so on across the pair. The icon reads as the gap
+ * itself rather than as an arrow pointing somewhere, which is what a margin actually is; it
+ * sits inside the box, under the L/T/R/B label that names the side.
+ */
 const SIDE_ICONS: Record<keyof SafeAreaMargins, typeof PanelRightOpenIcon> = {
   left: PanelRightOpenIcon,
   right: PanelLeftOpenIcon,
@@ -116,12 +183,14 @@ function clamp(value: number, min: number, max: number): number {
 
 interface NumberFieldProps {
   id: string;
-  /** Always the written name. With `abbr` it is what the tooltip and screen reader get. */
+  /** The written name — the tooltip and the screen-reader name for the icon fields. */
   label: string;
-  /** One letter shown in place of the full name: L/T/R/B, where the row would not fit "Left". */
+  /** The short visible label shown above an icon field: L/T/R/B, where "Left" would not fit. */
   abbr?: string;
-  /** Figma-style: the side glyph sits INSIDE the field and replaces the label row. */
+  /** Figma-style: the side glyph sits INSIDE the field, under its own short label. */
   icon?: typeof PanelRightOpenIcon;
+  /** A unit shown INSIDE the box at the trailing edge (e.g. "px"), for the plain fields. */
+  suffix?: string;
   value: number;
   onValueChange: (next: number) => void;
   min?: number;
@@ -137,6 +206,7 @@ function NumberField({
   label,
   abbr,
   icon: Icon,
+  suffix,
   value,
   onValueChange,
   min,
@@ -177,18 +247,13 @@ function NumberField({
     onBlur: () => setDraft(null),
   };
 
-  // With an icon the label row disappears entirely and the glyph moves inside the box, the way
-  // Figma labels padding. That buys back a whole row per field — the reason to use icons at all
-  // — but an icon names nothing to a screen reader, so the text stays as an sr-only label and
-  // as the hover title.
+  // Icon field: the short label (L/T/R/B) names the side above the box, and the glyph inside
+  // it — Figma-style, where a label would sit — reinforces which edge without spending a
+  // second row. The full "Left" reaches a screen reader through aria-label and the hover title.
   if (Icon) {
     return (
       <Field className="gap-1">
-        <FieldLabel
-          htmlFor={id}
-          title={label}
-          className="text-[11px] font-normal text-muted-foreground"
-        >
+        <FieldLabel htmlFor={id} title={label} className="text-xs font-normal">
           {abbr ?? label}
         </FieldLabel>
         <InputGroup title={label}>
@@ -196,24 +261,34 @@ function NumberField({
             <Icon className="size-3.5" aria-hidden />
           </InputGroupAddon>
           {/* px-0: the addon already supplies the gap, and the control's own left padding
-              pushed the number away from its icon.
-
-              aria-label carries the written name rather than a hidden twin inside the <label>:
-              "L" is only legible beside its three siblings, and a screen reader reaches the
-              field on its own. Naming the input directly also settles the name outright, where
-              a visible letter plus a hidden phrase leaves it to accname's aria-hidden rules. */}
-          <InputGroupInput {...controlProps} aria-label={label} className="px-0 text-xs" />
+              pushed the number away from its icon. No text size: Input's own
+              `text-base md:text-sm` is the suite's control text, and a `text-xs` here only
+              ever bit below 768px — shrinking these four while the Select beside them stayed
+              put. */}
+          <InputGroupInput {...controlProps} aria-label={label} className="px-0" />
         </InputGroup>
       </Field>
     );
   }
 
+  // Plain field: a foreground label (the panel's one label style) over the box. A unit, when
+  // there is one, rides INSIDE the box at the trailing edge as subtext — "Width" reads cleaner
+  // than "Width (px)", and the px sits where the value it qualifies actually is.
   return (
     <Field className="gap-1">
-      <FieldLabel htmlFor={id} className="text-[11px] font-normal text-muted-foreground">
+      <FieldLabel htmlFor={id} className="text-xs font-normal">
         {label}
       </FieldLabel>
-      <Input {...controlProps} className="h-8 text-xs" />
+      {suffix ? (
+        <InputGroup>
+          <InputGroupInput {...controlProps} />
+          <InputGroupAddon align="inline-end" className="text-muted-foreground">
+            {suffix}
+          </InputGroupAddon>
+        </InputGroup>
+      ) : (
+        <Input {...controlProps} />
+      )}
     </Field>
   );
 }
@@ -223,14 +298,10 @@ export function SafeAreaControls({
   onChange,
   onReset,
   disabled = false,
+  showBackground = true,
 }: SafeAreaControlsProps): React.JSX.Element {
   const [customTile, setCustomTile] = React.useState(false);
   const [linkMargins, setLinkMargins] = React.useState(false);
-  const [customBg, setCustomBg] = React.useState(() =>
-    backgroundMode(config.background) === 'custom' && HEX6.test(config.background)
-      ? config.background
-      : FALLBACK_CUSTOM_BG,
-  );
 
   function patch(next: Partial<SafeAreaConfig>) {
     onChange({ ...config, ...next });
@@ -303,40 +374,32 @@ export function SafeAreaControls({
     onReset();
   }
 
-  function handleBackgroundMode(mode: BackgroundMode) {
-    if (mode === 'transparent') patch({ background: TRANSPARENT });
-    else if (mode === 'white') patch({ background: WHITE });
-    else patch({ background: customBg });
-  }
-
-  const bgMode = backgroundMode(config.background);
-  const colorValue = bgMode === 'custom' && HEX6.test(config.background) ? config.background : customBg;
   const fillPct = Math.round(clamp(Number.isFinite(config.fill) ? config.fill : 1, 0, 1) * 100);
   const unitSuffix = config.marginUnit === 'percent' ? '%' : 'px';
 
   return (
     <FieldGroup className="gap-4">
-      <div className="flex items-center justify-between gap-2">
-        <FieldTitle className="text-sm">Safe area</FieldTitle>
-        <Button
-          variant="ghost"
-          size="xs"
-          disabled={disabled}
-          onClick={handleReset}
-          className="text-muted-foreground"
-        >
-          <RotateCcwIcon />
-          Reset
-        </Button>
-      </div>
-
-      <Separator />
-
-      {/* Tile size ------------------------------------------------------------------ */}
+      {/* Tile size — and the section's Reset. There is no "Safe area" sub-heading: the
+          PanelSection this lives in is already titled "Tile fit", and a second line under it
+          named the same thing at a second weight. Reset keeps its top-right corner as an icon
+          and still clears the whole safe area, panel affordances included. */}
       <Field className="gap-1.5">
-        <FieldLabel htmlFor="safe-area-tile" className="text-xs">
-          Tile size
-        </FieldLabel>
+        <div className="flex items-center justify-between gap-2">
+          <FieldLabel htmlFor="safe-area-tile" className="text-xs">
+            Tile size
+          </FieldLabel>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            disabled={disabled}
+            onClick={handleReset}
+            aria-label="Reset safe area"
+            title="Reset safe area"
+            className="-my-1 text-muted-foreground"
+          >
+            <RotateCcwIcon />
+          </Button>
+        </div>
         <Select
           items={TILE_ITEMS}
           value={tileValue}
@@ -346,7 +409,19 @@ export function SafeAreaControls({
             handleTilePreset(String(v));
           }}
         >
-          <SelectTrigger id="safe-area-tile" size="sm" className="h-8 w-full text-xs">
+          {/* Default size and no text override, so this reads as the same control as every
+              other Select in the suite (12.6px on a 28.8px box) and lines up with the Width /
+              Height fields directly below it.
+
+              What it used to say — `size="sm" className="h-8 text-xs"` — asked for two
+              contradictory heights and lost: `data-[size=sm]:h-7` is an attribute selector, so
+              it outranks a plain `h-8` and the field rendered 25.2px, not the 28.8px the class
+              was there to get. The `text-xs` DID land, and that is the whole reason this select
+              was the only shrunken one on the panel: Input carries `text-base md:text-sm`, so a
+              `text-xs` beside it dies against the md: variant at this width, while
+              SelectTrigger's plain `text-sm` loses to it outright. Same class, two components,
+              opposite outcomes. */}
+          <SelectTrigger id="safe-area-tile" className="w-full">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -362,7 +437,8 @@ export function SafeAreaControls({
           <div className="grid grid-cols-2 gap-2 pt-1">
             <NumberField
               id="safe-area-tile-w"
-              label="Width (px)"
+              label="Width"
+              suffix="px"
               value={config.tile.width}
               min={1}
               max={8192}
@@ -371,7 +447,8 @@ export function SafeAreaControls({
             />
             <NumberField
               id="safe-area-tile-h"
-              label="Height (px)"
+              label="Height"
+              suffix="px"
               value={config.tile.height}
               min={1}
               max={8192}
@@ -387,7 +464,7 @@ export function SafeAreaControls({
       {/* Margins -------------------------------------------------------------------- */}
       <Field className="gap-1.5">
         <div className="flex items-center justify-between gap-2">
-          <FieldTitle className="text-xs">
+          <FieldTitle className="text-xs font-normal">
             <Hint hint="Negative values bleed the safe area past the tile edge.">Margins</Hint>
           </FieldTitle>
           <div className="flex items-center gap-1.5">
@@ -423,26 +500,20 @@ export function SafeAreaControls({
             </ToggleGroup>
           </div>
         </div>
-        {/* Anchor and margins share the row. They were stacked with a rule between them, which
-            spent two headings and a divider on eight small controls that are read together —
-            "where does the subject sit, and how much room does it get". Side by side, the whole
-            question fits without scrolling.
-
-            Both columns lead with a label row — "Anchor" on one side, L/T/R/B on the other —
-            and that is what holds the anchor box level with the first margin field. Take the
-            letters away and the margin column has no label row to match, so it rides up level
-            with the WORD "Anchor" rather than with the box under it. */}
+        {/* Anchor pad and the four margin fields sit side by side — "where does the subject
+            sit" next to "how much room does it get". Each column leads with a label row —
+            "Anchor" over the pad, L/T/R/B over the fields — and that shared label row is what
+            keeps the pad level with the first row of fields rather than riding up a line. */}
         <div className="flex gap-3">
           <div className="shrink-0 space-y-1">
-            {/* A field label, not a heading. Anchor is a sibling of Left/Top/Right/Bottom —
-                one of the five things being set — so it takes their label style rather than
-                competing with "Margins" for section rank. */}
-            <FieldLabel className="text-[11px] font-normal text-muted-foreground">
+            {/* A field label, not a heading: Anchor is a sibling of L/T/R/B, one of the five
+                things being set, so it takes the label style rather than the "Margins" rank. */}
+            <FieldLabel className="text-xs font-normal">
               <Hint hint="Where the subject sits inside the safe area once it has been scaled.">
                 Anchor
               </Hint>
             </FieldLabel>
-          <div
+            <div
               className={cn(
                 'w-fit rounded-lg border border-input bg-muted/40 p-1.5',
                 disabled && 'opacity-50',
@@ -506,12 +577,12 @@ export function SafeAreaControls({
         </div>
       </Field>
 
-      <Separator />
-
-      {/* Fill ----------------------------------------------------------------------- */}
+      {/* Fill sits in the same group as Margins — no divider between them. Both answer "how
+          much room does the subject get": the margins set the box, the slider sets how much of
+          it the subject fills. */}
       <Field className="gap-1.5">
         <div className="flex items-baseline justify-between gap-2">
-          <FieldTitle className="text-xs">
+          <FieldTitle className="text-xs font-normal">
             <Hint hint="How much of the safe area the subject may occupy.">Fill safe area</Hint>
           </FieldTitle>
           <span className="text-xs text-muted-foreground tabular-nums">{fillPct}%</span>
@@ -552,42 +623,15 @@ export function SafeAreaControls({
         />
       </Field>
 
-      <Separator />
-
-      {/* Background ----------------------------------------------------------------- */}
-      <Field className="gap-1.5">
-        <FieldTitle className="text-xs">Background</FieldTitle>
-        <div className="flex items-center gap-2">
-          <ToggleGroup
-            size="sm"
-            variant="outline"
-            spacing={0}
-            disabled={disabled}
-            value={[bgMode]}
-            onValueChange={(next) => {
-              const mode = next[0];
-              if (mode === 'transparent' || mode === 'white' || mode === 'custom') {
-                handleBackgroundMode(mode);
-              }
-            }}
-          >
-            <ToggleGroupItem value="transparent">Transparent</ToggleGroupItem>
-            <ToggleGroupItem value="white">White</ToggleGroupItem>
-            <ToggleGroupItem value="custom">Custom</ToggleGroupItem>
-          </ToggleGroup>
-          <ColorPicker
-            aria-label="Custom background colour"
-            showValue={false}
-            disabled={disabled}
-            value={colorValue}
-            onChange={(next) => {
-              setCustomBg(next);
-              patch({ background: next });
-            }}
-            className="h-7 shrink-0"
-          />
-        </div>
-      </Field>
+      {/* Background shares the render group with Allow upscale — no divider between them; both
+          are about how the cutout comes out, not where it sits. */}
+      {showBackground && (
+        <BackgroundField
+          value={config.background}
+          onChange={(next) => patch({ background: next })}
+          disabled={disabled}
+        />
+      )}
     </FieldGroup>
   );
 }

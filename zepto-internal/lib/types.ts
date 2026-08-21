@@ -61,7 +61,8 @@ export interface GridBand {
   headers: string[];
   records: CsvRecord[];
   imageCols: string[];
-  titleCol: string;
+  /** Columns joined into the tile's title, in CSV order. Empty = no title drawn. */
+  titleCols: string[];
   offerCol: string;
 }
 

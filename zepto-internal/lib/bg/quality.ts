@@ -331,6 +331,11 @@ const VERIFY_NEAR_COLLAPSE_RATIO = 0.6;
 /** Pure — safe to call on every render; no image decode, just arithmetic over stored fields. */
 export function assessQuality(item: BgItem): QualityAssessment {
   if (item.status !== 'done' || !item.cutout) return OK;
+  // A person's override wins over the heuristic. 'clear' takes a flagged cutout OUT of the
+  // worklist; 'flag' forces one in with a plain reason, so the badge and the filters agree on
+  // why. Computed reasons are intentionally dropped here — the override IS the verdict now.
+  if (item.manualFlag === 'clear') return OK;
+  if (item.manualFlag === 'flag') return { level: 'warn', reasons: ['Flagged manually'] };
   const { bounds, width, height } = item.cutout;
 
   if (!bounds) {

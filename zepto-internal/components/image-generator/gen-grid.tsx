@@ -146,7 +146,8 @@ export function GenGrid({
  */
 export function GenDialog({
   item,
-  previewPrompt,
+  defaultPrompt,
+  rowContext,
   size,
   running,
   onClose,
@@ -154,7 +155,10 @@ export function GenDialog({
   onUndo,
 }: {
   item: GenItem | null;
-  previewPrompt: string;
+  /** The BRIEF — the editable half. The row's own block arrives separately as rowContext. */
+  defaultPrompt: string;
+  /** Read-only row/subject block shown under "Send with the prompt", like Cleanup's CSV. */
+  rowContext?: string;
   size: GenSize;
   running: boolean;
   onClose: () => void;
@@ -181,59 +185,89 @@ export function GenDialog({
   const line = item ? genStatusLine(item) : null;
   return (
     <Dialog open={item !== null} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-h-[85dvh] w-full overflow-x-hidden overflow-y-auto sm:max-w-3xl">
+      {/* Cleanup's shell, verbatim: a fixed-height flex column — pinned header, one scrolling
+          middle, pinned footer — at the same 4xl width, so the two products' dialogs read as
+          the same surface. */}
+      <DialogContent className="flex max-h-[85dvh] w-full flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl">
         {item && (
           <>
-            <DialogHeader className="min-w-0">
-              <DialogTitle className="truncate" title={item.name}>{item.name}</DialogTitle>
-              <DialogDescription className={line?.error ? 'text-destructive' : undefined}>
-                {line?.text}
-              </DialogDescription>
-            </DialogHeader>
+            <div className="shrink-0 border-b px-5 pt-5 pb-4">
+              <DialogHeader className="min-w-0 gap-2">
+                <div className="flex min-h-8 min-w-0 items-center gap-2 pr-10">
+                  <DialogTitle className="min-w-0 truncate" title={item.name}>{item.name}</DialogTitle>
+                  <DialogDescription
+                    className={cn('shrink-0 text-xs', line?.error && 'text-destructive')}
+                  >
+                    {line?.text}
+                  </DialogDescription>
+                </div>
+              </DialogHeader>
+            </div>
 
-            {/* There is no "before" image in a text-to-image product, so the result gets the
-                middle on its own and the prompt sits under it — the same place Compose and
-                Cleanup put theirs. */}
-            <div className="mx-auto w-full max-w-sm space-y-1.5">
-              <div className="text-xs font-medium text-muted-foreground">Generated image</div>
-              <div className={cn('grid place-items-center overflow-hidden rounded-lg border bg-muted/30 p-2', GEN_ASPECT[size])}>
-                {item.image ? (
-                  <img
-                    src={item.image.src}
-                    alt=""
-                    className="max-h-full max-w-full min-h-0 min-w-0 object-contain"
-                  />
-                ) : item.status === 'generating' ? (
-                  <Spinner className="size-5 text-primary" />
-                ) : (
-                  <span className="text-xs text-muted-foreground">Not generated yet</span>
-                )}
+            <div className="bg-scroll-slim min-h-0 space-y-4 overflow-y-auto px-5 py-4 [scrollbar-gutter:stable]">
+              {/* Image LEFT, console right — Cleanup's split. One pane only: a text-to-image row
+                  has no "original" picture, so the left column is the result alone at the
+                  panel's chosen output shape. */}
+              <div className="grid min-w-0 gap-4 sm:grid-cols-[minmax(0,24rem)_minmax(0,1fr)]">
+                <div className="flex min-w-0 flex-col gap-1.5">
+                  <div className="text-xs text-muted-foreground">Generated image</div>
+                  <div className={cn('grid w-full place-items-center overflow-hidden rounded-lg border bg-muted/30 p-2', GEN_ASPECT[size])}>
+                    {item.image ? (
+                      <img
+                        src={item.image.src}
+                        alt=""
+                        className="max-h-full max-w-full min-h-0 min-w-0 object-contain"
+                      />
+                    ) : item.status === 'generating' ? (
+                      <Spinner className="size-5 text-primary" />
+                    ) : (
+                      <span className="text-xs text-muted-foreground">Not generated yet</span>
+                    )}
+                  </div>
+                </div>
+
+                {/* Same trick as Cleanup's AI tab: a relative cell the console fills absolutely,
+                    so the prompt scrolls INSIDE the row rather than growing the dialog. min-h is
+                    the floor — without it the row is whatever the image happens to be, and a
+                    square thumbnail left the textarea pinned at its 115px minimum under the
+                    send-with card. The row is now max(image, 24rem), so the modal sizes to
+                    content and only scrolls once it hits the dialog's own 85dvh cap. */}
+                <div className="relative min-h-[32rem] min-w-0">
+                  <div className="absolute inset-0 flex min-h-0 flex-col">
+                    {/* Keyed by row: a prompt tweaked for one image never opens on the next.
+                        defaultPrompt is the brief alone with the row attached read-only — the
+                        split Cleanup's AI edit makes; the page re-joins the two at send time.
+                        sentPrompt is deliberately not seeded: it records the assembled string,
+                        and seeding it into a brief-only editor would double the row block. */}
+                    <RegenPrompt
+                      key={item.id}
+                      defaultPrompt={defaultPrompt}
+                      rowContext={rowContext}
+                      busy={running}
+                      working={item.status === 'generating'}
+                      disabled={false}
+                      hint="Send this row to Azure again"
+                      source={{
+                        latestLabel: 'Generated image',
+                        originalLabel: 'Text only',
+                        hasLatest: !!item.image,
+                        hasOriginal: true,
+                        note: 'The image is sent to be edited; text only re-runs the prompt from scratch.',
+                      }}
+                      actionLabel="Regenerate"
+                      copyable={false}
+                      collapsible={false}
+                      fill
+                      onRegenerate={(p, from) => onRegenerate(item.id, p, from)}
+                    />
+                  </div>
+                </div>
               </div>
             </div>
 
-            {/* Keyed by row: a prompt tweaked for one image never opens on the next. */}
-            {/* Generate is the one product where the two sources are not two pictures: this row
-                has no input image, only whatever it produced last. So the choice is edit that
-                result, or re-run the prompt with no image at all — and the picker hides itself
-                on a row that has never generated, where only the second exists. */}
-            <RegenPrompt
-              key={item.id}
-              defaultPrompt={previewPrompt}
-              sentPrompt={item.sentPrompt}
-              busy={running}
-              working={item.status === 'generating'}
-              hint="Send this row to Azure again"
-              source={{
-                latestLabel: 'Generated image',
-                originalLabel: 'Text only',
-                hasLatest: !!item.image,
-                hasOriginal: true,
-                note: 'The image is sent to be edited; text only re-runs the prompt from scratch.',
-              }}
-              onRegenerate={(p, from) => onRegenerate(item.id, p, from)}
-            />
-
-            <DialogFooter className="flex-wrap gap-2">
+            {/* m-0 neutralises DialogFooter's -mx-4 -mb-4 bleed; bg-transparent its muted/50
+                fill — one surface with a hairline seam, same as Cleanup's footer. */}
+            <DialogFooter className="m-0 shrink-0 flex-wrap items-center gap-2 bg-transparent px-5 py-3">
               {item.prev && (
                 <Button
                   variant="outline"

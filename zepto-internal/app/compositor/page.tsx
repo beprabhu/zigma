@@ -27,6 +27,7 @@ import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { TemplateEditor } from '@/components/template-editor';
 import { BatchPromptDialog, resolvePromptSource, type PromptSource } from '@/components/regen-prompt';
 import { ColumnPicker } from '@/components/column-picker';
+import { joinNameColumns } from '@/lib/csv-name';
 import { CsvFileTile } from '@/components/csv-dropzone';
 import { CanvasDropzone, DropzoneShell, FolderInputButton } from '@/components/dropzone';
 import { BandCard, RowSizeControls } from '@/components/grid-bands';
@@ -81,7 +82,7 @@ function newBand(id = crypto.randomUUID()): GridBand {
     headers: [],
     records: [],
     imageCols: [],
-    titleCol: '',
+    titleCols: [],
     offerCol: '',
   };
 }
@@ -189,7 +190,7 @@ export default function Compositor() {
   const [sessionName, setSessionName] = React.useState('');
   const sessionSlug = sessionName.trim().replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '');
   const [imageCols, setImageCols] = React.useState<string[]>([]);
-  const [titleCol, setTitleCol] = React.useState('');
+  const [titleCols, setTitleCols] = React.useState<string[]>([]);
   const [offerCol, setOfferCol] = React.useState('');
 
   // Banner grid — the rows ("bands") of the grid. Each owns one CSV, one banner-tile preset and
@@ -280,10 +281,12 @@ export default function Compositor() {
       setHeaders(headers);
       setRecords(records);
       setImageCols(imgCols);
-      setTitleCol(tCol);
+      // Detection guesses ONE header; a combination is only ever an explicit choice.
+      const tCols = tCol ? [tCol] : [];
+      setTitleCols(tCols);
       setOfferCol(oCol);
       setMode('csv');
-      setItems(buildQueue(records, imgCols, tCol, oCol));
+      setItems(buildQueue(records, imgCols, tCols, oCol));
     };
     reader.readAsText(file);
   }
@@ -434,7 +437,7 @@ export default function Compositor() {
   function buildQueue(
     records: CsvRecord[],
     imageCols: string[],
-    titleCol: string,
+    titleCols: readonly string[],
     offerCol: string,
     opts: { bandId?: string; rowStart?: number } = {},
   ): QueueItem[] {
@@ -446,7 +449,7 @@ export default function Compositor() {
         row: rowStart + i,
         ...(opts.bandId ? { bandId: opts.bandId } : null),
         record, urls,
-        title: titleCol ? record[titleCol] ?? '' : '',
+        title: joinNameColumns(record, titleCols),
         offer: offerCol ? record[offerCol] ?? '' : '',
         status: urls.length ? 'ready' : 'no-images',
         resultImage: null,
@@ -519,7 +522,7 @@ export default function Compositor() {
     if (patch.presetId !== undefined) setBandPreset(band, patch.presetId);
     else if (patch.count !== undefined) setBandCount(band, patch.count);
     else if (patch.fileName === null) clearBandFile(band.id);
-    else if (patch.imageCols || patch.titleCol !== undefined || patch.offerCol !== undefined) remapBand(band, patch);
+    else if (patch.imageCols || patch.titleCols !== undefined || patch.offerCol !== undefined) remapBand(band, patch);
     else patchBand(band.id, patch);
   }
 
@@ -548,6 +551,7 @@ export default function Compositor() {
       if (!headers.length || !records.length) { toast.error('CSV appears empty.'); return; }
       const imgCols = detectImageColumns(headers, records);
       const tCol = detectTitleColumn(headers, imgCols);
+      const tCols = tCol ? [tCol] : [];
       const oCol = detectOfferColumn(headers, imgCols);
       const band = gridBands.find((b) => b.id === bandId);
       // A fresh sheet fills the row it landed in: as many tiles as the band's grid holds
@@ -556,9 +560,9 @@ export default function Compositor() {
       setSessionName((prev) => (prev.trim() ? prev : file.name.replace(/\.[^.]+$/, '')));
       patchBand(bandId, {
         fileName: file.name, headers, records,
-        imageCols: imgCols, titleCol: tCol, offerCol: oCol, count,
+        imageCols: imgCols, titleCols: tCols, offerCol: oCol, count,
       });
-      setBandItems(bandId, buildQueue(records.slice(0, count), imgCols, tCol, oCol, { bandId }));
+      setBandItems(bandId, buildQueue(records.slice(0, count), imgCols, tCols, oCol, { bandId }));
     };
     reader.readAsText(file);
   }
@@ -566,7 +570,7 @@ export default function Compositor() {
   /** Removing a band's CSV empties the row without removing the row itself. */
   function clearBandFile(bandId: string) {
     patchBand(bandId, {
-      fileName: null, headers: [], records: [], imageCols: [], titleCol: '', offerCol: '', count: 0,
+      fileName: null, headers: [], records: [], imageCols: [], titleCols: [], offerCol: '', count: 0,
     });
     setBandItems(bandId, []);
   }
@@ -586,7 +590,7 @@ export default function Compositor() {
     }
     const extra = buildQueue(
       band.records.slice(mine.length, capped),
-      band.imageCols, band.titleCol, band.offerCol,
+      band.imageCols, band.titleCols, band.offerCol,
       { bandId: band.id, rowStart: mine.length + 1 },
     );
     setBandItems(band.id, [...mine, ...extra]);
@@ -596,11 +600,11 @@ export default function Compositor() {
   function remapBand(band: GridBand, patch: Partial<GridBand>) {
     const next = { ...band, ...patch };
     patchBand(band.id, patch);
-    if (next.titleCol !== band.titleCol || next.offerCol !== band.offerCol) setCompressSummary('');
+    if (next.titleCols !== band.titleCols || next.offerCol !== band.offerCol) setCompressSummary('');
     setItems((prev) =>
       prev.map((it) =>
         it.bandId === band.id
-          ? remapItem(it, next.imageCols, next.titleCol, next.offerCol)
+          ? remapItem(it, next.imageCols, next.titleCols, next.offerCol)
           : it,
       ),
     );
@@ -625,25 +629,25 @@ export default function Compositor() {
    * survive it. Rebuilding the queue here is what used to throw a whole finished batch away the
    * moment someone corrected the title column. (Generate remaps names the same way.)
    */
-  function updateMapping(next: { imageCols?: string[]; titleCol?: string; offerCol?: string }) {
+  function updateMapping(next: { imageCols?: string[]; titleCols?: string[]; offerCol?: string }) {
     const ic = next.imageCols ?? imageCols;
-    const tc = next.titleCol ?? titleCol;
+    const tc = next.titleCols ?? titleCols;
     const oc = next.offerCol ?? offerCol;
     if (next.imageCols) setImageCols(ic);
-    if (next.titleCol !== undefined) setTitleCol(tc);
+    if (next.titleCols !== undefined) setTitleCols(tc);
     if (next.offerCol !== undefined) setOfferCol(oc);
     // The summary describes bytes that some rows no longer have; it is re-earned on next export.
-    if (tc !== titleCol || oc !== offerCol) setCompressSummary('');
+    if (tc !== titleCols || oc !== offerCol) setCompressSummary('');
     setItems((prev) => prev.map((it) => remapItem(it, ic, tc, oc)));
   }
 
   /** One row under a new mapping — the rule updateMapping and remapBand share. */
-  function remapItem(it: QueueItem, ic: string[], tc: string, oc: string): QueueItem {
+  function remapItem(it: QueueItem, ic: string[], tc: readonly string[], oc: string): QueueItem {
     // An image row has no record to remap; running the rule over it would read '' out of an
     // empty record and flip a perfectly loaded tile to 'no-images'.
     if (it.localSources?.length) return it;
     const urls = rowUrls(it.record, ic);
-    const title = tc ? it.record[tc] ?? '' : '';
+    const title = joinNameColumns(it.record, tc);
     const offer = oc ? it.record[oc] ?? '' : '';
     const sameUrls = urls.length === it.urls.length && urls.every((u, n) => u === it.urls[n]);
     const sameText = title === it.title && offer === it.offer;
@@ -918,7 +922,7 @@ export default function Compositor() {
     setHeaders([]);
     setRecords([]);
     setImageCols([]);
-    setTitleCol('');
+    setTitleCols([]);
     setOfferCol('');
     setMode(null);
     setProgress(null);
@@ -1182,7 +1186,7 @@ export default function Compositor() {
   // Which columns the preview is reading, for the line under the two text fields. The offer is
   // named only where there is a bar to draw it in, so the line never credits a hidden layer.
   const mappedText = [
-    titleCol && `title from ${titleCol}`,
+    titleCols.length && `title from ${titleCols.join(' + ')}`,
     template.offer.visible && offerCol && `offer from ${offerCol}`,
   ]
     .filter(Boolean)
@@ -1450,21 +1454,18 @@ export default function Compositor() {
                     </FieldDescription>
                   </Field>
                   <Field>
-                    <FieldLabel htmlFor="title-col">Title column</FieldLabel>
-                    <Select
-                      value={titleCol || NONE}
+                    <FieldLabel htmlFor="title-col">Title columns</FieldLabel>
+                    <ColumnPicker
+                      id="title-col"
+                      columns={headers}
+                      selected={titleCols}
+                      onChange={(next) => updateMapping({ titleCols: next })}
                       disabled={running}
-                      onValueChange={(v) => updateMapping({ titleCol: v === NONE ? '' : String(v ?? '') })}
-                    >
-                      {/* Select.Value renders the raw value, so the sentinel needs a label. */}
-                      <SelectTrigger id="title-col" className="w-full">
-                        <SelectValue>{(v) => (v && v !== NONE ? String(v) : '(none)')}</SelectValue>
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value={NONE}>(none)</SelectItem>
-                        {headers.map((h) => <SelectItem key={h} value={h}>{h}</SelectItem>)}
-                      </SelectContent>
-                    </Select>
+                      placeholder="None — no title drawn"
+                    />
+                    <FieldDescription>
+                      Several columns are joined with a dash, in the sheet&rsquo;s column order.
+                    </FieldDescription>
                   </Field>
                   {/* Only where there is an offer bar to fill. The Image presets are an image
                       container and nothing else, so mapping a column to a layer they do not
@@ -1839,12 +1840,6 @@ export default function Compositor() {
                     />
 
                     <Field orientation="horizontal">
-                      <Checkbox
-                        id="co-number-files"
-                        checked={numberFiles}
-                        disabled={running}
-                        onCheckedChange={(checked) => setNumberFiles(checked === true)}
-                      />
                       <FieldContent>
                         <FieldLabel htmlFor="co-number-files" className="font-normal">
                           Number exported files
@@ -1855,6 +1850,12 @@ export default function Compositor() {
                             : 'Files use the title alone; repeats get -2, -3 so nothing is overwritten.'}
                         </FieldDescription>
                       </FieldContent>
+                      <Switch
+                        id="co-number-files"
+                        checked={numberFiles}
+                        disabled={running}
+                        onCheckedChange={(checked) => setNumberFiles(checked === true)}
+                      />
                     </Field>
 
                   </FieldGroup>

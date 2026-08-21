@@ -5,6 +5,7 @@
 // honest about each other.
 
 import type { CsvRecord } from './csv';
+import { joinNameColumns } from './csv-name';
 
 /**
  * The shapes the image endpoints return. Lives here rather than in the page because the results
@@ -63,13 +64,13 @@ export interface GenItem {
 
 export function createGenItems(
   records: CsvRecord[],
-  nameColumn: string,
+  nameColumns: readonly string[],
   startId: number,
 ): GenItem[] {
   return records.map((record, i) => ({
     id: startId + i,
     record,
-    name: (nameColumn ? record[nameColumn] : '')?.trim() || `Row ${startId + i + 1}`,
+    name: joinNameColumns(record, nameColumns) || `Row ${startId + i + 1}`,
     status: 'ready',
     image: null,
   }));

@@ -10,9 +10,9 @@
 
 import * as React from 'react';
 import {
-  ChartColumnIcon, CodeIcon, CopyIcon, DownloadIcon, EyeIcon, KeyRoundIcon, LockIcon,
-  PencilIcon, PlugZapIcon, PlusIcon,
-  Settings2Icon, SlidersHorizontalIcon, SparklesIcon, Trash2Icon, UploadIcon,
+  BotIcon, ChartColumnIcon, CodeIcon, CopyIcon, DownloadIcon, EyeIcon, KeyRoundIcon, LockIcon,
+  PencilIcon, PlugZapIcon, PlusIcon, ScrollTextIcon,
+  Settings2Icon, Trash2Icon, UploadIcon,
 } from 'lucide-react';
 
 import { TAG_DOTS } from '@/components/ui/badge';
@@ -61,10 +61,20 @@ import { cn } from '@/lib/utils';
 
 type SettingsTab = 'api-keys' | 'image-model' | 'skills' | 'defaults' | 'usage';
 
+/**
+ * One icon per tab, and each one has to be unique IN THE SUITE, not just in this list — a
+ * glyph that already means something else somewhere reads as a link to that thing. Two were
+ * doing exactly that: Image model wore SlidersHorizontal, which the PNG compressor uses for
+ * its own settings, and Skills wore Sparkles, which sixteen call sites use for the AI edit.
+ * Settings2 stays on Defaults (a controls glyph is right for a pane of controls) and the gear
+ * proper stays on the rail button that opens this dialog, so neither is spent twice.
+ */
 const TABS: { id: SettingsTab; label: string; icon: typeof KeyRoundIcon }[] = [
   { id: 'api-keys', label: 'API keys', icon: KeyRoundIcon },
-  { id: 'image-model', label: 'Image model', icon: SlidersHorizontalIcon },
-  { id: 'skills', label: 'Skills', icon: SparklesIcon },
+  // The pane picks WHICH model runs, not how a slider is set.
+  { id: 'image-model', label: 'Image model', icon: BotIcon },
+  // Skills are markdown prompt documents; the pane is a list of them.
+  { id: 'skills', label: 'Skills', icon: ScrollTextIcon },
   { id: 'defaults', label: 'Defaults', icon: Settings2Icon },
   { id: 'usage', label: 'Usage', icon: ChartColumnIcon },
 ];
@@ -331,7 +341,7 @@ function ImageModelPane() {
         <FieldDescription>
           {rpm === 0
             ? 'No throttle — products only cap how many requests run at once.'
-            : `Calls beyond ${rpm}/min wait their turn instead of erroring. Match your Azure deployment's rate limit to avoid 429s.`}
+            : `One request every ${Math.round(600 / rpm) / 10}s, evenly spaced — Azure meters RPM in per-second slices, so a burst 429s even under the minute total. Match your deployment's limit.`}
         </FieldDescription>
       </Field>
       <p className="border-t pt-3 text-[11px] text-muted-foreground">

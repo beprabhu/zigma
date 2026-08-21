@@ -1,4 +1,4 @@
-import localFont from "next/font/local"
+import { Geist } from "next/font/google"
 
 // Single CSS entry: app.css chains globals.css (theme paste target) then
 // base.css (app plumbing) inside one Tailwind graph. Import order inside
@@ -15,13 +15,15 @@ export const metadata = {
     "Zepto's internal image suite — composite product tiles and background removal.",
 }
 
-// Google Sans (self-hosted variable TTF: wght 400-700) is the UI face; --font-sans in
-// base.css consumes this variable (with the system stack as fallback). The tile renderer's
-// ZeptoNorms faces in public/fonts are separate and untouched by this.
-const googleSans = localFont({
-  src: "./fonts/GoogleSans-Variable.ttf",
+// Geist is the UI face, self-hosted at build by next/font (no runtime request to Google, so
+// it works under the app's cross-origin-isolation headers). It publishes --font-app-sans, which
+// base.css's --font-sans consumes ahead of the system fallback stack. The tile renderer's
+// ZeptoNorms faces in public/fonts are separate and untouched by this. The old
+// GoogleSans-Variable.ttf under app/fonts is no longer referenced.
+const geist = Geist({
+  subsets: ["latin"],
   variable: "--font-app-sans",
-  weight: "400 700",
+  display: "swap",
 })
 
 export default function RootLayout({
@@ -33,7 +35,7 @@ export default function RootLayout({
     <html
       lang="en"
       suppressHydrationWarning
-      className={`${googleSans.variable} antialiased font-sans`}
+      className={`${geist.variable} antialiased font-sans`}
     >
       {/* The tweakcn live-preview <script> used to sit in a <head> block here.
           next.config.ts now sends Cross-Origin-Embedder-Policy: require-corp so

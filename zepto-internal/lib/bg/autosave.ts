@@ -38,6 +38,7 @@ import type { BgItem, BgVerify, CsvOrigin } from './batch';
 import type { InkFootprint, OriginalComponentReport, RegionReport } from './regions';
 import type { DetectedBand } from './bands';
 import type { ProjectCsv } from './project';
+import { normalizeNameColumns } from '../csv-name';
 import type { SubjectBounds } from './safe-area';
 
 const DB_NAME = 'zesku-bg-autosave';
@@ -228,8 +229,9 @@ function parseCsvMeta(v: unknown): AutosaveCsv | null {
   return {
     fileName: typeof c.fileName === 'string' && c.fileName ? c.fileName : 'import.csv',
     text: c.text,
-    // '' is meaningful — "name each image from its URL" — so a bad value degrades to it.
-    nameColumn: typeof c.nameColumn === 'string' ? c.nameColumn : '',
+    // Empty is meaningful — "name each image from its URL" — so a bad value degrades to it.
+    // The list wins; a record written before it existed falls back to its single column.
+    nameColumns: normalizeNameColumns(c.nameColumns ?? c.nameColumn),
     imageColumns: Array.isArray(c.imageColumns)
       ? c.imageColumns.filter((column): column is string => typeof column === 'string' && !!column)
       : [],
@@ -252,7 +254,7 @@ export function saveAutosaveCsv(csv: ProjectCsv, savedAt: number = Date.now()): 
       key: CSV_KEY,
       fileName: csv.fileName,
       text: csv.text,
-      nameColumn: csv.nameColumn,
+      nameColumns: [...csv.nameColumns],
       imageColumns: [...csv.imageColumns],
       promptColumns: [...(csv.promptColumns ?? [])],
       savedAt,
@@ -333,7 +335,8 @@ function sameCsv(a: ProjectCsv | null, b: ProjectCsv | null): boolean {
   if (!a || !b) return a === b;
   return (
     a.fileName === b.fileName &&
-    a.nameColumn === b.nameColumn &&
+    a.nameColumns.length === b.nameColumns.length &&
+    a.nameColumns.every((column, i) => column === b.nameColumns[i]) &&
     a.imageColumns.length === b.imageColumns.length &&
     a.imageColumns.every((column, i) => column === b.imageColumns[i]) &&
     (a.promptColumns ?? []).length === (b.promptColumns ?? []).length &&
@@ -525,7 +528,7 @@ export interface Autosave {
 export interface AutosaveOptions {
   /**
    * True when the queue on screen was carried across a client-side navigation rather than
-   * rebuilt from scratch (lib/bg/session-store.ts). The records on disk then describe THESE
+   * rebuilt from scratch (lib/session-store.ts). The records on disk then describe THESE
    * rows, so there is nothing to recover: prompting would ask the user to restore work they
    * are already looking at, and the blocking dialog would hold writes for a session that never
    * crashed. Ignored when the store turns out to be empty.

@@ -18,8 +18,8 @@ import {
 import { Button } from '@/components/ui/button';
 import { ClearAllButton, SelectionBar, useGridSelection } from '@/components/selection';
 import { ColumnPicker } from '@/components/column-picker';
+import { joinNameColumns, normalizeNameColumns } from '@/lib/csv-name';
 import { BatchPromptDialog, resolvePromptSource, type PromptSource } from '@/components/regen-prompt';
-import { Checkbox } from '@/components/ui/checkbox';
 import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog';
@@ -30,6 +30,7 @@ import { matchSkill, useSkills } from '@/lib/skills';
 import { SessionHeader, type SessionChip } from '@/components/session-header';
 import { Field, FieldContent, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field';
 import { Progress } from '@/components/ui/progress';
+import { Switch } from '@/components/ui/switch';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Spinner } from '@/components/ui/spinner';
 import { Textarea } from '@/components/ui/textarea';
@@ -41,18 +42,17 @@ import { formatPromptList, parsePromptList } from '@/lib/prompt-list';
 
 import { detectTitleColumn, parseCSV, type CsvRecord } from '@/lib/csv';
 import { GEN_SIZES, createGenItems, genFileStem, reconcileSubjectItems, type GenItem, type GenSize } from '@/lib/gen';
-import { PROMPT_WARN_CHARS, buildRowPrompt, buildSubjectPrompt, isPromptEmpty } from '@/lib/row-prompt';
+import { PROMPT_WARN_CHARS, SUBJECT_HEADING, buildRowPrompt, buildSubjectPrompt, isPromptEmpty } from '@/lib/row-prompt';
 import { callAzure, callAzureGenerate, mockGenerate } from '@/lib/pipeline';
 import { readParallel } from '@/lib/rate';
 import { canvasToPngBlob, mapWithLimit, pickSave, releaseCanvas, saveTo } from '@/lib/bg/batch';
-import { readSession, restingStatus, saveSession, sessionKey } from '@/lib/bg/session-store';
+import { readSession, restingStatus, saveSession, sessionKey } from '@/lib/session-store';
 import { processImage } from '@/lib/process';
 import { useProcessing } from '@/components/process-panel';
 import { buildZipStream, type ZipStreamEntry } from '@/lib/zip';
 import { usePersistedState } from '@/hooks/use-persisted-state';
 import { CanvasDropzone, DropzoneShell } from '@/components/dropzone';
 
-const NONE = '__none__';
 
 /**
  * Everything a product switch would otherwise destroy. The rail's <Link>s unmount this page, so
@@ -62,7 +62,7 @@ const NONE = '__none__';
  * Only settled state belongs here: `running` and `exporting` are false again by definition on
  * the next mount, because leaving aborted the run. Persisted settings (endpoint, key, size,
  * numbering, the process panel) are localStorage-backed and never needed a snapshot. See
- * lib/bg/session-store.ts for what this does NOT survive — it is a tab-lifetime hand-off, not
+ * lib/session-store.ts for what this does NOT survive — it is a tab-lifetime hand-off, not
  * storage.
  */
 interface GenSession {
@@ -73,7 +73,9 @@ interface GenSession {
   sessionName: string;
   headers: string[];
   records: CsvRecord[];
-  nameCol: string;
+  /** Columns joined to name each row. `nameCol` is the pre-list form a saved session may hold. */
+  nameCols: string[];
+  nameCol?: string;
   excluded: string[];
   items: GenItem[];
   progress: { pct: number; text: string } | null;
@@ -128,7 +130,9 @@ export default function ImageGenerator() {
   }, []);
   const [headers, setHeaders] = React.useState<string[]>(() => revived?.headers ?? []);
   const [records, setRecords] = React.useState<CsvRecord[]>(() => revived?.records ?? []);
-  const [nameCol, setNameCol] = React.useState(() => revived?.nameCol ?? '');
+  const [nameCols, setNameCols] = React.useState<string[]>(() =>
+    normalizeNameColumns(revived?.nameCols ?? revived?.nameCol),
+  );
   const [excluded, setExcluded] = React.useState<string[]>(() => revived?.excluded ?? []);
 
   const [items, setItems] = React.useState<GenItem[]>(() => revived?.items ?? []);
@@ -160,7 +164,7 @@ export default function ImageGenerator() {
       sessionName,
       headers,
       records,
-      nameCol,
+      nameCols,
       excluded,
       items,
       // A run still in flight is a run the unmount is about to cancel, so it comes back
@@ -225,10 +229,25 @@ export default function ImageGenerator() {
   // the dialog, the length warning, the request itself — goes through here, so neither source
   // can end up displaying one thing and sending another.
   const promptFor = React.useCallback(
-    (item: GenItem) => (item.subject !== undefined
-      ? buildSubjectPrompt(brief, item.subject)
-      : buildRowPrompt(brief, headers, item.record, excludedSet)),
+    (item: GenItem, base: string = brief) => (item.subject !== undefined
+      ? buildSubjectPrompt(base, item.subject)
+      : buildRowPrompt(base, headers, item.record, excludedSet)),
     [brief, headers, excludedSet],
+  );
+
+  /**
+   * The read-only half of a row's prompt — what the dialog attaches BESIDE the editable brief,
+   * the way Cleanup attaches its CSV row. Built with an empty base so only the row/subject
+   * block comes back; the leading rule is stripped because the display is not a joint.
+   */
+  const rowContextFor = React.useCallback(
+    (item: GenItem) => {
+      const block = item.subject !== undefined
+        ? `${SUBJECT_HEADING}\n${item.subject.trim()}`
+        : buildRowPrompt('', headers, item.record, excludedSet);
+      return block.startsWith('---\n') ? block.slice(4) : block;
+    },
+    [headers, excludedSet],
   );
   const promptForRef = React.useRef(promptFor);
   React.useEffect(() => { promptForRef.current = promptFor; }, [promptFor]);
@@ -288,9 +307,10 @@ export default function ImageGenerator() {
           seedSessionName(file.name);
           setHeaders(parsed.headers);
           setRecords(parsed.records);
-          setNameCol(detected);
+          const detectedCols = detected ? [detected] : [];
+          setNameCols(detectedCols);
           setExcluded([]);
-          setItems(createGenItems(parsed.records, detected, 0));
+          setItems(createGenItems(parsed.records, detectedCols, 0));
           setOpenId(null);
         } else {
           setBrief(text);
@@ -303,12 +323,12 @@ export default function ImageGenerator() {
   }
 
   /** Re-mapping the name column renames rows in place — generated images are never thrown away. */
-  function remapNames(next: string) {
-    setNameCol(next);
+  function remapNames(next: string[]) {
+    setNameCols(next);
     setItems((prev) =>
       prev.map((it, i) => ({
         ...it,
-        name: (next ? it.record[next] : '')?.trim() || `Row ${i + 1}`,
+        name: joinNameColumns(it.record, next) || `Row ${i + 1}`,
       })),
     );
   }
@@ -339,7 +359,12 @@ export default function ImageGenerator() {
     promptOverride?: string,
     from: PromptSource = 'original',
   ): Promise<boolean> {
-    const prompt = promptOverride?.trim() || promptForRef.current(item);
+    // An override edits the BRIEF half only; the row's own block is re-attached here, exactly
+    // like Cleanup's AI edit. Sending the override verbatim dropped the row fields — and made a
+    // batch edit send the same identical prompt for every selected row.
+    const prompt = promptOverride?.trim()
+      ? promptForRef.current(item, promptOverride)
+      : promptForRef.current(item);
     if (isPromptEmpty(prompt)) {
       patchItem(item.id, { status: 'error', errorMsg: 'Nothing to send — no brief and no included columns' });
       return false;
@@ -525,7 +550,7 @@ export default function ImageGenerator() {
     setCsvName(null);
     setHeaders([]);
     setRecords([]);
-    setNameCol('');
+    setNameCols([]);
     setExcluded([]);
     setProgress(null);
   }
@@ -541,7 +566,7 @@ export default function ImageGenerator() {
     setCsvName(null);
     setHeaders([]);
     setRecords([]);
-    setNameCol('');
+    setNameCols([]);
     setExcluded([]);
     setProgress(null);
     setItems(reconcileSubjectItems(parsePromptList(subjects), []));
@@ -785,26 +810,18 @@ export default function ImageGenerator() {
             <PanelSection title="Columns" hint="Ticked columns are sent, each labelled with its header.">
                 <FieldGroup className="gap-4">
                   <Field>
-                    <FieldLabel htmlFor="gen-name-col">Name column</FieldLabel>
-                    <Select
-                      value={nameCol || NONE}
-                      onValueChange={(v) => remapNames(String(v ?? '') === NONE ? '' : String(v ?? ''))}
+                    <FieldLabel htmlFor="gen-name-col">Name columns</FieldLabel>
+                    <ColumnPicker
+                      id="gen-name-col"
+                      columns={headers}
+                      selected={nameCols}
+                      onChange={remapNames}
                       disabled={busy}
-                    >
-                      <SelectTrigger id="gen-name-col">
-                        <SelectValue>
-                          {(value) => (value === NONE || !value ? '(Row number)' : String(value))}
-                        </SelectValue>
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value={NONE}>(Row number)</SelectItem>
-                        {headers.map((h) => (
-                          <SelectItem key={h} value={h}>{h}</SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+                      placeholder="None — named by row number"
+                    />
                     <FieldDescription>
-                      Names the cells and the exported files. Safe to change any time — rows are
+                      Names the cells and the exported files; several columns are joined with a
+                      dash, in the sheet&rsquo;s column order. Safe to change any time — rows are
                       renamed in place and generated images are kept.
                     </FieldDescription>
                   </Field>
@@ -911,12 +928,6 @@ export default function ImageGenerator() {
           <PanelSection>
           <FieldGroup className="gap-4">
                 <Field orientation="horizontal">
-                  <Checkbox
-                    id="gen-number-files"
-                    checked={numberFiles}
-                    disabled={busy}
-                    onCheckedChange={(checked) => setNumberFiles(checked === true)}
-                  />
                   <FieldContent>
                     <FieldLabel htmlFor="gen-number-files" className="font-normal">
                       Number exported files
@@ -927,6 +938,12 @@ export default function ImageGenerator() {
                         : 'Files use the name alone; repeats get -2, -3 so nothing is overwritten.'}
                     </FieldDescription>
                   </FieldContent>
+                  <Switch
+                    id="gen-number-files"
+                    checked={numberFiles}
+                    disabled={busy}
+                    onCheckedChange={(checked) => setNumberFiles(checked === true)}
+                  />
                 </Field>
           </FieldGroup>
           </PanelSection>
@@ -961,7 +978,8 @@ export default function ImageGenerator() {
 
       <GenDialog
         item={openItem}
-        previewPrompt={openItem ? promptFor(openItem) : ''}
+        defaultPrompt={brief}
+        rowContext={openItem ? rowContextFor(openItem) : ''}
         size={size}
         running={busy}
         onClose={() => setOpenId(null)}

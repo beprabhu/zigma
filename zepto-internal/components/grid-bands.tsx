@@ -274,19 +274,14 @@ export function BandCard({
             <div className="grid grid-cols-2 gap-3">
               <Field>
                 <FieldLabel htmlFor={`band-title-${band.id}`}>Title</FieldLabel>
-                <Select
-                  value={band.titleCol || NONE}
+                <ColumnPicker
+                  id={`band-title-${band.id}`}
+                  columns={band.headers}
+                  selected={band.titleCols}
+                  onChange={(next) => onChange({ titleCols: next })}
                   disabled={disabled}
-                  onValueChange={(v) => onChange({ titleCol: v === NONE ? '' : String(v ?? '') })}
-                >
-                  <SelectTrigger id={`band-title-${band.id}`} className="w-full">
-                    <SelectValue>{(v) => (v && v !== NONE ? String(v) : '(none)')}</SelectValue>
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value={NONE}>(none)</SelectItem>
-                    {band.headers.map((h) => <SelectItem key={h} value={h}>{h}</SelectItem>)}
-                  </SelectContent>
-                </Select>
+                  placeholder="None"
+                />
               </Field>
               {/* Only where the chosen preset actually draws an offer bar — the same rule the
                   single-template panel uses, asked of this band's preset. */}

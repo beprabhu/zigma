@@ -21,8 +21,13 @@
 // product costs nothing new — but walking away no longer reclaims it either, which is the price
 // of not losing the work.
 //
-// Lives under lib/bg/ next to the queue modules, but nothing in it is background-removal
-// specific: both image products key into it the same way.
+// Nothing in it is background-removal specific — it lived under lib/bg/ only because that is where
+// the first caller was, and every product keys into it the same way.
+//
+// Since the file store landed, a snapshot also carries the id of the FILE the product was editing
+// (see SessionSnapshot below). That is what lets a rail click resume the same file rather than mint
+// a new one, and it is why lib/files/sweep.ts takes an exclusion set built from these snapshots: a
+// file can be live in this tab with its page unmounted, where no heartbeat covers it.
 
 /**
  * Identity for one product's snapshot, carrying the snapshot's type so a read and a write can
@@ -39,7 +44,30 @@ export function sessionKey<T>(id: string): SessionKey<T> {
   return { id };
 }
 
+/**
+ * What every product's snapshot has to carry, on top of whatever else it holds.
+ *
+ * The id belongs INSIDE the snapshot rather than in the key. Keying by `${tool}:${fileId}` reads
+ * well and cannot be used: resolving the fileId is precisely what reading the snapshot is for, so
+ * the key would have to be known before the thing that names it. It would also mean one entry per
+ * file, and evicting by tool would then throw away an unfinished draft every time the user switched
+ * between two files of the same product — the exact work this store exists to protect.
+ */
+export interface SessionSnapshot {
+  fileId: string;
+}
+
 const snapshots = new Map<string, unknown>();
+
+/** Every file id this tab is still holding live, for lib/files/sweep.ts's exclusion set. */
+export function liveFileIds(): Set<string> {
+  const ids = new Set<string>();
+  for (const snapshot of snapshots.values()) {
+    const id = (snapshot as Partial<SessionSnapshot> | null)?.fileId;
+    if (typeof id === 'string' && id) ids.add(id);
+  }
+  return ids;
+}
 
 /**
  * The product's snapshot, or undefined when it has not been left yet in this tab.
@@ -82,14 +110,20 @@ export function clearSession<T>(key: SessionKey<T>): void {
 /**
  * The statuses that exist only while a run is actively touching an item: 'loading-model',
  * 'removing' and 'editing' from BgItemStatus (lib/bg/batch.ts), 'generating' from GenStatus
- * (lib/gen.ts). Both unions rest in 'ready' / 'done' / 'error', which is what makes one shared
- * normalizer possible.
+ * (lib/gen.ts), 'fetching' and 'removing-bg' from Compose's ItemStatus (lib/types.ts). Every union
+ * rests in 'ready' / 'done' / 'error', which is what makes one shared normalizer possible.
+ *
+ * A status missing from this set is not a harmless omission: the row comes back frozen mid-run as a
+ * spinner that can never finish, and Compose's two were missing for exactly as long as Compose had
+ * no snapshot to come back from.
  */
 const TRANSIENT_STATUSES: ReadonlySet<string> = new Set([
   'loading-model',
   'removing',
   'editing',
   'generating',
+  'fetching',
+  'removing-bg',
 ]);
 
 export function isTransientStatus(status: string): boolean {

@@ -7,16 +7,20 @@
 
 import * as React from 'react';
 import {
-  CheckIcon, CopyIcon, DownloadIcon, ExternalLinkIcon, RefreshCwIcon, Undo2Icon,
+  CheckIcon, ChevronLeftIcon, ChevronRightIcon, CopyIcon, DownloadIcon, ExternalLinkIcon,
+  FlagIcon, ImageIcon, InfoIcon, RefreshCwIcon, SparklesIcon, Undo2Icon,
 } from 'lucide-react';
 
+import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { ButtonGroup, ButtonGroupText } from '@/components/ui/button-group';
 import { Checkbox } from '@/components/ui/checkbox';
+import { Field, FieldDescription, FieldLabel } from '@/components/ui/field';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { RegenPrompt, type PromptSource, type PromptSourceOptions } from '@/components/regen-prompt';
 import {
   Dialog,
   DialogContent,
-  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -25,7 +29,7 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
 import { Spinner } from '@/components/ui/spinner';
-import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { cn } from '@/lib/utils';
 import { usePreview } from '@/lib/bg/preview-store';
 import {
@@ -45,6 +49,7 @@ import {
   type BgItemStatus,
 } from '@/lib/bg/batch';
 import { TRANSPARENT } from '@/lib/bg/safe-area';
+import { assessQuality } from '@/lib/bg/quality';
 import type { RegionReport } from '@/lib/bg/regions';
 
 /* eslint-disable @next/next/no-img-element */
@@ -459,6 +464,20 @@ function sourceLabel(item: BgItem): string {
 }
 
 /**
+ * The same provenance, minus whatever the compare dialog's source button group is already
+ * showing. That group carries the URL — shortened, with the full value on its tooltip and both
+ * a copy and an open button — so printing the raw URL again beside it puts the exact 120-char
+ * string back on screen that the group exists to keep off it.
+ *
+ * An AI-edited row keeps its generated file name: the group shows the IMPORT it came from, and
+ * "which file is this now" is a different question that nothing else on the row answers.
+ */
+function sourceLabelBeside(item: BgItem, hasSourceButtons: boolean): string {
+  if (!hasSourceButtons) return sourceLabel(item);
+  return item.source.kind === 'url' ? '' : describeSource(item.source);
+}
+
+/**
  * The one-line status a tile shows under its name — the old queue row's badge and info line
  * folded into one string. Errors carry their message so the line is actionable in place.
  */
@@ -494,6 +513,16 @@ export interface CompareDialogProps {
   aiEdit?: CompareAiEdit;
   /** A run is in progress; redo stays visible but disabled. */
   busy?: boolean;
+  /**
+   * Step to the previous/next image without closing. Walks the VISIBLE queue order, not the raw
+   * one, so a filtered queue ("Show: flagged") turns this dialog into a triage loop. Omitted
+   * hides the pager entirely.
+   */
+  onNavigate?: (delta: 1 | -1) => void;
+  /** 1-based position in that same visible order, for the pager's label. */
+  position?: { index: number; total: number };
+  /** Sets (or clears) the manual flag override on this image. Omit to hide the flag control. */
+  onSetFlag?: (item: BgItem, flag: 'flag' | 'clear' | undefined) => void;
 }
 
 /**
@@ -519,6 +548,9 @@ export interface CompareModelOption {
   hint?: string;
 }
 
+/** Which method the run console is showing. Re-cut leads: it is the cheaper, likelier fix. */
+type FixTab = 'recut' | 'ai';
+
 /** Per-redo settings. Chosen in the dialog and applied to that one image only. */
 export interface CompareRedoOptions {
   model: string;
@@ -542,10 +574,26 @@ export function CompareDialog({
   onUndo,
   aiEdit,
   busy,
+  onNavigate,
+  position,
+  onSetFlag,
 }: CompareDialogProps) {
+  // Which console tab is open, held HERE rather than in CompareView: the view is keyed by item
+  // id and remounts on every step through the queue, so a tab kept inside it would snap back to
+  // the default on Next. Someone paging through prompts wants to stay on AI edit across the whole
+  // run. Resets to the default only when the dialog closes and reopens.
+  const [fixTab, setFixTab] = React.useState<FixTab>('recut');
+
   return (
     <Dialog open={item !== null} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-h-[85dvh] w-full overflow-x-hidden overflow-y-auto sm:max-w-3xl">
+      {/* Wider than the old 3xl: the body is two columns now — a stacked pair of image panes
+          beside the run console — and at 3xl neither column had room to be worth looking at. */}
+      {/* A fixed-height flex column: header and footer are pinned, only the middle scrolls.
+          gap-0/p-0 hand spacing to the three regions so the pinned edges sit flush against the
+          scroll seam. A short tab (AI edit) then shows no scrollbar and no floor of dead space
+          under a footer floated up to meet it; a long one (BG removal) scrolls between the
+          fixed bars. */}
+      <DialogContent className="flex max-h-[85dvh] w-full flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl">
         {item && (
           <CompareView
             key={item.id}
@@ -560,6 +608,11 @@ export function CompareDialog({
             onUndo={onUndo}
             aiEdit={aiEdit}
             busy={busy}
+            onNavigate={onNavigate}
+            position={position}
+            fixTab={fixTab}
+            onFixTabChange={setFixTab}
+            onSetFlag={onSetFlag}
           />
         )}
       </DialogContent>
@@ -579,6 +632,11 @@ function CompareView({
   onUndo,
   aiEdit,
   busy,
+  onNavigate,
+  position,
+  fixTab,
+  onFixTabChange,
+  onSetFlag,
 }: {
   item: BgItem;
   index: number;
@@ -591,6 +649,11 @@ function CompareView({
   onUndo?: (item: BgItem) => void;
   aiEdit?: CompareAiEdit;
   busy?: boolean;
+  onNavigate?: (delta: 1 | -1) => void;
+  position?: { index: number; total: number };
+  fixTab: FixTab;
+  onFixTabChange: (tab: FixTab) => void;
+  onSetFlag?: (item: BgItem, flag: 'flag' | 'clear' | undefined) => void;
 }) {
   const [saving, setSaving] = React.useState(false);
   const [saveError, setSaveError] = React.useState<string | null>(null);
@@ -601,6 +664,15 @@ function CompareView({
   // current global model — no effect needed to sync it.
   const [redoModel, setRedoModel] = React.useState<string>(defaultModel ?? models?.[0]?.id ?? '');
   const [redoRefine, setRedoRefine] = React.useState<boolean>(defaultRefine ?? false);
+
+  // Which methods this row actually offers. Both are gated on canRetry — a row with no source
+  // left to send can run neither — and the console hides entirely when neither is available.
+  const hasRedo = !!(onRedo && models?.length && canRetry(item));
+  const hasAiEdit = !!(aiEdit && canRetry(item));
+  // The held tab, corrected for THIS row: an image that offers no re-cut still shows AI edit
+  // rather than an empty panel, without disturbing the caller's remembered choice.
+  const activeTab: FixTab =
+    fixTab === 'recut' && !hasRedo ? 'ai' : fixTab === 'ai' && !hasAiEdit ? 'recut' : fixTab;
 
   // The import, when the item is no longer showing it — null for everything untouched by an AI
   // edit, so every "original" affordance below simply disappears on an ordinary row.
@@ -619,6 +691,32 @@ function CompareView({
         ? item.originalSource.url
         : null;
   const urlFromImport = sourceUrl !== null && item.source.kind !== 'url';
+
+  // What the line beside the source buttons says: the duration always, plus whatever provenance
+  // the button group is NOT already carrying. Joined here so an empty half never leaves a
+  // dangling separator dot.
+  /**
+   * The shape both panes take. A fixed height letterboxed every image inside a 4:3 box and made
+   * a portrait bottle and a landscape banner look like the same crop — so the frame follows the
+   * picture instead. The CUTOUT's dimensions are the source's: the engine preserves aspect, and
+   * it is the one measurement still around after `original` is released.
+   *
+   * max-height still wins where the two disagree, so a very tall portrait cannot push the run
+   * console off screen; object-contain keeps it honest inside the clamped box.
+   */
+  const sourceAspect =
+    item.cutout?.width && item.cutout.height
+      ? item.cutout.width / item.cutout.height
+      : item.original?.naturalWidth && item.original?.naturalHeight
+        ? item.original.naturalWidth / item.original.naturalHeight
+        : 1;
+
+  const besideLabel = [
+    item.durationMs !== undefined ? `Cut out in ${formatDuration(item.durationMs)}` : '',
+    sourceLabelBeside(item, sourceUrl !== null),
+  ]
+    .filter(Boolean)
+    .join(' · ');
 
   async function handleCopy() {
     if (!sourceUrl) return;
@@ -674,127 +772,394 @@ function CompareView({
     }
   }
 
+  /**
+   * The identifying tail of a source URL — the file name, shortened in the middle. The full URL
+   * is a CDN path nobody reads; what someone checks at a glance is which asset this row came
+   * from, and the copy/open buttons beside it carry the whole thing anyway.
+   */
+  function shortSource(url: string): string {
+    let tail = url;
+    try {
+      const parsed = new URL(url);
+      tail = parsed.pathname.split('/').filter(Boolean).pop() || parsed.host;
+    } catch {
+      tail = url.split('/').filter(Boolean).pop() || url;
+    }
+    return tail.length > 28 ? `${tail.slice(0, 14)}…${tail.slice(-10)}` : tail;
+  }
+
+  /**
+   * ← / → step through the queue. Bound on the window because there is nothing sensible to
+   * focus first, and scoped by what the key is currently FOR: inside a text field the arrows
+   * move the caret, and inside a listbox, menu, tablist or slider they move the selection.
+   * Stealing them there would break editing the prompt — the reason this was left out at first.
+   */
+  React.useEffect(() => {
+    if (!onNavigate) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+      if (event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
+      // instanceof, not a truthy check: a keydown dispatched at the window itself has `window`
+      // as its target, which carries none of these members and throws on .closest().
+      const el = event.target;
+      if (
+        el instanceof HTMLElement &&
+        (el.tagName === 'INPUT' ||
+          el.tagName === 'TEXTAREA' ||
+          el.isContentEditable ||
+          el.closest('[role="listbox"],[role="menu"],[role="tablist"],[role="slider"],[role="textbox"]'))
+      ) {
+        return;
+      }
+      event.preventDefault();
+      onNavigate(event.key === 'ArrowLeft' ? -1 : 1);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onNavigate]);
+
+  /**
+   * The two tuning tables. They measure the matte the BG-removal tab produces, so they live in
+   * that tab rather than under the whole dialog — where they sat between the console and the
+   * footer and got read as a summary of the image instead of of one run.
+   *
+   * Both keep their tie-to-cutout gate: the report is never cleared, so an AI edit or a failed
+   * run would otherwise leave last run's verdicts under a pane that says there is no cutout.
+   */
+  const diagnostics = item.cutout ? (
+    <div className="flex min-w-0 flex-col gap-4">
+      {item.regionReport && item.regionReport.length > 0 && (
+        <RegionTable regions={item.regionReport} />
+      )}
+      <ComponentTable item={item} />
+    </div>
+  ) : null;
+
+  // Paging, lifted out of the header to sit on the control bar beside the views it steps
+  // between. ← / → drive the same move (see the key handler above).
+  const pager =
+    onNavigate && position && position.total > 1 ? (
+      <ButtonGroup className="shrink-0">
+        <Button
+          variant="outline"
+          size="icon-sm"
+          disabled={position.index <= 1}
+          title="Previous image"
+          onClick={() => onNavigate(-1)}
+        >
+          <ChevronLeftIcon />
+          <span className="sr-only">Previous image</span>
+        </Button>
+        <ButtonGroupText className="h-7 rounded-[min(var(--radius-md),12px)] px-2 text-xs font-normal tabular-nums">
+          <span aria-live="polite">{position.index} / {position.total}</span>
+        </ButtonGroupText>
+        <Button
+          variant="outline"
+          size="icon-sm"
+          disabled={position.index >= position.total}
+          title="Next image"
+          onClick={() => onNavigate(1)}
+        >
+          <ChevronRightIcon />
+          <span className="sr-only">Next image</span>
+        </Button>
+      </ButtonGroup>
+    ) : null;
+
+  // Which image the left pane shows. A fused pair, not two gapped pills — a pair of mutually
+  // exclusive views is one control. Only when there is an AI edit to switch to.
+  // The quality verdict, brought INTO the dialog — the grid tile's amber flag reasons were
+  // never rendered here, so the one screen opened to act on a flag could not show it. Same
+  // source as the tile, so the two cannot disagree.
+  const verdict = item.cutout ? assessQuality(item) : null;
+  const flagged = verdict !== null && verdict.level !== 'ok';
+  // Toggle relative to the EFFECTIVE state, not the stored override: pressing F on a
+  // heuristically-flagged row should clear it (override 'clear'), and on a clean row flag it.
+  // Setting the override back to `undefined` when it would merely restate the computed verdict
+  // keeps the item honest — a cleared-then-recomputed row is not pinned to a stale decision.
+  const toggleFlag = React.useCallback(() => {
+    if (!onSetFlag || !item.cutout) return;
+    onSetFlag(item, flagged ? 'clear' : 'flag');
+  }, [onSetFlag, item, flagged]);
+
+  React.useEffect(() => {
+    if (!onSetFlag) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'f' && event.key !== 'F') return;
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      const el = event.target;
+      if (
+        el instanceof HTMLElement &&
+        (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)
+      ) {
+        return;
+      }
+      event.preventDefault();
+      toggleFlag();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onSetFlag, toggleFlag]);
+
+  const sourceToggle = imported ? (
+    <ButtonGroup className="shrink-0">
+      <Button
+        size="sm"
+        variant="outline"
+        aria-pressed={showImported}
+        className={cn(showImported && 'bg-muted text-foreground')}
+        title="The image this row was imported with"
+        onClick={() => setShowImported(true)}
+      >
+        Original
+      </Button>
+      <Button
+        size="sm"
+        variant="outline"
+        aria-pressed={!showImported}
+        className={cn(!showImported && 'bg-muted text-foreground')}
+        title="The image the background removal is running on"
+        onClick={() => setShowImported(false)}
+      >
+        {item.source.kind === 'file' && item.source.regenerated ? 'AI edit' : 'Current'}
+      </Button>
+    </ButtonGroup>
+  ) : null;
+
   return (
     <>
-      <DialogHeader className="min-w-0">
-        <DialogTitle className="truncate">{item.name || `Image ${index + 1}`}</DialogTitle>
-        <div className="flex min-w-0 items-center gap-1.5">
-          <DialogDescription
-            className={cn('min-w-0 truncate', item.status === 'error' && item.error && 'text-destructive')}
-            title={item.status === 'error' && item.error ? item.error : sourceLabel(item)}
-          >
-            {item.status === 'error' && item.error
-              ? item.error
-              : item.durationMs !== undefined
-                ? `Cut out in ${formatDuration(item.durationMs)} · ${sourceLabel(item)}`
-                : sourceLabel(item)}
-          </DialogDescription>
-          {sourceUrl && (
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              className="shrink-0"
-              title={urlFromImport ? 'Copy the imported image URL' : 'Copy image URL'}
-              onClick={() => void handleCopy()}
-            >
-              {copied ? <CheckIcon /> : <CopyIcon />}
-              <span className="sr-only">Copy image URL</span>
-            </Button>
+      <div className="shrink-0 border-b px-5 pt-5 pb-4">
+      <DialogHeader className="min-w-0 gap-2">
+        {/* Title and the file-detail ⓘ on one line; pr-10 keeps a long title clear of the
+            close button DialogContent pins absolutely to this corner. The pager moved down to
+            the control bar, beside the views it steps between. min-h-8 pins the row to the
+            icon-button's height, so a row without the ⓘ is not shorter than one with it. */}
+        <div className="flex min-h-8 min-w-0 items-center gap-2 pr-10">
+          <DialogTitle className="min-w-0 truncate">{item.name || `Image ${index + 1}`}</DialogTitle>
+          {besideLabel && (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button variant="ghost" size="icon-sm" className="shrink-0 text-muted-foreground" />
+                }
+              >
+                <InfoIcon />
+                <span className="sr-only">File details</span>
+              </TooltipTrigger>
+              <TooltipContent className="max-w-80">{besideLabel}</TooltipContent>
+            </Tooltip>
           )}
-          {sourceUrl && (
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              className="shrink-0"
-              title={
-                urlFromImport
-                  ? 'Open the imported image URL in a new tab — this row now holds an AI edit'
-                  : 'Open the original image URL in a new tab'
-              }
-              nativeButton={false}
-              render={<a href={sourceUrl} target="_blank" rel="noreferrer" />}
-            >
-              <ExternalLinkIcon />
-              <span className="sr-only">Open original image</span>
-            </Button>
+          {/* Flag state, at title level. Amber when the matte tripped a check, a quiet "Clean"
+              when it did not — either way the dialog now SAYS whether this cutout is flagged,
+              with the reasons on the badge's tooltip. */}
+          {verdict && flagged && (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Badge
+                    variant="chip-warn"
+                    className="shrink-0 gap-1 py-0.5"
+                    render={onSetFlag ? <button type="button" onClick={toggleFlag} /> : undefined}
+                  />
+                }
+              >
+                <FlagIcon className="size-3" />
+                Flagged
+              </TooltipTrigger>
+              <TooltipContent className="max-w-80">
+                <ul className="list-disc space-y-0.5 pl-4">
+                  {verdict.reasons.map((r, i) => <li key={i}>{r}</li>)}
+                </ul>
+                {onSetFlag && <p className="mt-1 opacity-70">Press F to unflag.</p>}
+              </TooltipContent>
+            </Tooltip>
+          )}
+          {verdict && !flagged && onSetFlag && (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Badge
+                    variant="chip"
+                    className="shrink-0 gap-1 py-0.5"
+                    render={<button type="button" onClick={toggleFlag} />}
+                  />
+                }
+              >
+                <FlagIcon className="size-3" />
+                Clean
+              </TooltipTrigger>
+              <TooltipContent>Press F to flag this image.</TooltipContent>
+            </Tooltip>
+          )}
+          {verdict && !flagged && !onSetFlag && (
+            <span className="shrink-0 text-xs text-muted-foreground">Clean</span>
           )}
         </div>
       </DialogHeader>
-
-      {/* min-w-0 on the grid AND its children: without it a grid item's automatic minimum size
-          is its content, so the region table below widens the whole dialog instead of scrolling
-          inside its own container. */}
-      <div className="grid min-w-0 gap-3 sm:grid-cols-2">
-        <figure className="min-w-0 space-y-1.5">
-          {/* min-h-7 on both captions so the toggle appearing over one pane does not push its
-              image box out of line with the other's. */}
-          <figcaption className="flex min-h-7 min-w-0 items-center text-xs text-muted-foreground">
-            {imported ? (
-              // An AI-edited row has three images and this dialog has two columns. A third
-              // column at sm:max-w-3xl leaves each image ~200px wide, which is under the size
-              // where the edge quality anyone opens this for is still visible — so the two
-              // inputs share the left pane and swap instead of shrinking.
-              //
-              // It opens on the import: that is what the caption has always promised, it is the
-              // only copy of it left once `prev` is spent, and the AI input is one click away
-              // for anyone checking what the removal actually ran on.
-              <ToggleGroup
-                size="sm"
-                variant="outline"
-                value={[showImported ? 'import' : 'current']}
-                // An empty array is the user re-pressing the active segment; ignoring it keeps
-                // the pane from going blank on a click that meant nothing.
-                onValueChange={(next) => next[0] && setShowImported(next[0] === 'import')}
-              >
-                <ToggleGroupItem value="import" title="The image this row was imported with">
-                  Original
-                </ToggleGroupItem>
-                <ToggleGroupItem
-                  value="current"
-                  title="The image the background removal is running on"
-                >
-                  {item.source.kind === 'file' && item.source.regenerated ? 'AI edit' : 'Current'}
-                </ToggleGroupItem>
-              </ToggleGroup>
-            ) : (
-              'Original'
-            )}
-          </figcaption>
-          <div className="grid h-64 place-items-center overflow-hidden rounded-lg border bg-muted/40 p-2">
-            {imported && showImported ? (
-              // Not SourceImage: item.original is the AI edit's decoded output on exactly the
-              // rows that reach this branch, and drawing it here is the bug this pane exists
-              // to fix.
-              <RawSourceImage source={imported} className="max-h-full max-w-full object-contain" />
-            ) : (
-              <SourceImage item={item} className="max-h-full max-w-full object-contain" />
-            )}
-          </div>
-        </figure>
-        <figure className="min-w-0 space-y-1.5">
-          <figcaption className="flex min-h-7 min-w-0 items-center text-xs text-muted-foreground">
-            Background removed{background === TRANSPARENT ? '' : ` · on ${background}`}
-          </figcaption>
-          <div
-            className={cn(
-              'grid h-64 place-items-center overflow-hidden rounded-lg border p-2',
-              // The export backdrop is only worth showing under an actual cutout. It is a
-              // user-chosen colour, so the empty-state text below would be painted onto it —
-              // white-on-white for the default light backdrop viewed in a dark theme, and the
-              // mirror of that for a dark custom hex. The pane then reads as blank, which is
-              // the exact failure this message exists to prevent.
-              !item.cutout && 'bg-muted/40',
-            )}
-            style={item.cutout ? backdropStyle(background) : undefined}
-          >
-            {item.cutout ? (
-              <CutoutImage itemId={item.id} cutout={item.cutout} max={560} className="max-h-full max-w-full" />
-            ) : (
-              <EmptyCutout status={item.status} />
-            )}
-          </div>
-        </figure>
       </div>
+
+      {/* The one scroll region. `bg-scroll-slim` keeps its bar out of sight until the pointer is
+          over it — nothing to look at while it isn't being used. */}
+      <div className="bg-scroll-slim min-h-0 space-y-4 overflow-y-auto px-5 py-4 [scrollbar-gutter:stable]">
+
+      {/* One control bar over the two columns: source toggle, console tabs and paging on a
+          single line. It shares the body's grid template so the toggle sits over the left panes
+          and the tabs over the console. <Tabs> wraps the bar AND the grid, so the TabsList up
+          here and the TabsContent below share one tab context. */}
+      <Tabs
+        value={activeTab}
+        onValueChange={(value) => onFixTabChange(String(value ?? 'recut') as FixTab)}
+        className="min-w-0 gap-4"
+      >
+        <div className="grid min-h-8 min-w-0 items-center gap-4 sm:grid-cols-[minmax(0,20rem)_minmax(0,1fr)]">
+          <div className="flex min-h-8 min-w-0 items-center">
+            {sourceToggle ?? <span className="px-1 text-xs text-muted-foreground">Original</span>}
+          </div>
+          <div className="flex min-h-8 min-w-0 items-center gap-3">
+            {(hasRedo || hasAiEdit) && (
+              <TabsList>
+                {hasRedo && (
+                  <TabsTrigger value="recut">
+                    <ImageIcon data-icon="inline-start" />
+                    BG removal
+                  </TabsTrigger>
+                )}
+                {hasAiEdit && (
+                  <TabsTrigger value="ai">
+                    <SparklesIcon data-icon="inline-start" />
+                    AI edit
+                  </TabsTrigger>
+                )}
+              </TabsList>
+            )}
+            <div className="flex-1" />
+            {pager}
+          </div>
+        </div>
+
+      <div className="grid min-w-0 gap-4 sm:grid-cols-[minmax(0,20rem)_minmax(0,1fr)]">
+        <div className="flex min-w-0 flex-col gap-2">
+          <figure className="min-w-0">
+            <div
+              className="grid max-h-72 w-full place-items-center overflow-hidden rounded-lg border bg-muted/40 p-2"
+              style={{ aspectRatio: sourceAspect }}
+            >
+              {imported && showImported ? (
+                <RawSourceImage source={imported} className="max-h-full max-w-full object-contain" />
+              ) : (
+                <SourceImage item={item} className="max-h-full max-w-full object-contain" />
+              )}
+            </div>
+          </figure>
+          <figure className="min-w-0 space-y-1.5">
+            <figcaption className="text-xs text-muted-foreground">
+              Background removed{background === TRANSPARENT ? '' : ` · on ${background}`}
+            </figcaption>
+            <div
+              className={cn(
+                'grid max-h-72 w-full place-items-center overflow-hidden rounded-lg border p-2',
+                !item.cutout && 'bg-muted/40',
+              )}
+              style={{ aspectRatio: sourceAspect, ...(item.cutout ? backdropStyle(background) : null) }}
+            >
+              {item.cutout ? (
+                <CutoutImage itemId={item.id} cutout={item.cutout} max={560} className="max-h-full max-w-full" />
+              ) : (
+                <EmptyCutout status={item.status} />
+              )}
+            </div>
+          </figure>
+        </div>
+
+        {/* The run console body — the tab bar for it lives on the shared control bar above.
+            `relative` with no height of its own: the AI-edit tab fills it absolutely so the grid
+            row is sized by the image column, and the prompt scrolls WITHIN that height rather
+            than growing the dialog. The BG-removal tab flows normally — its tables belong in the
+            dialog's own scroll. */}
+        <div className="relative min-h-[32rem] min-w-0">
+            {hasRedo && (
+              <TabsContent value="recut" className="flex min-w-0 flex-col gap-4 data-[state=inactive]:hidden">
+                <div className="flex min-w-0 flex-col gap-3 rounded-lg border p-3">
+                  <Field>
+                    <FieldLabel htmlFor="compare-redo-model">Model</FieldLabel>
+                    <Select
+                      value={redoModel}
+                      onValueChange={(value) => setRedoModel(String(value ?? ''))}
+                      disabled={busy}
+                    >
+                      <SelectTrigger id="compare-redo-model" size="sm" className="w-full">
+                        <SelectValue>
+                          {(value) => models?.find((m) => m.id === value)?.label ?? 'Model'}
+                        </SelectValue>
+                      </SelectTrigger>
+                      <SelectContent>
+                        {models?.map((m) => (
+                          <SelectItem key={m.id} value={m.id} disabled={m.disabled}>
+                            <span className="flex flex-col gap-0.5 py-0.5">
+                              <span>{m.label}</span>
+                              {m.hint && <span className="text-xs text-muted-foreground">{m.hint}</span>}
+                            </span>
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                  <label className="flex cursor-pointer items-center gap-2 text-sm">
+                    <Checkbox
+                      checked={redoRefine}
+                      disabled={busy}
+                      onCheckedChange={(checked) => setRedoRefine(checked === true)}
+                    />
+                    Refine edges
+                  </label>
+                  <FieldDescription>
+                    Runs background removal on this image again and replaces the cutout. Undo
+                    brings the old one back.
+                  </FieldDescription>
+                  <Button
+                    className="self-start"
+                    disabled={busy || !redoModel}
+                    onClick={() => onRedo?.(item, { model: redoModel, refine: redoRefine })}
+                  >
+                    <RefreshCwIcon data-icon="inline-start" />
+                    Remove again
+                  </Button>
+                </div>
+                {diagnostics && (
+                  <div className="flex min-w-0 flex-col gap-4 border-t pt-4">{diagnostics}</div>
+                )}
+              </TabsContent>
+            )}
+
+            {hasAiEdit && aiEdit && (
+              <TabsContent value="ai" className="absolute inset-0 flex min-h-0 flex-col data-[state=inactive]:hidden">
+                {/* Unchanged inside — the same block Compose and Generate show in their dialogs.
+                    Its own title would repeat the tab, so it is dropped here. */}
+                <RegenPrompt
+                  defaultPrompt={aiEdit.defaultPrompt}
+                  rowContext={aiEdit.rowContext}
+                  busy={busy}
+                  working={item.status === 'editing'}
+                  disabled={!aiEdit.ready}
+                  hint={aiEdit.hint}
+                  source={aiEdit.source}
+                  // The tab already says AI edit; the button says the same word rather than
+                  // introducing "Regenerate" as a second name for it. Copy is off here — the
+                  // prompt is one click from Settings, and the row it took was worth more.
+                  actionLabel="AI edit"
+                  copyable={false}
+                  collapsible={false}
+                  fill
+                  onRegenerate={(prompt, from) => aiEdit.onEdit(item, prompt, from)}
+                />
+              </TabsContent>
+            )}
+            {/* No BG-removal tab to hold them (an archived row can still carry a cutout and its
+                report) — so the tables render straight into the console column instead. */}
+            {!hasRedo && diagnostics}
+        </div>
+      </div>
+      </Tabs>
 
       {/* Same tie-to-cutout rule as the tables below: the verdict describes one matte, and it
           is cleared whenever a new one replaces it. */}
@@ -814,79 +1179,53 @@ function CompareView({
         </p>
       )}
 
-      {/* Tied to the cutout it measures: the report is never cleared, so an AI edit or a failed
-          redo leaves last run's verdicts sitting under a pane that says there is no cutout —
-          two contradictory claims about a matte the user can no longer see or download. */}
-      {item.cutout && item.regionReport && item.regionReport.length > 0 && (
-        <RegionTable regions={item.regionReport} />
-      )}
-
-      {/* Same tie-to-cutout rule as the region table above. */}
-      {item.cutout && <ComponentTable item={item} />}
-
-      {/* The same block Compose and Generate show in their dialogs (components/regen-prompt.tsx).
-          CompareView is already keyed by item id upstream, so the draft reseeds per image. */}
-      {aiEdit && canRetry(item) && (
-        <RegenPrompt
-          title="AI edit"
-          defaultPrompt={aiEdit.defaultPrompt}
-          rowContext={aiEdit.rowContext}
-          busy={busy}
-          working={item.status === 'editing'}
-          disabled={!aiEdit.ready}
-          hint={aiEdit.hint}
-          source={aiEdit.source}
-          onRegenerate={(prompt, from) => aiEdit.onEdit(item, prompt, from)}
-        />
-      )}
-
       {saveError && <p className="text-xs text-destructive">{saveError}</p>}
+      </div>
 
-      {/* One close affordance only — DialogContent's top-right X. A second Close button here
-          competed with Download PNG for the primary slot. */}
-      <DialogFooter className="flex-wrap gap-2">
-        {onRedo && models?.length && canRetry(item) ? (
-          <div className="mr-auto flex min-w-0 items-center gap-2">
-            <Select
-              value={redoModel}
-              onValueChange={(value) => setRedoModel(String(value ?? ''))}
-              disabled={busy}
+      {/* One close affordance only — DialogContent's top-right X. The run controls moved into
+          the console above, so this row carries only what happens to the cutout that exists. */}
+      {/* m-0 kills DialogFooter's own -mx-4 -mb-4 bleed: those were meant for a padded dialog
+          and, in this fixed-column layout, pushed the footer 16px past the clipped bottom edge
+          (its rounded corners sliced off square). It keeps the base border-t and rounded-b. */}
+      {/* bg-transparent kills DialogFooter's own bg-muted/50 fill: the modal reads as ONE
+          surface with a hairline seam, not a two-tone panel. m-0 kills its bleed margins. */}
+      <DialogFooter className="m-0 shrink-0 flex-wrap items-center gap-2 bg-transparent px-5 py-3">
+        {/* Provenance sits with the other things you do to the WHOLE image rather than in the
+            header: it is an action pair (copy, open), not a caption, and in the header it made
+            the title area two rows tall on every row that had a URL. */}
+        {sourceUrl && (
+          <ButtonGroup className="mr-auto">
+            <ButtonGroupText
+              className="h-8 max-w-56 text-xs font-normal"
+              title={sourceUrl}
             >
-              <SelectTrigger size="sm" className="w-44" aria-label="Model for this redo">
-                <SelectValue>
-                  {(value) => models.find((m) => m.id === value)?.label ?? 'Model'}
-                </SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {models.map((m) => (
-                  <SelectItem key={m.id} value={m.id} disabled={m.disabled}>
-                    <span className="flex flex-col gap-0.5 py-0.5">
-                      <span>{m.label}</span>
-                      {m.hint && <span className="text-xs text-muted-foreground">{m.hint}</span>}
-                    </span>
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <label className="flex cursor-pointer items-center gap-1.5 text-xs whitespace-nowrap">
-              <Checkbox
-                checked={redoRefine}
-                disabled={busy}
-                onCheckedChange={(checked) => setRedoRefine(checked === true)}
-              />
-              Refine edges
-            </label>
+              <span className="truncate">{shortSource(sourceUrl)}</span>
+            </ButtonGroupText>
             <Button
               variant="outline"
-              disabled={busy || !redoModel}
-              onClick={() => onRedo(item, { model: redoModel, refine: redoRefine })}
-              title="Remove the background again with these settings"
+              size="icon"
+              title={urlFromImport ? 'Copy the imported image URL' : 'Copy image URL'}
+              onClick={() => void handleCopy()}
             >
-              <RefreshCwIcon data-icon="inline-start" />
-              Redo
+              {copied ? <CheckIcon /> : <CopyIcon />}
+              <span className="sr-only">Copy image URL</span>
             </Button>
-          </div>
-        ) : null}
+            <Button
+              variant="outline"
+              size="icon"
+              title={
+                urlFromImport
+                  ? 'Open the imported image URL in a new tab — this row now holds an AI edit'
+                  : 'Open the original image URL in a new tab'
+              }
+              nativeButton={false}
+              render={<a href={sourceUrl} target="_blank" rel="noreferrer" />}
+            >
+              <ExternalLinkIcon />
+              <span className="sr-only">Open original image</span>
+            </Button>
+          </ButtonGroup>
+        )}
         {onUndo && item.prev && (
           <Button
             variant="outline"

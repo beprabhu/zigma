@@ -30,28 +30,31 @@ import { buildZipStream, type ZipStreamEntry } from '@/lib/zip';
 import { canvasToPngBlob, formatKb, loadImageFromFile, mapWithLimit, releaseCanvas } from '@/lib/bg/batch';
 import { compressPng } from '@/lib/compress';
 import { useProcessing } from '@/components/process-panel';
-
-type ItemStatus = 'queued' | 'working' | 'done' | 'error';
-
-interface Item {
-  id: string;
-  file: File;
-  previewUrl: string;
-  status: ItemStatus;
-  output?: Blob;
-  outputUrl?: string;
-  error?: string;
-}
+import {
+  releasePngItem, restingPngStatus, revivePngUrls, savingsPct, tinyName, type PngItem,
+} from '@/lib/png-queue';
+import { readSession, saveSession, sessionKey } from '@/lib/session-store';
+import { resolveOpen } from '@/lib/files/open';
+import { useNewFileGeneration } from '@/components/new-file-boundary';
+import { useFileStore, type LoadedFile } from '@/lib/files/use-file-store';
+import { EMPTY_PNG_DOC, pngCodec, type PngDoc } from '@/lib/files/codecs/png';
+import { daysUntilExpiry } from '@/lib/files/sweep';
 
 const COLOR_CHOICES = [256, 128, 64, 32, 16] as const;
 
-function tinyName(name: string): string {
-  return name.replace(/\.png$/i, '') + '-tiny.png';
+/**
+ * What survives a hop to another product. Not persistence — the file store handles that — but the
+ * live rows, including the dropped Files themselves, which disk deliberately never holds.
+ */
+interface PngSession {
+  fileId: string;
+  items: PngItem[];
+  sessionName: string;
+  colors: number;
+  lossless: boolean;
 }
 
-function savingsPct(input: number, output: number): number {
-  return input ? Math.round((100 * (input - output)) / input) : 0;
-}
+const PNG_SESSION = sessionKey<PngSession>('png-compressor');
 
 function imageToCanvas(img: HTMLImageElement): Promise<HTMLCanvasElement> {
   const c = document.createElement('canvas');
@@ -61,23 +64,88 @@ function imageToCanvas(img: HTMLImageElement): Promise<HTMLCanvasElement> {
   return Promise.resolve(c);
 }
 
+/**
+ * Thin shell around the file itself. The key is what makes "New png-compressor file" work: a bump
+ * remounts everything below and the fresh mount resolves to a new file id, rather than every
+ * piece of page state needing its own reset.
+ */
 export default function PngCompressorPage() {
-  const [items, setItems] = React.useState<Item[]>([]);
+  const generation = useNewFileGeneration('png-compressor');
+  return <PngCompressorFile key={generation} />;
+}
+
+function PngCompressorFile() {
+  /**
+   * Which file this mount is editing, and whether the tab's live snapshot belongs to it. A request
+   * from the homepage outranks the snapshot; when they disagree the snapshot is dropped, because
+   * its rows belong to a different file.
+   */
+  const [opened] = React.useState(() => resolveOpen('png-compressor', readSession(PNG_SESSION)));
+  const [items, setItems] = React.useState<PngItem[]>(() =>
+    revivePngUrls(opened.snapshot?.items ?? []),
+  );
   // Figma-style session name in the panel header; seeds the download ZIP filename. Auto-seeded
   // from the first PNG dropped, but never over a name the user already typed.
-  const [sessionName, setSessionName] = React.useState('');
+  const [sessionName, setSessionName] = React.useState(() => opened.snapshot?.sessionName ?? '');
   const sessionSlug = sessionName.trim().replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '');
-  const [colors, setColors] = React.useState<number>(256);
-  const [lossless, setLossless] = React.useState(false);
+  const [colors, setColors] = React.useState<number>(
+    () => opened.snapshot?.colors ?? EMPTY_PNG_DOC.colors,
+  );
+  const [lossless, setLossless] = React.useState(
+    () => opened.snapshot?.lossless ?? EMPTY_PNG_DOC.lossless,
+  );
   const [running, setRunning] = React.useState(false);
   const [progress, setProgress] = React.useState<{ pct: number; text: string } | null>(null);
   const abortRef = React.useRef<AbortController | null>(null);
 
   const proc = useProcessing({ prefix: 'skuc_png', removeBg: true, tileFit: true, compress: false, busy: running });
 
-  const patch = React.useCallback((id: string, delta: Partial<Item>) => {
+  const patch = React.useCallback((id: string, delta: Partial<PngItem>) => {
     setItems((prev) => prev.map((it) => (it.id === id ? { ...it, ...delta } : it)));
   }, []);
+
+  // ---- The file ----
+  const fileDoc = React.useMemo<PngDoc>(
+    () => ({ sessionName, colors, lossless }),
+    [sessionName, colors, lossless],
+  );
+
+  /** Seeds the page from disk. Called once, before the store starts mirroring. */
+  const handleLoadedFile = React.useCallback((loaded: LoadedFile<PngItem, PngDoc>) => {
+    if (loaded.doc) {
+      if (loaded.doc.sessionName) {
+        setSessionName((prev) => (prev.trim() ? prev : loaded.doc!.sessionName));
+      }
+      setColors(loaded.doc.colors);
+      setLossless(loaded.doc.lossless);
+    }
+    if (loaded.items.length) {
+      setItems((prev) => (prev.length ? [...prev, ...loaded.items] : loaded.items));
+    }
+  }, []);
+
+  const {
+    fileId,
+    phase: filePhase,
+    record: fileRecord,
+    setKept: setFileKept,
+    failing: fileFailing,
+  } = useFileStore<PngItem, PngDoc>({
+    codec: pngCodec,
+    items,
+    doc: fileDoc,
+    fileId: opened.fileId,
+    // A queue carried across a product switch is not a file being opened: its rows are
+    // already on screen AND already on disk.
+    adopted: !!opened.snapshot,
+    onLoad: handleLoadedFile,
+  });
+  const fileLoading = filePhase !== 'active';
+  const expiryLabel = React.useMemo(() => {
+    if (!fileRecord || fileRecord.keptAt !== null) return '';
+    const days = daysUntilExpiry(fileRecord);
+    return days === null ? '' : `Deletes in ${days} day${days === 1 ? '' : 's'}.`;
+  }, [fileRecord]);
 
   const addFiles = React.useCallback((files: FileList | File[]) => {
     const pngs = Array.from(files).filter(
@@ -91,6 +159,8 @@ export default function PngCompressorPage() {
       ...prev,
       ...pngs.map((file) => ({
         id: crypto.randomUUID(),
+        name: file.name,
+        inputSize: file.size,
         file,
         previewUrl: URL.createObjectURL(file),
         status: 'queued' as const,
@@ -98,15 +168,40 @@ export default function PngCompressorPage() {
     ]);
   }, []);
 
-  // Object URLs live for the page's lifetime; revoke them all on unmount.
+  // The unmount cleanup runs once, so its closure is the FIRST render's. Everything it needs is
+  // mirrored here on every commit instead.
+  const sessionRef = React.useRef<PngSession>({
+    fileId: '',
+    items,
+    sessionName,
+    colors,
+    lossless,
+  });
+  React.useEffect(() => {
+    sessionRef.current = { fileId, items, sessionName, colors, lossless };
+  });
+
+  // Leaving the product stops the run and hands back every object URL — a client-side route change
+  // keeps the document alive, so nothing else would ever revoke them.
   React.useEffect(() => () => {
-    setItems((prev) => {
-      for (const it of prev) {
-        URL.revokeObjectURL(it.previewUrl);
-        if (it.outputUrl) URL.revokeObjectURL(it.outputUrl);
-      }
-      return prev;
+    abortRef.current?.abort();
+    // Snapshot BEFORE revoking, and with BOTH urls stripped from every row — then revoke every
+    // row. Carrying a url across would revive a queue pointing at revoked blob: URLs, the exact
+    // trap lib/session-store.ts:60-69 documents, and it is the download link as much as the
+    // thumbnail: an outputUrl kept while its object was revoked gives a button that saves nothing.
+    // The File and the output Blob are what actually survive, so the mount below re-mints from
+    // those.
+    const snapshot = sessionRef.current;
+    saveSession(PNG_SESSION, {
+      ...snapshot,
+      items: snapshot.items.map((it) => ({
+        ...it,
+        previewUrl: '',
+        outputUrl: undefined,
+        status: restingPngStatus(it),
+      })),
     });
+    snapshot.items.forEach(releasePngItem);
   }, []);
 
   React.useEffect(() => {
@@ -119,7 +214,18 @@ export default function PngCompressorPage() {
   }, [addFiles]);
 
   const compressOne = React.useCallback(
-    async (item: Item, signal: AbortSignal) => {
+    async (item: PngItem, signal: AbortSignal) => {
+      // A row restored from disk carries its result but not its source — inputs are never
+      // persisted (see PngItem.file). Nothing routes such a row here today, because restored rows
+      // arrive 'done' and only queued/errored ones are run; this says so out loud rather than
+      // letting a future caller find out through a null dereference.
+      if (!item.file) {
+        patch(item.id, {
+          status: 'error',
+          error: 'Original not saved — drop the file again to re-compress it.',
+        });
+        return;
+      }
       patch(item.id, { status: 'working', error: undefined });
       try {
         // The processing space runs first (pixels), then the shared compress step (bytes) —
@@ -180,7 +286,7 @@ export default function PngCompressorPage() {
     // The outputs are already Blobs — hand them to the zip as-is instead of materializing
     // every compressed PNG into memory first.
     const entries: ZipStreamEntry[] = done.map((it) => ({
-      name: tinyName(it.file.name),
+      name: tinyName(it.name),
       data: it.output!,
     }));
     const url = URL.createObjectURL(await buildZipStream(entries));
@@ -199,14 +305,18 @@ export default function PngCompressorPage() {
   // it becomes the export. Dropping more files raises pendingCount and flips it back, so the
   // button always offers the thing that is actually next rather than two rival CTAs.
   const exportMode = !running && pendingCount === 0 && doneCount > 0;
-  const totalIn = items.reduce((s, it) => s + it.file.size, 0);
+  const totalIn = items.reduce((s, it) => s + it.inputSize, 0);
   const totalOut = items.reduce(
-    (s, it) => s + (it.output ? it.output.size : it.file.size), 0,
+    (s, it) => s + (it.output ? it.output.size : it.inputSize), 0,
   );
 
   const statusText = running
     ? progress?.text ?? 'Compressing…'
-    : doneCount
+    : // A failing store is worth saying out loud even mid-batch: writes retry on their own, but
+      // the user is entitled to know the results on screen are not safely on disk yet.
+      fileFailing
+      ? 'Autosave failing — retrying'
+      : doneCount
       ? `${formatKb(totalIn)} → ${formatKb(totalOut)} · ${savingsPct(totalIn, totalOut)}% smaller`
       : items.length
         ? `${items.length} file${items.length === 1 ? '' : 's'} queued`
@@ -252,7 +362,7 @@ export default function PngCompressorPage() {
                 </span>
                 <ClearAllButton
                   title="Clear the queue?"
-                  disabled={running}
+                  disabled={running || fileLoading}
                   onConfirm={() => setItems([])}
                   description={
                     <>
@@ -272,15 +382,15 @@ export default function PngCompressorPage() {
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
                     src={it.outputUrl ?? it.previewUrl}
-                    alt={it.file.name}
+                    alt={it.name}
                     className="size-12 shrink-0 rounded border object-contain [background:repeating-conic-gradient(var(--muted)_0%_25%,transparent_0%_50%)_0_0/12px_12px]"
                   />
                   <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-medium">{it.file.name}</p>
+                    <p className="truncate text-sm font-medium">{it.name}</p>
                     <p className="text-xs text-muted-foreground">
                       {it.status === 'done' && it.output
-                        ? `${formatKb(it.file.size)} → ${formatKb(it.output.size)}`
-                        : formatKb(it.file.size)}
+                        ? `${formatKb(it.inputSize)} → ${formatKb(it.output.size)}`
+                        : formatKb(it.inputSize)}
                       {it.status === 'error' && (
                         <span className="text-destructive"> — {it.error}</span>
                       )}
@@ -292,9 +402,9 @@ export default function PngCompressorPage() {
                   )}
                   {it.status === 'done' && it.output && (
                     <Badge
-                      variant={it.output.size < it.file.size ? 'default' : 'secondary'}
+                      variant={it.output.size < it.inputSize ? 'default' : 'secondary'}
                     >
-                      −{savingsPct(it.file.size, it.output.size)}%
+                      −{savingsPct(it.inputSize, it.output.size)}%
                     </Badge>
                   )}
                   {it.status === 'done' && it.outputUrl && (
@@ -305,7 +415,7 @@ export default function PngCompressorPage() {
                       size="icon"
                       className="size-8"
                       nativeButton={false}
-                      render={<a href={it.outputUrl} download={tinyName(it.file.name)} />}
+                      render={<a href={it.outputUrl} download={tinyName(it.name)} />}
                     >
                       <DownloadIcon />
                     </Button>
@@ -373,8 +483,33 @@ export default function PngCompressorPage() {
                       onChange={(e) => setSessionName(e.target.value)}
                       placeholder="Untitled batch"
                     />
-                    <FieldDescription>Names the exported ZIP.</FieldDescription>
+                    <FieldDescription>
+                      Names the exported ZIP, and titles this batch on the Zigma home screen.
+                    </FieldDescription>
                   </Field>
+                  {/* The expiry rule has to be reachable from inside the tool. Compress has no
+                      session header to hang a chip on, so it rides here, next to the name — the
+                      one place this product already talks about the batch as a document. */}
+                  {fileRecord && (
+                    <Field className="mt-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs text-muted-foreground">
+                          {fileRecord.keptAt !== null
+                            ? 'Kept — this batch will not be deleted.'
+                            : expiryLabel}
+                        </span>
+                        <Toggle
+                          size="sm"
+                          variant="outline"
+                          pressed={fileRecord.keptAt !== null}
+                          onPressedChange={setFileKept}
+                          title="Unkept batches are removed 7 days after their last change."
+                        >
+                          Keep
+                        </Toggle>
+                      </div>
+                    </Field>
+                  )}
                 </section>
                 {/* Remove background and Tile fit — the pixel steps that run before the bytes
                     get squeezed. Tile fit alone opens a whole safe-area editor, which is why

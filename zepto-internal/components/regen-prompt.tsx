@@ -21,6 +21,7 @@ import {
 } from '@/components/ui/dialog';
 import { Spinner } from '@/components/ui/spinner';
 import { Textarea } from '@/components/ui/textarea';
+import { cn } from '@/lib/utils';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 
 /** One-click copy with the async-clipboard + execCommand fallback the suite uses everywhere. */
@@ -156,6 +157,30 @@ export interface RegenPromptProps {
    * one picture to travel with — the callback then always receives 'latest'.
    */
   source?: PromptSourceOptions;
+  /**
+   * The action's own verb. Products that RE-run a generation keep "Regenerate"; where the block
+   * is one method among several (Cleanup's console tabs it against BG removal) the button is
+   * named for the method instead, so the tab and its button do not use two different words for
+   * one act.
+   */
+  actionLabel?: string;
+  /**
+   * Copy-the-whole-prompt button. Off where the prompt is already one click from the product's
+   * own prompt panel and the row it would occupy is worth more than the shortcut.
+   */
+  copyable?: boolean;
+  /**
+   * Whether the block collapses behind its own header. Off where something else already owns
+   * the disclosure — Cleanup's console tabs it against BG removal, so the tab IS the toggle and
+   * a second one just hides the panel the tab was clicked to show.
+   */
+  collapsible?: boolean;
+  /**
+   * Grow to fill the height its container gives it, textarea taking the slack. Non-collapsible
+   * case only — it lets the prompt panel match a taller neighbouring column instead of leaving
+   * dead space under a fixed-height box.
+   */
+  fill?: boolean;
   onRegenerate: (prompt: string, source: PromptSource) => void;
 }
 
@@ -169,6 +194,10 @@ export function RegenPrompt({
   disabled = false,
   hint,
   source,
+  actionLabel = 'Regenerate',
+  copyable = true,
+  collapsible = true,
+  fill = false,
   onRegenerate,
 }: RegenPromptProps) {
   const seed = sentPrompt ?? defaultPrompt;
@@ -184,6 +213,114 @@ export function RegenPrompt({
   const stale = !!sentPrompt && sentPrompt.trim() !== defaultPrompt.trim();
   const locked = busy || working;
 
+  const content = (
+    <div
+      className={cn(
+        'space-y-2 p-3 pb-0',
+        collapsible && 'border-t',
+        // overflow-y-auto is the safety valve, not the plan: the panel is a FIXED height and the
+        // row block is unbounded (a sheet with twenty columns prints twenty lines). Without it
+        // the wrapper's overflow-hidden — there for the rounded corners — cut the overflow
+        // through the middle of a line. The floors below are sized so the common case never
+        // reaches this.
+        fill && 'flex min-h-0 flex-1 flex-col gap-2 space-y-0 overflow-y-auto',
+      )}
+    >
+        {copyable && (
+          <div className="flex items-center justify-end">
+            <CopyButton
+              text={rowContext ? `${draft}\n\n${rowContext}` : draft}
+              title="Copy the full prompt"
+            />
+          </div>
+        )}
+        <Textarea
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          rows={fill ? undefined : 6}
+          disabled={locked}
+          aria-label={`${title} for this row`}
+          className={cn(
+            'overflow-y-auto text-xs',
+            fill ? 'min-h-48 flex-1 resize-none' : 'max-h-64',
+          )}
+        />
+        {/* One group for everything sent to Azure ALONGSIDE the prompt text: the source-image
+            choice and the row's CSV fields. The picker carries the "Send with the prompt"
+            heading when there is an image choice to make; otherwise it is stated once above the
+            details. The nested radii step in (outer rounded-lg, inner rounded-md) so the two
+            read as a card and its content, not two stacked boxes. */}
+        {(rowContext || (source && source.hasLatest && source.hasOriginal)) && (
+          <div className="shrink-0 space-y-2 rounded-lg border bg-muted/30 p-2.5">
+            {source && source.hasLatest && source.hasOriginal ? (
+              <PromptSourcePicker
+                options={source}
+                value={picked}
+                onChange={setPick}
+                disabled={locked || disabled}
+              />
+            ) : (
+              <span className="text-xs font-medium text-muted-foreground">Send with the prompt</span>
+            )}
+            {/* Two things keep this from slicing a line in half. leading-4 pins the line box to
+                1rem, and max-h-40 minus p-2 leaves exactly 9 of them — left to the font's own
+                15.7px, the old 7rem box held 6.43 lines and cut the last through the glyphs.
+                8 lines also clears a typical row (keyword, attribute, id, value, treatment)
+                outright, so the common case has nothing hidden rather than one line short —
+                and the whole panel then fits its floor without a 10px sliver of scroll. */}
+            {rowContext && (
+              <pre className="max-h-36 overflow-auto rounded-md bg-muted/40 p-2 text-[11px] leading-4 whitespace-pre-wrap text-muted-foreground">
+                {rowContext}
+              </pre>
+            )}
+          </div>
+        )}
+        {stale && (
+          <p className="text-[11px] text-muted-foreground">
+            This ran on a different prompt than the current default — regenerate to use what is
+            in the box.
+          </p>
+        )}
+        {/* The action bar, pinned to the bottom of the scroll. The caveat lives HERE rather than
+            as its own row above: same words, one line less of this panel's fixed height, and it
+            reads as a note on the button instead of a footnote to the prompt. Sticky against the
+            dialog's own scroller; -mx-3 pulls it out to the panel's edges, which p-3 insets. */}
+        <div className="sticky bottom-0 -mx-3 flex flex-wrap items-center gap-2 border-t bg-popover px-3 py-2.5">
+          <p className="mr-auto text-[11px] text-muted-foreground">
+            Prompt edits only apply to this image.
+          </p>
+          {edited && (
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={locked}
+              onClick={() => setDraft(defaultPrompt)}
+            >
+              Reset
+            </Button>
+          )}
+          <Button
+            size="sm"
+            disabled={locked || disabled || !draft.trim()}
+            title={hint}
+            onClick={() => onRegenerate(draft, picked)}
+          >
+            {working ? <Spinner data-icon="inline-start" /> : <RefreshCwIcon data-icon="inline-start" />}
+            {actionLabel}
+          </Button>
+        </div>
+    </div>
+  );
+
+  // No disclosure of its own: whatever placed this block already decided it should be visible.
+  if (!collapsible) {
+    return (
+      <div className={cn('overflow-hidden rounded-lg border', fill && 'flex min-h-0 flex-1 flex-col')}>
+        {content}
+      </div>
+    );
+  }
+
   return (
     // Open by default: this dialog is opened to inspect one row, and a prompt behind a click is
     // a prompt nobody reads. The trigger still collapses it out of the way.
@@ -197,68 +334,7 @@ export function RegenPrompt({
           {working ? 'Regenerating…' : edited ? 'Custom prompt' : 'Default prompt'}
         </span>
       </CollapsibleTrigger>
-      <CollapsibleContent>
-        <div className="space-y-2 border-t p-3">
-          <div className="flex items-center justify-end">
-            <CopyButton
-              text={rowContext ? `${draft}\n\n${rowContext}` : draft}
-              title="Copy the full prompt"
-            />
-          </div>
-          {source && (
-            <PromptSourcePicker
-              options={source}
-              value={picked}
-              onChange={setPick}
-              disabled={locked || disabled}
-            />
-          )}
-          <Textarea
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            rows={6}
-            disabled={locked}
-            aria-label={`${title} for this row`}
-            className="max-h-64 overflow-y-auto text-xs"
-          />
-          {rowContext && (
-            <pre className="max-h-28 overflow-auto rounded-md bg-muted/50 p-2 text-[11px] whitespace-pre-wrap text-muted-foreground">
-              {rowContext}
-            </pre>
-          )}
-          {stale && (
-            <p className="text-[11px] text-muted-foreground">
-              This ran on a different prompt than the current default — regenerate to use what is
-              in the box.
-            </p>
-          )}
-          <div className="flex flex-wrap items-center gap-2">
-            <p className="mr-auto text-xs text-muted-foreground">
-              Applies to this row only — the shared prompt stays unchanged.
-              {rowContext ? ' The CSV row above is appended to it.' : ''}
-            </p>
-            {edited && (
-              <Button
-                variant="ghost"
-                size="sm"
-                disabled={locked}
-                onClick={() => setDraft(defaultPrompt)}
-              >
-                Reset
-              </Button>
-            )}
-            <Button
-              size="sm"
-              disabled={locked || disabled || !draft.trim()}
-              title={hint}
-              onClick={() => onRegenerate(draft, picked)}
-            >
-              {working ? <Spinner data-icon="inline-start" /> : <RefreshCwIcon data-icon="inline-start" />}
-              Regenerate
-            </Button>
-          </div>
-        </div>
-      </CollapsibleContent>
+      <CollapsibleContent>{content}</CollapsibleContent>
     </Collapsible>
   );
 }

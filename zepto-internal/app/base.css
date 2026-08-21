@@ -61,9 +61,9 @@ html {
   font-size: 90%;
 }
 
-/* Font wiring: Google Sans (self-hosted via next/font/local in layout.tsx) leads
-   the sans stack. Declared unlayered and after globals.css, so it overrides whatever
-   --font-sans a pasted theme sets — pastes only change color/radius/shadows. */
+/* Font wiring: Geist (self-hosted via next/font in layout.tsx) leads the sans stack.
+   Declared unlayered and after globals.css, so it overrides whatever --font-sans a pasted
+   theme sets — pastes only change color/radius/shadows. */
 :root,
 .dark {
   --font-sans: var(--font-app-sans), "Segoe UI", "Helvetica Neue", Helvetica,
@@ -102,6 +102,30 @@ html {
     background: var(--border);
     border-radius: 9999px;
     border: 2px solid transparent;
+    background-clip: content-box;
+  }
+
+  /* Scroll region that keeps its bar out of sight until it is being used — the compare dialog's
+     body asks for this so a short panel shows no chrome at all. The thumb only paints on hover
+     (or while actively scrolling, where the pointer is over the region anyway); the track never
+     does. Opt in with `bg-scroll-slim`, so the suite's always-on pane bars are unaffected. */
+  .bg-scroll-slim {
+    scrollbar-width: thin;
+    scrollbar-color: transparent transparent;
+    /* Reserve the track's width whether or not a bar is showing, so a tab that overflows does
+       not shove its content left as the scrollbar appears. */
+    scrollbar-gutter: stable;
+  }
+  .bg-scroll-slim:hover,
+  .bg-scroll-slim:focus-within {
+    scrollbar-color: var(--border) transparent;
+  }
+  .bg-scroll-slim::-webkit-scrollbar-thumb {
+    background: transparent;
+  }
+  .bg-scroll-slim:hover::-webkit-scrollbar-thumb,
+  .bg-scroll-slim:focus-within::-webkit-scrollbar-thumb {
+    background: var(--border);
     background-clip: content-box;
   }
 }

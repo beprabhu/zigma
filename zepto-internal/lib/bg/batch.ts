@@ -5,6 +5,7 @@
 // need. Nothing here holds state — the only mutable thing in the feature is the page's items[].
 
 import { detectImageColumns, detectTitleColumn, parseCSV } from '@/lib/csv';
+import { joinNameColumns } from '@/lib/csv-name';
 
 import type { LoadProgress } from './engine';
 import { TRANSPARENT, type SubjectBounds } from './safe-area';
@@ -193,6 +194,13 @@ export interface BgItem {
   status: BgItemStatus;
   error?: string;
   durationMs?: number;
+  /**
+   * A person's override of the computed quality verdict, set from the compare dialog (press F).
+   * 'flag' forces this cutout into the flagged worklist, 'clear' forces it out; absent means the
+   * heuristic decides. Folded into assessQuality so filters, the chip count and "AI-fix flagged"
+   * all honour it from the one place.
+   */
+  manualFlag?: 'flag' | 'clear';
   /** Graphic regions the product-only filter dropped, so a heuristic stays auditable. */
   removedRegions?: number;
   /** Per-region measurements, shown in the compare dialog so decisions can be inspected. */
@@ -434,14 +442,15 @@ export interface CsvImport {
   drafts: BgItemDraft[];
   /** The columns actually used (the auto-detected ones unless overridden). */
   imageColumns: string[];
-  titleColumn: string;
+  /** Columns joined to name each row, in CSV order. Empty = derive from the URL's filename. */
+  titleColumns: string[];
   headers: string[];
   rowCount: number;
 }
 
 export interface CsvColumnOverrides {
-  /** Column whose value names each image; '' or null = derive from the URL's filename. */
-  nameColumn?: string | null;
+  /** Columns whose values are joined to name each image; empty = the URL's filename. */
+  nameColumns?: string[];
   imageColumns?: string[];
 }
 
@@ -454,13 +463,16 @@ export interface CsvColumnOverrides {
 export function draftsFromCsv(text: string, overrides: CsvColumnOverrides = {}): CsvImport {
   const { headers, records } = parseCSV(text);
   const imageColumns = overrides.imageColumns ?? detectImageColumns(headers, records);
-  const titleColumn =
-    overrides.nameColumn !== undefined
-      ? overrides.nameColumn || ''
-      : detectTitleColumn(headers, imageColumns);
+  // Detection still yields at most one column: it guesses which header looks like a title,
+  // and guessing a COMBINATION would invent a naming scheme the user never asked for.
+  // Multi-column names are an explicit choice, so they only ever arrive via the override.
+  const titleColumns =
+    overrides.nameColumns !== undefined
+      ? overrides.nameColumns
+      : [detectTitleColumn(headers, imageColumns)].filter(Boolean);
   const drafts: BgItemDraft[] = [];
   records.forEach((record, row) => {
-    const title = titleColumn ? record[titleColumn] : '';
+    const title = joinNameColumns(record, titleColumns);
     for (const column of imageColumns) {
       const url = record[column];
       if (!HTTP_URL_RE.test(url || '')) continue;
@@ -471,7 +483,7 @@ export function draftsFromCsv(text: string, overrides: CsvColumnOverrides = {}):
       });
     }
   });
-  return { drafts, imageColumns, titleColumn, headers, rowCount: records.length };
+  return { drafts, imageColumns, titleColumns, headers, rowCount: records.length };
 }
 
 // ---- Images and PNG bytes -------------------------------------------------

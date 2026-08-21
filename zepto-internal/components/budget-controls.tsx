@@ -48,16 +48,11 @@ export function BudgetControls({
   const active = on && available;
   return (
     <>
+      {/* Label takes the row, switch sits at the end — the suite's settings-row shape, so a
+          panel scans down one edge. Field switches to items-start on its own once a
+          FieldContent is present, which is what keeps the switch on the label's first line
+          instead of centred against the label plus its description. */}
       <Field orientation="horizontal">
-        {/* Field only nudges [role=checkbox]/[role=radio] into line with the label; a switch
-            needs the offset spelled out. */}
-        <Switch
-          id={`${idPrefix}-budget-on`}
-          className="mt-0.5"
-          checked={on}
-          disabled={disabled || !available}
-          onCheckedChange={(checked) => onOnChange(checked === true)}
-        />
         <FieldContent>
           <FieldLabel htmlFor={`${idPrefix}-budget-on`} className="font-normal">
             <Hint
@@ -73,6 +68,12 @@ export function BudgetControls({
             </FieldDescription>
           )}
         </FieldContent>
+        <Switch
+          id={`${idPrefix}-budget-on`}
+          checked={on}
+          disabled={disabled || !available}
+          onCheckedChange={(checked) => onOnChange(checked === true)}
+        />
       </Field>
 
       {active && (
@@ -101,13 +102,6 @@ export function BudgetControls({
             />
           </Field>
           <Field orientation="horizontal">
-            <Switch
-              id={`${idPrefix}-budget-shrink`}
-              className="mt-0.5"
-              checked={shrink}
-              disabled={disabled}
-              onCheckedChange={(checked) => onShrinkChange(checked === true)}
-            />
             <FieldContent>
               <FieldLabel htmlFor={`${idPrefix}-budget-shrink`} className="font-normal">
                 <Hint hint="Last resort, only when no palette fits. Off, an unfittable file is exported over budget instead — either way the export report names it.">
@@ -115,6 +109,12 @@ export function BudgetControls({
                 </Hint>
               </FieldLabel>
             </FieldContent>
+            <Switch
+              id={`${idPrefix}-budget-shrink`}
+              checked={shrink}
+              disabled={disabled}
+              onCheckedChange={(checked) => onShrinkChange(checked === true)}
+            />
           </Field>
         </>
       )}

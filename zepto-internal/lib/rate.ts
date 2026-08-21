@@ -93,6 +93,14 @@ const admitted: number[] = [];
  * Blocks until the current RPM setting admits another request, then records it. No-op at 0.
  * The check-then-push runs with no await between them, so concurrent lanes can't oversubscribe
  * a slot. Rejects with AbortError if the run's Stop button fires mid-wait.
+ *
+ * Two conditions, not one. The window alone ("at most N starts in any 60s") admits a batch
+ * start as one burst — 9 parallel lanes all fire in the same instant, and 9 < 10 is legal.
+ * Azure does not meter that way: an S0 deployment enforces RPM in roughly per-second slices
+ * of the quota, so 10 RPM really means ~one request every 6 seconds and a 9-wide burst is an
+ * instant 429 ("retry after 1 second") even though the minute total is fine. The even-spacing
+ * gate below is what matches the meter Azure actually runs; the window is kept as the
+ * backstop that makes the setting's plain reading ("no more than N per minute") always true.
  */
 export async function acquireRpmSlot(signal?: AbortSignal): Promise<void> {
   for (;;) {
@@ -101,10 +109,15 @@ export async function acquireRpmSlot(signal?: AbortSignal): Promise<void> {
     if (rpm <= 0) break;
     const now = Date.now();
     while (admitted.length && now - admitted[0] >= 60_000) admitted.shift();
-    if (admitted.length < rpm) break;
-    // Wake just after the oldest admit leaves the window, then re-check — another lane may
-    // have taken the slot, or the setting may have changed while we slept.
-    await sleep(60_000 - (now - admitted[0]) + 25, signal);
+    const last = admitted.length ? admitted[admitted.length - 1] : -Infinity;
+    const gap = 60_000 / rpm;
+    if (admitted.length < rpm && now - last >= gap) break;
+    // Wake at whichever bar clears later — the spacing gap, or the oldest admit leaving the
+    // window — then re-check: another lane may have taken the slot, or the setting may have
+    // changed while we slept.
+    const gapWait = last === -Infinity ? 0 : gap - (now - last);
+    const windowWait = admitted.length < rpm ? 0 : 60_000 - (now - admitted[0]);
+    await sleep(Math.max(gapWait, windowWait) + 25, signal);
   }
   admitted.push(Date.now());
 }

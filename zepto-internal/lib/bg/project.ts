@@ -16,6 +16,7 @@
 // batches). v1 files still load exactly as before.
 
 import { buildZipStream, readZipIndex, type ZipStreamEntry } from '../zip';
+import { normalizeNameColumns } from '../csv-name';
 import type { BgCutout, BgItem, BgItemSource, BgVerify, CsvOrigin } from './batch';
 import type { InkFootprint, OriginalComponentReport, RegionReport } from './regions';
 import { ANCHORS, DEFAULT_SAFE_AREA, type SafeAreaConfig, type SubjectBounds } from './safe-area';
@@ -77,6 +78,8 @@ interface ManifestItem {
   originalName?: string;
   /** v2: per-item tile-fit override (absent = follows the global switch). */
   tileFit?: boolean;
+  /** v2: a person's flag override of the computed quality verdict. */
+  manualFlag?: 'flag' | 'clear';
   /**
    * v2: the embedded original is an AI edit's output, not a dropped input. Autosave decides
    * which file sources are worth persisting from this flag (lib/bg/autosave.ts recordOf), so
@@ -119,7 +122,14 @@ interface ManifestItem {
 /** Where the CSV text lives and how its columns were mapped; the text itself is a zip entry. */
 interface ManifestCsv {
   fileName: string;
+  /**
+   * The FIRST name column, still written for builds that predate multi-column names — they
+   * read this key and ignore nameColumns, so a file saved here reopens there with the naming
+   * it had before the list existed rather than with no naming at all.
+   */
   nameColumn: string;
+  /** v2-additive: every name column, joined in this order. Preferred over nameColumn. */
+  nameColumns?: string[];
   imageColumns: string[];
   /** v2-additive: columns sent with the AI-edit prompt. Absent on files saved before it. */
   promptColumns?: string[];
@@ -148,8 +158,12 @@ export interface ProjectCsv {
   fileName: string;
   /** Raw CSV text, exactly as it was read — headers are re-derived by re-parsing it. */
   text: string;
-  /** Column that names each image; '' means names come from the URL's filename. */
-  nameColumn: string;
+  /**
+   * Columns joined to name each image; empty means names come from the URL's filename.
+   * `nameColumn` is the legacy single-column form, kept so old files still load.
+   */
+  nameColumns: string[];
+  nameColumn?: string;
   imageColumns: string[];
   /**
    * Columns whose cells ride along with the AI-edit prompt. Optional: sheets saved before this
@@ -384,6 +398,9 @@ export async function saveProject(
         ? { regenerated: true }
         : null),
       ...(item.tileFit !== undefined ? { tileFit: item.tileFit } : null),
+      // A person's flag override outranks the heuristic, so it has to survive the round trip or
+      // a reopened project silently reverts to the computed verdict — undoing their triage.
+      ...(item.manualFlag ? { manualFlag: item.manualFlag } : null),
       // Saved for every item that has them, independent of the cutout's own readability probe:
       // the verdict has to survive the round trip or a reopened project quietly downgrades its
       // own flagged rows to clean.
@@ -440,7 +457,8 @@ export async function saveProject(
     entries.push({ name: CSV_ENTRY, data: new TextEncoder().encode(csv.text) });
     manifestCsv = {
       fileName: csv.fileName,
-      nameColumn: csv.nameColumn,
+      nameColumn: csv.nameColumns[0] ?? '',
+      ...(csv.nameColumns.length ? { nameColumns: [...csv.nameColumns] } : null),
       imageColumns: [...csv.imageColumns],
       ...(csv.promptColumns?.length ? { promptColumns: [...csv.promptColumns] } : null),
       path: CSV_ENTRY,
@@ -618,6 +636,9 @@ export async function loadProject(file: File): Promise<RestoredProject> {
         source,
         cutout,
         ...(typeof rec.tileFit === 'boolean' ? { tileFit: rec.tileFit } : null),
+        ...(rec.manualFlag === 'flag' || rec.manualFlag === 'clear'
+          ? { manualFlag: rec.manualFlag }
+          : null),
         ...(csvOrigin ? { csv: csvOrigin } : null),
         ...(typeof rec.originalSourceUrl === 'string' && /^https?:\/\//i.test(rec.originalSourceUrl)
           ? { originalSourceUrl: rec.originalSourceUrl }
@@ -698,9 +719,10 @@ export async function loadProject(file: File): Promise<RestoredProject> {
                 ? c.fileName
                 : csvPath.slice(csvPath.lastIndexOf('/') + 1),
             text,
-            // '' is a legitimate value here — it means "name each image from its URL" — so an
-            // absent or wrong-typed column must degrade to that, never to a header guess.
-            nameColumn: typeof c.nameColumn === 'string' ? c.nameColumn : '',
+            // Empty is a legitimate value here — it means "name each image from its URL" — so
+            // an absent or wrong-typed column must degrade to that, never to a header guess.
+            // The list wins when present; a pre-list file falls back to its single column.
+            nameColumns: normalizeNameColumns(c.nameColumns ?? c.nameColumn),
             imageColumns: Array.isArray(c.imageColumns)
               ? c.imageColumns.filter((column): column is string => typeof column === 'string' && !!column)
               : [],

@@ -15,6 +15,13 @@ export interface SessionChip {
   label: string;
   /** 'warn' renders amber — flagged counts, degraded states. */
   tone?: 'default' | 'warn';
+  /**
+   * Makes the chip a button. Used by the Keep toggle, which has to live where the user already is:
+   * a file's only defence against the 7-day sweep cannot exist solely on a homepage that someone
+   * working in one batch for a week never visits.
+   */
+  onClick?: () => void;
+  title?: string;
 }
 
 export function SessionHeader({
@@ -55,7 +62,18 @@ export function SessionHeader({
       {chips.length > 0 && (
         <div className="mt-2 flex flex-wrap gap-1.5">
           {chips.map((chip) => (
-            <Badge key={chip.label} variant={chip.tone === 'warn' ? 'chip-warn' : 'chip'}>
+            <Badge
+              key={chip.label}
+              variant={chip.tone === 'warn' ? 'chip-warn' : 'chip'}
+              // Base UI's Badge renders a <span>; `render` swaps the element without losing the
+              // chip styling, the same escape hatch the launcher uses for link-shaped buttons.
+              {...(chip.onClick
+                ? {
+                    render: <button type="button" onClick={chip.onClick} title={chip.title} />,
+                    className: 'cursor-pointer hover:brightness-110',
+                  }
+                : { title: chip.title })}
+            >
               {chip.label}
             </Badge>
           ))}
