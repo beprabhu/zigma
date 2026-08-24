@@ -35,6 +35,7 @@ import { SessionHeader, type SessionChip } from '@/components/session-header';
 import { TileGrid, TileGridSkeleton, TileDialog, tileOptsFor } from '@/components/tile-grid';
 import { ClearAllButton, SelectionBar, useGridSelection } from '@/components/selection';
 import { Canvas, CanvasToolbar, LeftPanel, PanelSection, RightPanel, StudioShell } from '@/components/pane-layout';
+import { QueueSearch, matchesTerms, recordValues, searchTerms } from '@/components/queue-search';
 import { useProcessing } from '@/components/process-panel';
 import { BudgetControls } from '@/components/budget-controls';
 import { MdFileIcon, MdFileTile } from '@/components/md-file-tile';
@@ -242,7 +243,28 @@ export default function Compositor() {
     [activeItems],
   );
 
-  const itemIds = React.useMemo(() => activeItems.map((it) => it.id), [activeItems]);
+  /**
+   * Display only. `activeItems` above stays the authoritative queue — generating, exporting and
+   * the counts all read it — so a search typed to check one tile can never shrink the run or the
+   * ZIP. Only the grid and the selection that rides on it narrow.
+   */
+  const [search, setSearch] = React.useState('');
+  const searchIn = React.useCallback(
+    (rows: QueueItem[]) => {
+      const terms = searchTerms(search);
+      if (!terms.length) return rows;
+      // The sheet's own cells are searched too: a row is far more often hunted for by its SKU code
+      // or pack size than by the title that ends up drawn on the tile.
+      return rows.filter((it) =>
+        matchesTerms([it.title, it.offer, it.row, ...recordValues(it.record)], terms),
+      );
+    },
+    [search],
+  );
+  const visibleItems = React.useMemo(() => searchIn(activeItems), [searchIn, activeItems]);
+
+  // Selection follows what is on screen — select-all must never reach rows a search is hiding.
+  const itemIds = React.useMemo(() => visibleItems.map((it) => it.id), [visibleItems]);
   const sel = useGridSelection(itemIds, openId !== null);
 
   // Post-await reads (undo eligibility, toast actions) need the LIVE queue, not the closure.
@@ -1528,6 +1550,9 @@ export default function Compositor() {
               <div className="flex flex-col gap-6">
                 {gridBands.map((band, i) => {
                   const bandItems = items.filter((it) => it.bandId === band.id);
+                  // What this band DRAWS. bandItems stays whole above so the band's own counts and
+                  // its row-count control keep describing the band rather than the search.
+                  const bandVisible = searchIn(bandItems);
                   const preset = bandPreset(band.presetId);
                   const bandDone = bandItems.filter((it) => it.status === 'done').length;
                   return (
@@ -1552,7 +1577,7 @@ export default function Compositor() {
                       </div>
                       {bandItems.length ? (
                         <TileGrid
-                          items={bandItems}
+                          items={bandVisible}
                           template={preset.template}
                           columns={band.columns}
                           fallbackTitle={tplTitle}
@@ -1656,9 +1681,13 @@ export default function Compositor() {
                 <CanvasToolbar className="justify-between">
                   <span className="text-xs text-muted-foreground">
                     {sel.active
-                      ? `${sel.checked.size} of ${activeItems.length} selected`
-                      : `${activeItems.length} row${activeItems.length === 1 ? '' : 's'}${doneCount ? ` · ${doneCount} generated` : ''}`}
+                      ? `${sel.checked.size} of ${visibleItems.length} selected`
+                      : search
+                        ? `${visibleItems.length} of ${activeItems.length} row${activeItems.length === 1 ? '' : 's'}`
+                        : `${activeItems.length} row${activeItems.length === 1 ? '' : 's'}${doneCount ? ` · ${doneCount} generated` : ''}`}
                   </span>
+                  <div className="flex items-center gap-2">
+                    <QueueSearch value={search} onChange={setSearch} placeholder="Search tiles" />
                   <ClearAllButton
                     title="Clear this run?"
                     disabled={running}
@@ -1672,9 +1701,20 @@ export default function Compositor() {
                       </>
                     }
                   />
+                  </div>
                 </CanvasToolbar>
+                {search && visibleItems.length === 0 ? (
+                  <div className="flex flex-1 flex-col items-center justify-center gap-3 py-16 text-center">
+                    <p className="text-sm text-muted-foreground">
+                      No rows match &ldquo;{search}&rdquo;.
+                    </p>
+                    <Button variant="outline" size="sm" onClick={() => setSearch('')}>
+                      Show all {activeItems.length} row{activeItems.length === 1 ? '' : 's'}
+                    </Button>
+                  </div>
+                ) : (
                 <TileGrid
-                  items={activeItems}
+                  items={visibleItems}
                   template={template}
                   fallbackTitle={tplTitle}
                   fallbackOffer={tplOffer}
@@ -1690,10 +1730,11 @@ export default function Compositor() {
                   }}
                   onToggleSelect={sel.toggle}
                 />
+                )}
                 {sel.active && (
                   <SelectionBar
                     count={sel.checked.size}
-                    total={activeItems.length}
+                    total={visibleItems.length}
                     allSelected={sel.allSelected}
                     busy={running}
                     actions={[

@@ -39,6 +39,7 @@ import { useNewFileGeneration } from '@/components/new-file-boundary';
 import { useFileStore, type LoadedFile } from '@/lib/files/use-file-store';
 import { EMPTY_PNG_DOC, pngCodec, type PngDoc } from '@/lib/files/codecs/png';
 import { daysUntilExpiry } from '@/lib/files/sweep';
+import { QueueSearch, matchesTerms, searchTerms } from '@/components/queue-search';
 
 const COLOR_CHOICES = [256, 128, 64, 32, 16] as const;
 
@@ -146,6 +147,16 @@ function PngCompressorFile() {
     const days = daysUntilExpiry(fileRecord);
     return days === null ? '' : `Deletes in ${days} day${days === 1 ? '' : 's'}.`;
   }, [fileRecord]);
+
+  /**
+   * Display only. Compressing, the totals and the ZIP all read `items`, so a search typed to find
+   * one file can never shrink the batch that runs or the archive that downloads.
+   */
+  const [search, setSearch] = React.useState('');
+  const visibleItems = React.useMemo(() => {
+    const terms = searchTerms(search);
+    return terms.length ? items.filter((it) => matchesTerms([it.name], terms)) : items;
+  }, [items, search]);
 
   const addFiles = React.useCallback((files: FileList | File[]) => {
     const pngs = Array.from(files).filter(
@@ -357,9 +368,12 @@ function PngCompressorFile() {
                   confirm-guarded idiom as Compose, Cleanup and Generate. */}
               <div className="-mb-2 flex items-center justify-between gap-2">
                 <span className="text-xs text-muted-foreground">
-                  {items.length} file{items.length === 1 ? '' : 's'}
-                  {doneCount ? ` · ${doneCount} compressed` : ''}
+                  {search
+                    ? `${visibleItems.length} of ${items.length} file${items.length === 1 ? '' : 's'}`
+                    : `${items.length} file${items.length === 1 ? '' : 's'}${doneCount ? ` · ${doneCount} compressed` : ''}`}
                 </span>
+                <div className="flex items-center gap-2">
+                  <QueueSearch value={search} onChange={setSearch} placeholder="Search files" />
                 <ClearAllButton
                   title="Clear the queue?"
                   disabled={running || fileLoading}
@@ -372,9 +386,20 @@ function PngCompressorFile() {
                     </>
                   }
                 />
+                </div>
               </div>
+            {search && visibleItems.length === 0 ? (
+              <div className="flex flex-col items-center justify-center gap-3 py-16 text-center">
+                <p className="text-sm text-muted-foreground">
+                  No files match &ldquo;{search}&rdquo;.
+                </p>
+                <Button variant="outline" size="sm" onClick={() => setSearch('')}>
+                  Show all {items.length} file{items.length === 1 ? '' : 's'}
+                </Button>
+              </div>
+            ) : (
             <ul className="flex flex-col gap-2">
-              {items.map((it) => (
+              {visibleItems.map((it) => (
                 <li
                   key={it.id}
                   className="flex items-center gap-3 rounded-lg border bg-card p-2 pr-3"
@@ -442,6 +467,7 @@ function PngCompressorFile() {
                 </li>
               ))}
             </ul>
+            )}
             </>
           )}
         </div>

@@ -36,6 +36,7 @@ import { Spinner } from '@/components/ui/spinner';
 import { Textarea } from '@/components/ui/textarea';
 
 import { Canvas, CanvasToolbar, LeftPanel, PanelSection, RightPanel, StudioShell } from '@/components/pane-layout';
+import { QueueSearch, matchesTerms, recordValues, searchTerms } from '@/components/queue-search';
 import { GenDialog, GenGrid } from '@/components/image-generator/gen-grid';
 import { PromptListInput } from '@/components/image-generator/prompt-list';
 import { formatPromptList, parsePromptList } from '@/lib/prompt-list';
@@ -204,7 +205,23 @@ export default function ImageGenerator() {
     [],
   );
 
-  const itemIds = React.useMemo(() => items.map((it) => it.id), [items]);
+  /**
+   * Display only. `items` remains the authoritative run — generating and exporting read it — so
+   * narrowing the grid to find one image never narrows what gets generated or shipped.
+   */
+  const [search, setSearch] = React.useState('');
+  const visibleItems = React.useMemo(() => {
+    const terms = searchTerms(search);
+    if (!terms.length) return items;
+    // The subject and the sheet's cells count as identity here: a generated row is looked up by
+    // what it was asked to depict at least as often as by the name it ended up with.
+    return items.filter((it) =>
+      matchesTerms([it.name, it.subject, ...recordValues(it.record)], terms),
+    );
+  }, [items, search]);
+
+  // Selection follows what is on screen — select-all must never reach rows a search is hiding.
+  const itemIds = React.useMemo(() => visibleItems.map((it) => it.id), [visibleItems]);
   const sel = useGridSelection(itemIds, openId !== null);
 
   const mock = typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('mock');
@@ -867,9 +884,13 @@ export default function ImageGenerator() {
               <CanvasToolbar className="justify-between">
                 <span className="text-xs text-muted-foreground">
                   {sel.active
-                    ? `${sel.checked.size} of ${items.length} selected`
-                    : `${items.length} ${csvName ? 'row' : 'prompt'}${items.length === 1 ? '' : 's'}${doneCount ? ` · ${doneCount} generated` : ''}`}
+                    ? `${sel.checked.size} of ${visibleItems.length} selected`
+                    : search
+                      ? `${visibleItems.length} of ${items.length} ${csvName ? 'row' : 'prompt'}${items.length === 1 ? '' : 's'}`
+                      : `${items.length} ${csvName ? 'row' : 'prompt'}${items.length === 1 ? '' : 's'}${doneCount ? ` · ${doneCount} generated` : ''}`}
                 </span>
+                <div className="flex items-center gap-2">
+                  <QueueSearch value={search} onChange={setSearch} placeholder="Search images" />
                 <ClearAllButton
                   title="Clear this run?"
                   disabled={busy}
@@ -883,9 +904,20 @@ export default function ImageGenerator() {
                     </>
                   }
                 />
+                </div>
               </CanvasToolbar>
+              {search && visibleItems.length === 0 ? (
+                <div className="flex flex-1 flex-col items-center justify-center gap-3 py-16 text-center">
+                  <p className="text-sm text-muted-foreground">
+                    No rows match &ldquo;{search}&rdquo;.
+                  </p>
+                  <Button variant="outline" size="sm" onClick={() => setSearch('')}>
+                    Show all {items.length} row{items.length === 1 ? '' : 's'}
+                  </Button>
+                </div>
+              ) : (
               <GenGrid
-                items={items}
+                items={visibleItems}
                 promptFor={promptFor}
                 size={size}
                 running={busy}
@@ -894,10 +926,11 @@ export default function ImageGenerator() {
                 onRemove={handleRemove}
                 onToggleSelect={sel.toggle}
               />
+              )}
               {sel.active && (
                 <SelectionBar
                   count={sel.checked.size}
-                  total={items.length}
+                  total={visibleItems.length}
                   allSelected={sel.allSelected}
                   busy={busy}
                   actions={[

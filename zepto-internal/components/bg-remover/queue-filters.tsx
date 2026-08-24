@@ -148,11 +148,10 @@ export function QueueFilters({
       >
         <SelectTrigger
           size="sm"
-          // Fixed width, with the count pinned to its right edge rather than trailing the label.
-          // The number climbs for the whole of a run, and a trigger sized to its content would
-          // step the sort control sideways every time it crossed a power of ten — under a pointer
-          // already on its way there.
-          className="w-64"
+          // Fixed, and wide enough for the longest label ('AI-generated') so nothing truncates.
+          // Fixed rather than content-sized because a trigger that grew with its label would step
+          // the sort control sideways on every change — under a pointer already on its way there.
+          className="w-48"
           title={active.hint}
         >
           <span className="shrink-0 text-xs text-muted-foreground">Show</span>
@@ -163,17 +162,12 @@ export function QueueFilters({
             <span className="flex w-full min-w-0 items-center gap-1.5">
               <ActiveIcon className={active.iconClassName} />
               <span className="min-w-0 truncate">{active.label}</span>
-              {/* 'All' carries no number: the count line beside this control already states the
-                  queue total. A narrowed view carries its own, because that is the moment the
-                  grid stops matching that line and the user has to be told how much they hid.
-                  It is this filter's count over the WHOLE queue — the same number as its menu
-                  row — and a batch filter can narrow the grid further, so the count line, not
-                  this, remains the authority on how many tiles are actually on screen. */}
-              {filter !== 'all' && (
-                <span className="ml-auto shrink-0 tabular-nums text-muted-foreground">
-                  {formatCount(counts[filter])}
-                </span>
-              )}
+              {/* No number on the face any more. It used to sit here because nothing else said how
+                  much a narrowed view was hiding; the search field now carries "N of M" — which is
+                  the better number anyway, since it accounts for the search and the batch filter
+                  too, not just this one. Every filter's own count is still one click away in the
+                  menu, and the 40px this frees is what lets the trigger hold 'AI-generated'
+                  without truncating. */}
             </span>
           </SelectValue>
         </SelectTrigger>
@@ -217,7 +211,7 @@ export function QueueFilters({
         }}
         disabled={disabled}
       >
-        <SelectTrigger size="sm" className="w-44" title={SORT_META[sort].hint}>
+        <SelectTrigger size="sm" className="w-40" title={SORT_META[sort].hint}>
           <span className="shrink-0 text-xs text-muted-foreground">Sort</span>
           <SelectValue>{SORT_META[sort].label}</SelectValue>
         </SelectTrigger>

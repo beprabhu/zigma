@@ -90,6 +90,7 @@ import {
 import { VERIFY_MODEL_ID, compareCutouts, filteredRects } from '@/lib/bg/verify';
 import { askSemantic, probeSemanticSidecar } from '@/lib/bg/semantic';
 import { QueueFilters } from '@/components/bg-remover/queue-filters';
+import { QueueSearch, matchesTerms, searchTerms } from '@/components/queue-search';
 import { ColorPicker } from '@/components/color-picker';
 import { ColumnPicker } from '@/components/column-picker';
 import { normalizeNameColumns } from '@/lib/csv-name';
@@ -523,12 +524,25 @@ function BgRemoverFile() {
   );
 
 
+  /**
+   * Display only, like the filter and sort beside it. Nothing downstream of the canvas reads this:
+   * the run, the cohorts and every export go through `items`, so narrowing the grid to find one
+   * image can never narrow what ships.
+   */
+  const [search, setSearch] = React.useState('');
+
   const displayItems = React.useMemo(() => {
     const byBatch =
       selectedBatch === null ? items : items.filter((it) => it.batch === selectedBatch);
-    const shown = filterQueue(byBatch, queueFilter, verdictOf);
+    const terms = searchTerms(search);
+    // The CSV cell is searched alongside the name because a row imported from a sheet is usually
+    // hunted for by something the name does not contain — an SKU code, a pack size.
+    const found = terms.length
+      ? byBatch.filter((it) => matchesTerms([it.name, it.csv?.column, it.csv?.row], terms))
+      : byBatch;
+    const shown = filterQueue(found, queueFilter, verdictOf);
     return queueSort === 'quality' ? sortByQualityWith(shown, verdictOf) : shown;
-  }, [items, selectedBatch, queueFilter, queueSort, verdictOf]);
+  }, [items, selectedBatch, queueFilter, queueSort, verdictOf, search]);
 
   const cleanCohort = React.useMemo(
     () => cleanUnexported(items, verdictOf, { claimed }),
@@ -3384,23 +3398,22 @@ function BgRemoverFile() {
                       onSortChange={setQueueSort}
                     />
                     <div className="flex items-center gap-2">
-                      {/* The only thing the window-level drop and paste cannot offer: a click
-                          that opens the file picker. */}
-                      <ImageDropzone
-                        size="button"
-                        onAdd={handleAdd}
-                        onCsv={handleCsv}
-                        onProject={(file) => void handleProject(file)}
-                        itemCount={items.length}
-                        disabled={inputsLocked}
+                      {/* The count lives in the field because it is that field's answer: what
+                          the grid is showing, out of what there is. Selection takes the slot over
+                          while it is active, since "12 of 40 selected" is then the more useful
+                          reading of the same two numbers. */}
+                      <QueueSearch
+                        value={search}
+                        onChange={setSearch}
+                        placeholder="Search images"
+                        count={
+                          gridSel.active
+                            ? `${gridSel.checked.size.toLocaleString()} of ${displayItems.length.toLocaleString()} selected`
+                            : displayItems.length === items.length
+                              ? `${items.length.toLocaleString()} image${items.length === 1 ? '' : 's'}`
+                              : `${displayItems.length.toLocaleString()} of ${items.length.toLocaleString()}`
+                        }
                       />
-                      <span className="text-xs text-muted-foreground tabular-nums">
-                        {gridSel.active
-                          ? `${gridSel.checked.size.toLocaleString()} of ${displayItems.length.toLocaleString()} selected`
-                          : displayItems.length === items.length
-                            ? `${items.length.toLocaleString()} image${items.length === 1 ? '' : 's'}`
-                            : `${displayItems.length.toLocaleString()} of ${items.length.toLocaleString()}`}
-                      </span>
                       <ClearAllButton
                         title="Clear the queue?"
                         disabled={inputsLocked}
@@ -3416,6 +3429,30 @@ function BgRemoverFile() {
                       />
                     </div>
                   </CanvasToolbar>
+                  {/* A filter or a search that matches nothing leaves an empty canvas that looks
+                      exactly like a broken grid. Say which control is hiding the queue, and offer
+                      the way back. */}
+                  {displayItems.length === 0 ? (
+                    <div className="flex flex-1 flex-col items-center justify-center gap-3 py-16 text-center">
+                      <p className="text-sm text-muted-foreground">
+                        {search
+                          ? `No images match “${search}”.`
+                          : 'No images match this filter.'}
+                      </p>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => {
+                          setSearch('');
+                          changeQueueFilter('all');
+                          setSelectedBatch(null);
+                        }}
+                      >
+                        Show all {items.length.toLocaleString()} image
+                        {items.length === 1 ? '' : 's'}
+                      </Button>
+                    </div>
+                  ) : (
                   <VirtualGrid
                     items={displayItems}
                     scrollRef={removeScrollRef}
@@ -3449,6 +3486,7 @@ function BgRemoverFile() {
                       />
                     )}
                   />
+                  )}
                   {gridSel.active && (
                     <SelectionBar
                       count={gridSel.checked.size}
