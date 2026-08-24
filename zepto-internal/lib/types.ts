@@ -19,12 +19,15 @@ export interface QueueItem {
    * alternative to `urls`, never a supplement to it: a row comes from a sheet or from disk.
    *
    * The blob URL is minted ONCE, when the row is built, and is what both the preview and the
-   * generate pass load — so a cell re-rendering never churns object URLs, and nothing has to
-   * hold the File itself. It is released by releaseLocalSources() when the row goes away;
-   * dropping the row without that call leaks the image for the life of the tab.
+   * generate pass load — so a cell re-rendering never churns object URLs. It is released by
+   * releaseLocalSources() when the row goes away; dropping the row without that call leaks the
+   * image for the life of the tab.
    *
-   * Never persisted: a blob URL dies with the document, which is why an image run cannot be
-   * revived from a snapshot the way a CSV one could.
+   * The bytes are NOT persisted, and deliberately so: a folder drop can be gigabytes of product
+   * shots the user still has on disk, and the store is shared with three other tools. What is
+   * persisted is the composed TILE, which cost the work — so a restored image-mode row can be
+   * exported but not re-composed until the folder is dropped again. `url` is empty on such a
+   * restored row, since there is nothing behind it to point at.
    */
   localSources?: { name: string; url: string }[];
   title: string;

@@ -37,12 +37,17 @@ import { Textarea } from '@/components/ui/textarea';
 
 import { Canvas, CanvasToolbar, LeftPanel, PanelSection, RightPanel, StudioShell } from '@/components/pane-layout';
 import { QueueSearch, matchesTerms, recordValues, searchTerms } from '@/components/queue-search';
+import { useFileStore, type LoadedFile } from '@/lib/files/use-file-store';
+import { EMPTY_GEN_DOC, genCodec, hydrateImages, type GenDoc } from '@/lib/files/codecs/gen';
+import { CSV_KEY } from '@/lib/files/store';
+import { daysUntilExpiry } from '@/lib/files/sweep';
+import { useNewFileGeneration } from '@/components/new-file-boundary';
 import { GenDialog, GenGrid } from '@/components/image-generator/gen-grid';
 import { PromptListInput } from '@/components/image-generator/prompt-list';
 import { formatPromptList, parsePromptList } from '@/lib/prompt-list';
 
 import { detectImageColumns, detectTitleColumn, parseCSV, type CsvRecord } from '@/lib/csv';
-import { GEN_SIZES, createGenItems, genFileStem, reconcileSubjectItems, type GenItem, type GenSize } from '@/lib/gen';
+import { GEN_SIZES, genFileStem, reconcileCsvItems, reconcileSubjectItems, type GenItem, type GenSize } from '@/lib/gen';
 import {
   PROMPT_WARN_CHARS, ROW_HEADING, SUBJECT_HEADING, buildRowPrompt, buildSubjectPrompt,
   isPromptEmpty, referenceUrls,
@@ -51,6 +56,7 @@ import { callAzure, callAzureGenerate, loadImageFromUrl, mockGenerate } from '@/
 import { readParallel } from '@/lib/rate';
 import { canvasToPngBlob, mapWithLimit, pickSave, releaseCanvas, saveTo } from '@/lib/bg/batch';
 import { readSession, restingStatus, saveSession, sessionKey } from '@/lib/session-store';
+import { resolveOpen } from '@/lib/files/open';
 import { processImage } from '@/lib/process';
 import { useProcessing } from '@/components/process-panel';
 import { buildZipStream, type ZipStreamEntry } from '@/lib/zip';
@@ -70,6 +76,11 @@ import { CanvasDropzone, DropzoneShell } from '@/components/dropzone';
  * storage.
  */
 interface GenSession {
+  /**
+   * Which FILE this snapshot belongs to. Carried so a rail click resumes the same file rather
+   * than minting a new one, and so lib/files/sweep.ts can exempt it while its page is unmounted.
+   */
+  fileId: string;
   brief: string;
   briefName: string | null;
   subjects: string;
@@ -87,7 +98,17 @@ interface GenSession {
 
 const GEN_SESSION = sessionKey<GenSession>('image-generator');
 
+/**
+ * Thin shell around the file itself. The key is what makes "New Generate file" work: a bump
+ * remounts everything below and the fresh mount resolves to a new file id, rather than every piece
+ * of page state needing its own reset.
+ */
 export default function ImageGenerator() {
+  const generation = useNewFileGeneration('image-generator');
+  return <ImageGeneratorFile key={generation} />;
+}
+
+function ImageGeneratorFile() {
   // Azure credentials are the suite's shared pair — set them once in any product.
   const [endpoint] = usePersistedState('skuc_azureEndpoint', '');
   const [azureKey] = usePersistedState('skuc_azureKey', '');
@@ -97,7 +118,13 @@ export default function ImageGenerator() {
   // Whatever the last unmount left behind, read once for the initializers below and nowhere
   // else. readSession never consumes, so StrictMode's double-invoked render and its dev-only
   // remount both see the same snapshot rather than racing each other for it.
-  const revived = React.useMemo(() => readSession(GEN_SESSION), []);
+  /**
+   * Which file this mount is editing, and whether the tab's live snapshot belongs to it. A request
+   * from the homepage outranks the snapshot; when they disagree the snapshot is dropped, because
+   * its rows belong to a different file.
+   */
+  const [opened] = React.useState(() => resolveOpen('image-generator', readSession(GEN_SESSION)));
+  const revived = opened.snapshot;
 
   // Brief: never written to storage, on purpose. It is document-sized and specific to one batch,
   // so persisting it would silently apply an old brief to a new CSV. Surviving a product switch
@@ -154,6 +181,114 @@ export default function ImageGenerator() {
   const itemsRef = React.useRef<GenItem[]>(items);
   React.useEffect(() => { itemsRef.current = items; }, [items]);
 
+  // ---- The file ----
+  // Small by contract: the brief and the sheet are megabytes of text and live in meta singletons,
+  // not here, because listFiles() reads every doc on every homepage mount.
+  const fileDoc = React.useMemo<GenDoc>(
+    () => ({
+      ...EMPTY_GEN_DOC,
+      sessionName,
+      briefName,
+      csvName,
+      headers,
+      nameCols,
+      excluded,
+      rowCount: records.length,
+    }),
+    [sessionName, briefName, csvName, headers, nameCols, excluded, records.length],
+  );
+
+  /**
+   * Seeds the page from disk. Called once, before the store starts mirroring.
+   *
+   * The rows arrive complete except for their pictures, which decode asynchronously and are
+   * patched in behind them — for a 500-row set the names and prompts are what the user is looking
+   * for first, and waiting on 500 image decodes to show any of it would be the wrong trade.
+   */
+  const handleLoadedFile = React.useCallback((loaded: LoadedFile<GenItem, GenDoc>) => {
+    const doc = loaded.doc;
+    if (doc) {
+      if (doc.sessionName) setSessionName((prev) => (prev.trim() ? prev : doc.sessionName));
+      if (doc.briefName) setBriefName((prev) => prev ?? doc.briefName);
+      if (doc.csvName) setCsvName((prev) => prev ?? doc.csvName);
+      if (doc.headers.length) setHeaders((prev) => (prev.length ? prev : doc.headers));
+      if (doc.nameCols.length) setNameCols((prev) => (prev.length ? prev : doc.nameCols));
+      if (doc.excluded.length) setExcluded((prev) => (prev.length ? prev : doc.excluded));
+    }
+    const sheet = loaded.meta[CSV_KEY] as { text?: string } | undefined;
+    // Re-parsed rather than stored twice: the rows the panel needs for a column remap come from
+    // the same text the sheet was imported from, so the two can never disagree.
+    if (sheet?.text) {
+      const parsed = parseCSV(sheet.text);
+      setRecords((prev) => (prev.length ? prev : parsed.records));
+      setHeaders((prev) => (prev.length ? prev : parsed.headers));
+    }
+    if (loaded.items.length) {
+      setItems((prev) => (prev.length ? [...prev, ...loaded.items] : loaded.items));
+      void hydrateImages(loaded.records, (id, image) => {
+        setItems((prev) =>
+          prev.map((it) => (it.id === id ? { ...it, image, status: 'done' as const } : it)),
+        );
+      });
+    }
+  }, []);
+
+  const {
+    fileId,
+    phase: filePhase,
+    lastSavedAt: fileSavedAt,
+    failing: fileFailing,
+    record: fileRecord,
+    setKept: setFileKept,
+    setMeta: setFileMeta,
+  } = useFileStore<GenItem, GenDoc>({
+    codec: genCodec,
+    items,
+    doc: fileDoc,
+    metaKeys: [CSV_KEY],
+    fileId: opened.fileId,
+    // A queue carried across a product switch is not a file being opened: its rows are already on
+    // screen AND already on disk.
+    adopted: !!opened.snapshot,
+    onLoad: handleLoadedFile,
+  });
+  const fileLoading = filePhase !== 'active';
+
+  /**
+   * Mirrors the sheet into the file. The ref stops a fresh mount from writing a null before the
+   * file's own sheet has finished loading — only a sheet that existed in THIS session may clear
+   * one. The store's dedup then keeps megabytes of text from being rewritten on every keystroke.
+   */
+  const [csvText, setCsvText] = React.useState<{ fileName: string; text: string } | null>(null);
+  const csvMirrored = React.useRef(false);
+  React.useEffect(() => {
+    if (!csvText && !csvMirrored.current) return;
+    csvMirrored.current = true;
+    setFileMeta(CSV_KEY, csvText);
+  }, [csvText, setFileMeta]);
+
+  /**
+   * "Kept" / "Deletes in N days", and the toggle for both. Absent until the file exists on disk —
+   * a run nobody has started has nothing to keep, and a countdown on an empty queue is noise.
+   */
+  const keepChip = React.useMemo<SessionChip | null>(() => {
+    if (!fileRecord) return null;
+    if (fileRecord.keptAt !== null) {
+      return {
+        label: 'Kept',
+        title: 'This file is pinned and will not be deleted. Click to unpin.',
+        onClick: () => setFileKept(false),
+      };
+    }
+    const days = daysUntilExpiry(fileRecord);
+    return {
+      label: days === null ? 'Keep' : `Deletes in ${days} day${days === 1 ? '' : 's'}`,
+      tone: days !== null && days <= 2 ? ('warn' as const) : undefined,
+      title: 'Unpinned files are removed 7 days after their last change. Click to keep this one.',
+      onClick: () => setFileKept(true),
+    };
+  }, [fileRecord, setFileKept]);
+
   // The snapshot the unmount below hands to the next mount, restated after every commit. The
   // cleanup that reads it has to be mount-once — anything else would tear down and re-arm the
   // abort on every keystroke — so its closure is stuck with the empty state it was created
@@ -161,6 +296,7 @@ export default function ImageGenerator() {
   const sessionRef = React.useRef<GenSession | null>(null);
   React.useEffect(() => {
     sessionRef.current = {
+      fileId,
       brief,
       briefName,
       subjects,
@@ -229,6 +365,14 @@ export default function ImageGenerator() {
 
   const mock = typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('mock');
   const busy = running || exporting;
+  /**
+   * Everything that would ADD a row is closed while the file loads, not just the writes.
+   *
+   * Row ids are minted off the live array, which is empty until the load lands — so a CSV dropped
+   * in that window numbers its rows from 0, colliding with the rows still on their way in. The
+   * store re-mints on collision as a backstop; this is what keeps it from having to.
+   */
+  const inputsLocked = busy || fileLoading;
   const excludedSet = React.useMemo(() => new Set(excluded), [excluded]);
   // The picker speaks inclusion, the state speaks exclusion. Storing what is NOT sent is what
   // makes a freshly dropped CSV send everything by default, and a re-dropped sheet with a new
@@ -344,6 +488,10 @@ export default function ImageGenerator() {
   // ---- Input -------------------------------------------------------------
 
   function handleFiles(files: File[]) {
+    // The dropzones are disabled while this is true, but the handler has to hold the line
+    // itself too: a CSV landing while the file is still loading replaces the queue with rows
+    // numbered from 0 — the ids the rows still on their way in already carry.
+    if (inputsLocked) return;
     for (const file of files) {
       const isCsv = /\.csv$/i.test(file.name) || file.type === 'text/csv';
       const isDoc = /\.(md|markdown|txt)$/i.test(file.name);
@@ -368,10 +516,16 @@ export default function ImageGenerator() {
           seedSessionName(file.name);
           setHeaders(parsed.headers);
           setRecords(parsed.records);
+          // The sheet itself, so a restored run can still remap columns. A singleton rather than
+          // part of the doc: its text runs to megabytes and the homepage reads every doc.
+          setCsvText({ fileName: file.name, text });
           const detectedCols = detected ? [detected] : [];
           setNameCols(detectedCols);
           setExcluded([]);
-          setItems(createGenItems(parsed.records, detectedCols, 0));
+          // Reconciled, not rebuilt: a re-dropped sheet keeps every generated image whose row it
+          // still contains, and ids are NEVER re-derived from sheet position — the saved records
+          // are keyed by id, so renumbering here is how images end up on the wrong rows.
+          setItems((prev) => reconcileCsvItems(parsed.records, detectedCols, prev));
           setOpenId(null);
         } else {
           setBrief(text);
@@ -761,6 +915,12 @@ export default function ImageGenerator() {
                       : `${items.length} prompt${items.length === 1 ? '' : 's'}`,
                   },
                   doneCount > 0 && { label: `${doneCount} generated` },
+                  fileFailing && { label: 'Autosave failing — retrying', tone: 'warn' as const },
+                  !fileFailing && fileSavedAt !== null && {
+                    label: `Autosaved ${new Date(fileSavedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`,
+                  },
+                  // The expiry rule has to be visible where the work is — see Cleanup's header.
+                  keepChip,
                   briefLabel !== null && {
                     label: brief.trim() ? 'brief loaded' : 'brief empty',
                     tone: (brief.trim() ? 'default' : 'warn') as SessionChip['tone'],
@@ -823,7 +983,7 @@ export default function ImageGenerator() {
               {!csvName && (
                 <DropzoneShell
                   accept=".csv,text/csv"
-                  disabled={busy}
+                  disabled={inputsLocked}
                   onFiles={handleFiles}
                   className="gap-1 border py-3 text-xs"
                 >
@@ -953,6 +1113,7 @@ export default function ImageGenerator() {
               description="Write what to generate in the panel — number the lines for one image each — or drop a CSV and let every row become an image. Either way the brief leads the prompt."
               accept=".md,.markdown,.txt,.csv,text/csv,text/markdown"
               multiple
+              disabled={inputsLocked}
               onFiles={handleFiles}
             />
           ) : (
@@ -970,7 +1131,7 @@ export default function ImageGenerator() {
                   <QueueSearch value={search} onChange={setSearch} placeholder="Search images" />
                 <ClearAllButton
                   title="Clear this run?"
-                  disabled={busy}
+                  disabled={inputsLocked}
                   onConfirm={clearAll}
                   description={
                     <>

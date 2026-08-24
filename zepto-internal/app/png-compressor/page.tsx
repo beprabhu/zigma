@@ -142,6 +142,10 @@ function PngCompressorFile() {
     onLoad: handleLoadedFile,
   });
   const fileLoading = filePhase !== 'active';
+  // Mirrored for addFiles, whose closure is deliberately frozen (deps []) — reading the flag
+  // directly there would read the first render's value forever.
+  const fileLoadingRef = React.useRef(fileLoading);
+  React.useEffect(() => { fileLoadingRef.current = fileLoading; });
   const expiryLabel = React.useMemo(() => {
     if (!fileRecord || fileRecord.keptAt !== null) return '';
     const days = daysUntilExpiry(fileRecord);
@@ -159,6 +163,11 @@ function PngCompressorFile() {
   }, [items, search]);
 
   const addFiles = React.useCallback((files: FileList | File[]) => {
+    // Closed while the file loads, like every add-a-row path in the suite. Compress ids are
+    // uuids so a mid-load drop cannot collide, but rows appearing inside a half-restored queue
+    // is still a merge the user never asked for — and paste reaches here with no dropzone
+    // between it and the queue. Read through a ref: this callback is deliberately stable.
+    if (fileLoadingRef.current) return;
     const pngs = Array.from(files).filter(
       (f) => f.type === 'image/png' || /\.png$/i.test(f.name),
     );
@@ -351,11 +360,12 @@ function PngCompressorFile() {
               description="Browse or paste works too. Every PNG becomes a queue row."
               accept="image/png"
               multiple
+              disabled={fileLoading}
               onFiles={(files) => addFiles(files)}
             />
           ) : (
             <>
-              <DropzoneShell accept="image/png" multiple onFiles={(files) => addFiles(files)}>
+              <DropzoneShell accept="image/png" multiple disabled={fileLoading} onFiles={(files) => addFiles(files)}>
                 <UploadCloudIcon className="size-6" />
                 <span className="font-medium text-foreground">
                   Drop PNGs here, <span className="font-normal text-primary underline underline-offset-2">browse</span>, or paste

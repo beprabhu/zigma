@@ -23,6 +23,24 @@ export const LEDGER_KEY = 'ledger';
 export const LOCK_KEY = 'lock';
 
 /**
+ * One sealed export, as stored under LEDGER_KEY.
+ *
+ * It exists because `BgItem.batch` is deliberately outside autosave's change signature — stamping
+ * a 500-image cohort must not re-put 500 cutout blobs to record one number each — so a stamp that
+ * moves on its own never reaches the item records. A merge or a split moves nothing BUT stamps,
+ * which makes this the only copy of batch membership that is still correct afterwards, and
+ * therefore the one a reopened file has to trust over the rows' own stored numbers.
+ */
+export interface ExportedBatch {
+  batch: number;
+  /** Member ids, as they were when the batch was written. */
+  ids: number[];
+  exportedAt: number;
+  /** What the ZIP was saved as. Display only. */
+  fileName: string;
+}
+
+/**
  * How stale a heartbeat has to be before the file counts as closed.
  *
  * Generous on purpose: the cost of treating a live file as closed is deleting work someone is

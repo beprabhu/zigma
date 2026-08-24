@@ -62,20 +62,6 @@ export interface GenItem {
   prev?: { image: HTMLImageElement; sentPrompt?: string; durationMs?: number };
 }
 
-export function createGenItems(
-  records: CsvRecord[],
-  nameColumns: readonly string[],
-  startId: number,
-): GenItem[] {
-  return records.map((record, i) => ({
-    id: startId + i,
-    record,
-    name: joinNameColumns(record, nameColumns) || `Row ${startId + i + 1}`,
-    status: 'ready',
-    image: null,
-  }));
-}
-
 /**
  * The typed list as queue items, reusing the item that already held each subject.
  *
@@ -103,6 +89,42 @@ export function reconcileSubjectItems(subjects: string[], existing: GenItem[]): 
       status: 'ready' as const,
       image: null,
     };
+  });
+}
+
+/**
+ * A dropped sheet as queue items, reusing the item that already holds each row.
+ *
+ * The sheet-mode twin of reconcileSubjectItems above, matched on the row's RECORD — in a CSV run
+ * the record is the row's identity the way the typed text is in a list run. So re-dropping the
+ * same or an edited CSV keeps every generated image whose row is still in the sheet, which is
+ * exactly what the delete dialog promises ("rows still in the CSV file come back if you drop it
+ * again"). Before this, a re-drop rebuilt the queue from scratch: every id renumbered by sheet
+ * position, every image dropped on the floor — and the autosave then faithfully saved the loss.
+ *
+ * Matching is by the record's full content. A row edited in the sheet therefore comes back as a
+ * NEW row without its old image — deliberate: the image was generated from the old values, and
+ * quietly keeping it would pin a stale picture on a row that no longer says what it said.
+ */
+export function reconcileCsvItems(
+  records: CsvRecord[],
+  nameColumns: readonly string[],
+  existing: GenItem[],
+): GenItem[] {
+  const spare = new Map<string, GenItem[]>();
+  for (const item of existing) {
+    if (item.subject !== undefined) continue; // typed rows are the other reconcile's business
+    const key = JSON.stringify(item.record);
+    const bucket = spare.get(key);
+    if (bucket) bucket.push(item);
+    else spare.set(key, [item]);
+  }
+  let nextId = nextGenId(existing);
+  return records.map((record, i) => {
+    const reused = spare.get(JSON.stringify(record))?.shift();
+    const name = joinNameColumns(record, nameColumns) || `Row ${i + 1}`;
+    if (reused) return { ...reused, name };
+    return { id: nextId++, record, name, status: 'ready' as const, image: null };
   });
 }
 

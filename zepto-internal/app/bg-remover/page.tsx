@@ -72,7 +72,7 @@ import {
 } from '@/lib/bg/batch';
 import { useFileStore, type LoadedFile } from '@/lib/files/use-file-store';
 import { bgCodec, EMPTY_BG_DOC, type BgDoc } from '@/lib/files/codecs/bg';
-import { CSV_KEY, LEDGER_KEY } from '@/lib/files/store';
+import { CSV_KEY, LEDGER_KEY, type ExportedBatch } from '@/lib/files/store';
 import { daysUntilExpiry } from '@/lib/files/sweep';
 import { measureFaintResidue } from '@/lib/bg/regions';
 import { describeBudget, fitToBudget, type BudgetResult } from '@/lib/bg/budget';
@@ -99,11 +99,13 @@ import { parseCSV } from '@/lib/csv';
 import { buildRowPrompt } from '@/lib/row-prompt';
 import { BatchList } from '@/components/bg-remover/batch-list';
 import {
-  DEFAULT_SEAL_SIZE, cleanUnexported, nextAllocation, planExport, planFinalSeal, planReexport,
-  planSeal,
-  recordBatch, remainingUnexported, stampBatch, summarizeLedger, unverifiedUnexported,
-  type Allocation, type BatchRecord, type ExportPlan,
+  DEFAULT_SEAL_SIZE, applyReshape, batchItems, canMergeBatches, changedSince, cleanUnexported,
+  nextAllocation, planCombined, planExport, planFinalSeal, planMerge, planReexport, planSeal,
+  planSplit, recordBatch, remainingUnexported, reshapeRecords, stampBatch, summarizeLedger,
+  unverifiedUnexported,
+  type Allocation, type BatchRecord, type BatchReshape, type ExportPlan,
 } from '@/lib/bg/ledger';
+import { BatchModal } from '@/components/bg-remover/batch-modal';
 import { readParallel } from '@/lib/rate';
 import { createEta } from '@/lib/eta';
 import { DEFAULT_AI_PROMPT, matchSkill, useSkills } from '@/lib/skills';
@@ -437,8 +439,40 @@ function BgRemoverFile() {
         // thing that still says where the last ZIP stopped once the BatchRecords are gone.
         if (doc.allocFloor) allocFloorRef.current = doc.allocFloor;
       }
-      if (loaded.items.length) {
-        setItems((prev) => (prev.length ? [...prev, ...loaded.items] : loaded.items));
+      /**
+       * The export ledger decides which batch each row belongs to — NOT the row's own stored
+       * stamp.
+       *
+       * `batch` is deliberately outside autosave's change signature (stamping a 500-image cohort
+       * must not re-put 500 cutout blobs to record one number each), so a stamp that moves
+       * without anything else moving never reaches the item records. That is true of the original
+       * seal and doubly true of a merge or a split, which change nothing about a row except its
+       * batch. The ledger singleton is the compensating record: it is small, it is rewritten on
+       * every ledger change, and it names its members by id — so it is the only copy that is
+       * still right after a reshape.
+       */
+      const shipped = new Map<number, number>();
+      for (const row of (loaded.meta[LEDGER_KEY] as ExportedBatch[] | undefined) ?? []) {
+        for (const id of row.ids) shipped.set(id, row.batch);
+      }
+      const restored = shipped.size
+        ? loaded.items.map((item) => {
+            const batch = shipped.get(item.id);
+            if (batch === undefined) {
+              if (item.batch === undefined) return item;
+              // Stamped on the row but in no ledger row: the batch it names was reshaped away.
+              // Leaving the stale number would draw a batch that no longer exists; dropping it
+              // returns the image to the unexported tail, where anything no ZIP claims belongs.
+              const next = { ...item };
+              delete next.batch;
+              return next;
+            }
+            return item.batch === batch ? item : { ...item, batch };
+          })
+        : loaded.items;
+
+      if (restored.length) {
+        setItems((prev) => (prev.length ? [...prev, ...restored] : restored));
       }
       const sheet = loaded.meta[CSV_KEY] as ProjectCsv | undefined;
       // Never displaces a sheet this session already has.
@@ -489,12 +523,16 @@ function BgRemoverFile() {
    * same file numbers to a second ZIP.
    */
   const [openPlans, setOpenPlans] = React.useState<ExportPlan[]>([]);
+  /** The batches modal — where the receipts live now that the rail only summarises them. */
+  const [batchesOpen, setBatchesOpen] = React.useState(false);
   const claimed = React.useMemo(
     () => new Set(openPlans.flatMap((plan) => plan.items.map((it) => it.id))),
     [openPlans],
   );
   // Set in Settings -> Defaults; usePersistedState syncs the change into this tab live.
-  const [sealSize] = usePersistedState('skuc_bgSealSize', DEFAULT_SEAL_SIZE);
+  // Writable from the batches modal as well as Settings — same stored value, two doors onto it.
+  // Only the NEXT seal reads it; sealed batches are receipts for files on disk and never change.
+  const [sealSize, setSealSize] = usePersistedState('skuc_bgSealSize', DEFAULT_SEAL_SIZE);
   const [selectedBatch, setSelectedBatch] = React.useState<number | null>(null);
   const [exportingBatch, setExportingBatch] = React.useState<number | null>(null);
   // Files already written cannot be un-written, so numbering may never retreat into names that
@@ -564,6 +602,12 @@ function BgRemoverFile() {
    * moment it is allocated, so it gets a chip and a Download button straight away instead of
    * being invisible until its file exists.
    */
+  /** Sealed but never written to disk. They have no record, so they cannot be reshaped. */
+  const pendingBatchNumbers = React.useMemo(
+    () => new Set(openPlans.map((plan) => plan.batch)),
+    [openPlans],
+  );
+
   const batchRows = React.useMemo(() => {
     const shipped = ledgerSummary.batches.map((b) => ({
       batch: b.batch,
@@ -2455,6 +2499,86 @@ function BgRemoverFile() {
     }
   }
 
+  /**
+   * Writes one batch to disk: its first ZIP if it has never been saved, a replacement otherwise.
+   *
+   * A replacement keeps the original number AND offset, so the fresh files land on the old ones
+   * rather than beside them under new names — the whole point of re-downloading a stale batch.
+   */
+  function downloadBatch(batch: number) {
+    const open = openPlans.find((p) => p.batch === batch);
+    if (open) return void runPlan(open);
+    const row = ledger.find((r) => r.batch === batch);
+    const redo = row && planReexport(itemsRef.current, row);
+    if (redo) void runPlan(redo, { reexport: true });
+  }
+
+  /**
+   * One ZIP for several batches at once, each file keeping the number it already has.
+   *
+   * Not a re-export of one batch and not a reshape: no stamp moves and no ledger row retires.
+   * The archive simply covers a contiguous run of file numbers, so it unzips over the separate
+   * folders it replaces. On success every batch it covered gets a fresh record — they were all
+   * just written, so they are all current again.
+   */
+  async function downloadTogether(picked: number[]) {
+    const plan = planCombined(itemsRef.current, ledgerSummary.batches, picked);
+    if (!plan || exportingBatch !== null) return;
+    const span = `${picked[0]}-${picked[picked.length - 1]}`;
+    setExportingBatch(plan.batch);
+    try {
+      const saved = await exportItems(plan.items, {
+        suffix: `batches-${span}`,
+        offset: plan.offset,
+      });
+      if (!saved) return;
+      // Per batch, not one record for the lot: the receipts are unchanged, only their contents
+      // are freshly on disk, so each keeps its own number, offset and count.
+      setLedger((prev) =>
+        prev.map((row) => {
+          if (!picked.includes(row.batch)) return row;
+          const members = batchItems(itemsRef.current, row.batch);
+          return members.length
+            ? recordBatch({ batch: row.batch, offset: row.offset, items: members }, { fileName: saved })
+            : row;
+        }),
+      );
+      toast.success(`Saved ${picked.length} batches as one ZIP.`);
+    } finally {
+      setExportingBatch(null);
+    }
+  }
+
+  /**
+   * Applies a merge or a split: re-stamp the queue, swap the ledger rows, retire the old numbers.
+   *
+   * Nothing is written to disk. File numbers come from a batch's offset plus each member's
+   * position, and a reshape preserves both — which is why the ZIPs already downloaded stay
+   * correct and the confirm step can say so. Where it cannot (`renamed > 0`), the dialog says
+   * that instead; this function just does what was confirmed.
+   */
+  function applyBatchReshape(reshape: BatchReshape) {
+    const records = reshapeRecords(reshape, ledger);
+    setItems((prev) => applyReshape(prev, reshape));
+    setLedger((prev) => [
+      ...prev.filter((row) => !reshape.retire.includes(row.batch)),
+      ...records,
+    ].sort((a, b) => a.batch - b.batch));
+    // The ids mirror follows the stamps, or a crash would restore rows into retired batches.
+    for (const batch of reshape.retire) batchIdsRef.current.delete(batch);
+    for (const group of reshape.groups) {
+      batchIdsRef.current.set(group.batch, group.members.map((item) => item.id));
+    }
+    // A number handed out is spent, exactly as it is for a plan — the retired ones never come
+    // back and the new ones must not be re-issued.
+    allocFloorRef.current = {
+      batch: Math.max(allocFloorRef.current.batch, reshape.maxBatch + 1),
+      offset: allocFloorRef.current.offset,
+    };
+    // The filter may be pointing at a number that no longer exists.
+    setSelectedBatch((prev) => (prev !== null && reshape.retire.includes(prev) ? null : prev));
+  }
+
   /** Seals nothing — just hands the current cohort a range and a chip the user can download. */
   function exportCohort(cohort: CutoutItem[]) {
     const plan = planExport(cohort, allocate());
@@ -2932,16 +3056,11 @@ function BgRemoverFile() {
         batches={batchRows}
         selected={selectedBatch}
         onSelect={setSelectedBatch}
-        onDownload={(batch: number) => {
-          const open = openPlans.find((p) => p.batch === batch);
-          if (open) return void runPlan(open);
-          const row = ledger.find((r) => r.batch === batch);
-          const redo = row && planReexport(itemsRef.current, row);
-          if (redo) void runPlan(redo, { reexport: true });
-        }}
+        onDownload={downloadBatch}
         downloadingBatch={exportingBatch}
         downloadDisabled={exporting}
         running={running}
+        onOpenAll={() => setBatchesOpen(true)}
         // At rest the same row stops being a progress readout and becomes an action: clean work
         // that no batch took — a run stopped early, or one whose tail predates this behaviour —
         // would otherwise only be shippable mixed in with the flagged pile.
@@ -3623,6 +3742,38 @@ function BgRemoverFile() {
           offers a retry rather than asking the user to choose between two versions of their work.
           Writes stay held while this is up: the store parks in 'loading', where an empty queue can
           never be mistaken for a deletion. */}
+      {/* The batches, in full. The rail keeps only the summary line and the two live cohorts,
+          so this is where a finished batch is downloaded, merged, split or inspected. */}
+      <BatchModal
+        open={batchesOpen}
+        onOpenChange={setBatchesOpen}
+        batches={ledgerSummary.batches}
+        pendingBatches={pendingBatchNumbers}
+        changedIn={(batch) => {
+          const row = ledger.find((r) => r.batch === batch);
+          return row ? changedSince(itemsRef.current, row) : [];
+        }}
+        onSelect={setSelectedBatch}
+        onDownload={(batch) => downloadBatch(batch)}
+        onDownloadTogether={(picked) => void downloadTogether(picked)}
+        mergeBlocked={(picked) => canMergeBatches(ledgerSummary.batches, picked).reason}
+        previewMerge={(picked) => planMerge(itemsRef.current, ledgerSummary.batches, picked, allocate())}
+        previewSplit={(batch, at) => planSplit(itemsRef.current, ledgerSummary.batches, batch, at, allocate())}
+        onMerge={(picked) => {
+          const reshape = planMerge(itemsRef.current, ledgerSummary.batches, picked, allocate());
+          if (reshape) applyBatchReshape(reshape);
+        }}
+        onSplit={(batch, at) => {
+          const reshape = planSplit(itemsRef.current, ledgerSummary.batches, batch, at, allocate());
+          if (reshape) applyBatchReshape(reshape);
+        }}
+        downloadingBatch={exportingBatch}
+        busy={exporting || exportingBatch !== null}
+        sealSize={sealSize}
+        onSealSizeChange={setSealSize}
+        cleanWaiting={cleanCohort.length}
+      />
+
       <AlertDialog open={filePhase === 'failed'}>
         <AlertDialogContent>
           <AlertDialogHeader>

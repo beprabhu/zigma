@@ -36,6 +36,16 @@ import { TileGrid, TileGridSkeleton, TileDialog, tileOptsFor } from '@/component
 import { ClearAllButton, SelectionBar, useGridSelection } from '@/components/selection';
 import { Canvas, CanvasToolbar, LeftPanel, PanelSection, RightPanel, StudioShell } from '@/components/pane-layout';
 import { QueueSearch, matchesTerms, recordValues, searchTerms } from '@/components/queue-search';
+import { readSession, restingStatus, saveSession, sessionKey } from '@/lib/session-store';
+import { resolveOpen } from '@/lib/files/open';
+import { useNewFileGeneration } from '@/components/new-file-boundary';
+import { useFileStore, type LoadedFile } from '@/lib/files/use-file-store';
+import { CSV_KEY } from '@/lib/files/store';
+import { daysUntilExpiry } from '@/lib/files/sweep';
+import {
+  BANDS_KEY, EMPTY_COMPOSE_DOC, composeCodec, fattenBand, hydrateResults, leanBand,
+  type BandSheets, type ComposeDoc,
+} from '@/lib/files/codecs/compositor';
 import { useProcessing } from '@/components/process-panel';
 import { BudgetControls } from '@/components/budget-controls';
 import { MdFileIcon, MdFileTile } from '@/components/md-file-tile';
@@ -107,7 +117,59 @@ function canvasToImage(canvas: HTMLCanvasElement): Promise<HTMLImageElement> {
   });
 }
 
+/**
+ * What survives a hop to another product — the thing Compose never had.
+ *
+ * Until this landed, clicking Cleanup to check one thing and coming back took the whole run with
+ * it: every useState in the page went with the route change, and nothing outside it held a
+ * reference. The tiles were the expensive half, but the mapping work — which column names the
+ * tile, which holds the offer, how many rows each band draws — was the part that took the longest
+ * to redo.
+ *
+ * Object URLs are NOT stripped here, unlike Cleanup's snapshot. Compose does not revoke them on
+ * unmount (they are minted once per row and live as long as the document), so they are still
+ * valid on the way back in.
+ */
+interface ComposeSession {
+  fileId: string;
+  items: QueueItem[];
+  bands: GridBand[];
+  mode: 'csv' | 'images' | null;
+  sessionName: string;
+  fileName: string | null;
+  headers: string[];
+  records: CsvRecord[];
+  imageCols: string[];
+  titleCols: string[];
+  offerCol: string;
+  tplTitle: string;
+  tplOffer: string;
+  offerVisible: boolean;
+  nextItemId: number;
+  csvText: { fileName: string; text: string } | null;
+  bandSheets: BandSheets;
+}
+
+const COMPOSE_SESSION = sessionKey<ComposeSession>('compositor');
+
+/**
+ * Thin shell around the file itself. The key is what makes "New Compose file" work: a bump
+ * remounts everything below and the fresh mount resolves to a new file id.
+ */
 export default function Compositor() {
+  const generation = useNewFileGeneration('compositor');
+  return <CompositorFile key={generation} />;
+}
+
+function CompositorFile() {
+  /**
+   * Which file this mount is editing, and whether the tab's live snapshot belongs to it. A
+   * request from the homepage outranks the snapshot; when they disagree the snapshot is dropped,
+   * because its rows belong to a different file.
+   */
+  const [opened] = React.useState(() => resolveOpen('compositor', readSession(COMPOSE_SESSION)));
+  const revived = opened.snapshot;
+
   // Template + defaults
   const [template, setTemplate] = usePersistedState<TileTemplate>('skuc_template', DEFAULT_TEMPLATE);
   // Derived, never stored: the dropdown shows whichever preset the template currently equals,
@@ -137,9 +199,9 @@ export default function Compositor() {
   // The 1:1 preset's geometry is settled, so it offers colours and nothing else. Every other
   // preset — including the two ratios still being worked out — keeps the full editor.
   const colorsOnly = presetId === 'banner-square';
-  const [tplTitle, setTplTitle] = React.useState('Tile name');
-  const [tplOffer, setTplOffer] = React.useState('20% OFF');
-  const [offerVisible, setOfferVisible] = React.useState(true);
+  const [tplTitle, setTplTitle] = React.useState(() => revived?.tplTitle ?? 'Tile name');
+  const [tplOffer, setTplOffer] = React.useState(() => revived?.tplOffer ?? '20% OFF');
+  const [offerVisible, setOfferVisible] = React.useState(() => revived?.offerVisible ?? true);
 
   // Keys / prompt
   const [endpoint] = usePersistedState('skuc_azureEndpoint', DEFAULT_ENDPOINT);
@@ -183,23 +245,29 @@ export default function Compositor() {
   const activeModel = serverBlocked ? DEFAULT_MODEL_ID : knownModel;
 
   // CSV
-  const [fileName, setFileName] = React.useState<string | null>(null);
-  const [headers, setHeaders] = React.useState<string[]>([]);
-  const [records, setRecords] = React.useState<CsvRecord[]>([]);
+  const [fileName, setFileName] = React.useState<string | null>(() => revived?.fileName ?? null);
+  const [headers, setHeaders] = React.useState<string[]>(() => revived?.headers ?? []);
+  const [records, setRecords] = React.useState<CsvRecord[]>(() => revived?.records ?? []);
+  /** The sheet's own text, kept so a restored run can still remap columns. */
+  const [csvText, setCsvText] = React.useState<{ fileName: string; text: string } | null>(
+    () => revived?.csvText ?? null,
+  );
+  /** Each band's sheet, by band id — the heavy half GridBand carries and the doc may not. */
+  const [bandSheets, setBandSheets] = React.useState<BandSheets>(() => revived?.bandSheets ?? {});
   // Figma-style session name in the panel header; seeds the export ZIP filename. Auto-seeded
   // from the dropped CSV, but never over a name the user already typed.
-  const [sessionName, setSessionName] = React.useState('');
+  const [sessionName, setSessionName] = React.useState(() => revived?.sessionName ?? '');
   const sessionSlug = sessionName.trim().replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '');
-  const [imageCols, setImageCols] = React.useState<string[]>([]);
-  const [titleCols, setTitleCols] = React.useState<string[]>([]);
-  const [offerCol, setOfferCol] = React.useState('');
+  const [imageCols, setImageCols] = React.useState<string[]>(() => revived?.imageCols ?? []);
+  const [titleCols, setTitleCols] = React.useState<string[]>(() => revived?.titleCols ?? []);
+  const [offerCol, setOfferCol] = React.useState(() => revived?.offerCol ?? '');
 
   // Banner grid — the rows ("bands") of the grid. Each owns one CSV, one banner-tile preset and
   // how much of that sheet to draw; the tiles themselves live in the flat queue below, tagged
   // with their band, so every batch mechanism stays band-agnostic.
-  const [bands, setBands] = React.useState<GridBand[]>([]);
+  const [bands, setBands] = React.useState<GridBand[]>(() => revived?.bands ?? []);
   // A grid holds several sheets at once, so a row's sheet index can no longer be its queue id.
-  const nextItemId = React.useRef(0);
+  const nextItemId = React.useRef(revived?.nextItemId ?? 0);
   // Grid mode is never empty-handed: there is always a row on screen to drop a CSV into.
   const gridBands = bands.length ? bands : [SEED_BAND];
   /** Band writes go through the SAME list the UI reads, seed included. */
@@ -208,7 +276,7 @@ export default function Compositor() {
   }
 
   // Queue / run state
-  const [items, setItems] = React.useState<QueueItem[]>([]);
+  const [items, setItems] = React.useState<QueueItem[]>(() => revived?.items ?? []);
   /**
    * What this run is fed by, decided by whatever landed FIRST and held until Clear.
    *
@@ -217,7 +285,151 @@ export default function Compositor() {
    * mean a Columns panel that maps half the rows and an export that numbers them from two
    * different origins. So the first drop picks, and the other kind is refused out loud.
    */
-  const [mode, setMode] = React.useState<'csv' | 'images' | null>(null);
+  const [mode, setMode] = React.useState<'csv' | 'images' | null>(() => revived?.mode ?? null);
+
+  // ---- The file ----
+  // Small by contract: the sheets are megabytes and live in meta singletons, so `bands` goes in
+  // stripped of its headers and records.
+  const fileDoc = React.useMemo<ComposeDoc>(
+    () => ({
+      ...EMPTY_COMPOSE_DOC,
+      sessionName,
+      mode,
+      fileName,
+      headers,
+      imageCols,
+      titleCols,
+      offerCol,
+      bands: bands.map(leanBand),
+      tplTitle,
+      tplOffer,
+      offerVisible,
+      nextItemId: nextItemId.current,
+      rowCount: records.length,
+    }),
+    // `items` is read by nothing above, and that is why it is listed: nextItemId is a ref, so
+    // nothing about it can re-run this memo on its own, and `items` is the state that moves
+    // whenever the counter does. Drop it and a restored file numbers its next row over one that
+    // has already been exported.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [sessionName, mode, fileName, headers, imageCols, titleCols, offerCol, bands, tplTitle,
+     tplOffer, offerVisible, records.length, items],
+  );
+
+  /**
+   * Seeds the page from disk. Called once, before the store starts mirroring.
+   *
+   * Tiles arrive complete except for their pictures, which decode asynchronously and are patched
+   * in behind them — the mapping panel and the row list are what a person looks at first.
+   */
+  const handleLoadedFile = React.useCallback((loaded: LoadedFile<QueueItem, ComposeDoc>) => {
+    const doc = loaded.doc;
+    const sheets = (loaded.meta[BANDS_KEY] as BandSheets | undefined) ?? {};
+    if (doc) {
+      if (doc.sessionName) setSessionName((prev) => (prev.trim() ? prev : doc.sessionName));
+      if (doc.mode) setMode((prev) => prev ?? doc.mode);
+      if (doc.fileName) setFileName((prev) => prev ?? doc.fileName);
+      if (doc.headers.length) setHeaders((prev) => (prev.length ? prev : doc.headers));
+      if (doc.imageCols.length) setImageCols((prev) => (prev.length ? prev : doc.imageCols));
+      if (doc.titleCols.length) setTitleCols((prev) => (prev.length ? prev : doc.titleCols));
+      if (doc.offerCol) setOfferCol((prev) => prev || doc.offerCol);
+      if (doc.bands.length) {
+        setBands((prev) => (prev.length ? prev : doc.bands.map((b) => fattenBand(b, sheets))));
+        setBandSheets((prev) => (Object.keys(prev).length ? prev : sheets));
+      }
+      setTplTitle((prev) => (prev === EMPTY_COMPOSE_DOC.tplTitle ? doc.tplTitle : prev));
+      setTplOffer((prev) => (prev === EMPTY_COMPOSE_DOC.tplOffer ? doc.tplOffer : prev));
+      setOfferVisible(doc.offerVisible);
+      // Never downward: a counter that retreated would hand a new row an id a deleted one used,
+      // and the export names by id.
+      nextItemId.current = Math.max(nextItemId.current, doc.nextItemId);
+    }
+    const sheet = loaded.meta[CSV_KEY] as { fileName?: string; text?: string } | undefined;
+    if (sheet?.text) {
+      const parsed = parseCSV(sheet.text);
+      setRecords((prev) => (prev.length ? prev : parsed.records));
+      setHeaders((prev) => (prev.length ? prev : parsed.headers));
+      setCsvText((prev) => prev ?? { fileName: sheet.fileName ?? 'import.csv', text: sheet.text! });
+    }
+    if (loaded.items.length) {
+      setItems((prev) => (prev.length ? [...prev, ...loaded.items] : loaded.items));
+      nextItemId.current = Math.max(
+        nextItemId.current,
+        ...loaded.items.map((item) => item.id + 1),
+      );
+      void hydrateResults(loaded.records, (id, image) => {
+        setItems((prev) =>
+          prev.map((it) => (it.id === id ? { ...it, resultImage: image, status: 'done' as const } : it)),
+        );
+      });
+    }
+  }, []);
+
+  const {
+    fileId,
+    phase: filePhase,
+    lastSavedAt: fileSavedAt,
+    failing: fileFailing,
+    record: fileRecord,
+    setKept: setFileKept,
+    setMeta: setFileMeta,
+  } = useFileStore<QueueItem, ComposeDoc>({
+    codec: composeCodec,
+    items,
+    doc: fileDoc,
+    metaKeys: [CSV_KEY, BANDS_KEY],
+    fileId: opened.fileId,
+    // A queue carried across a product switch is not a file being opened: its rows are already on
+    // screen AND already on disk.
+    adopted: !!opened.snapshot,
+    onLoad: handleLoadedFile,
+  });
+  const fileLoading = filePhase !== 'active';
+  /**
+   * Everything that would ADD a row waits for the load, not just the writes: ids come from a
+   * counter, and a CSV dropped mid-load would number its rows over the ones still arriving.
+   */
+  const inputsLocked = fileLoading;
+
+  // Mirrors the sheets. Each ref stops a fresh mount from writing a null before the file's own
+  // copy has loaded — only a sheet that existed in THIS session may clear one.
+  const csvMirrored = React.useRef(false);
+  React.useEffect(() => {
+    if (!csvText && !csvMirrored.current) return;
+    csvMirrored.current = true;
+    setFileMeta(CSV_KEY, csvText);
+  }, [csvText, setFileMeta]);
+
+  const bandsMirrored = React.useRef(false);
+  React.useEffect(() => {
+    const any = Object.keys(bandSheets).length > 0;
+    if (!any && !bandsMirrored.current) return;
+    bandsMirrored.current = true;
+    setFileMeta(BANDS_KEY, any ? bandSheets : null);
+  }, [bandSheets, setFileMeta]);
+
+  /**
+   * "Kept" / "Deletes in N days", and the toggle for both. Absent until the file exists on disk.
+   */
+  const keepChip = React.useMemo<SessionChip | null>(() => {
+    if (!fileRecord) return null;
+    if (fileRecord.keptAt !== null) {
+      return {
+        label: 'Kept',
+        title: 'This file is pinned and will not be deleted. Click to unpin.',
+        onClick: () => setFileKept(false),
+      };
+    }
+    const days = daysUntilExpiry(fileRecord);
+    return {
+      label: days === null ? 'Keep' : `Deletes in ${days} day${days === 1 ? '' : 's'}`,
+      tone: days !== null && days <= 2 ? ('warn' as const) : undefined,
+      title: 'Unpinned files are removed 7 days after their last change. Click to keep this one.',
+      onClick: () => setFileKept(true),
+    };
+  }, [fileRecord, setFileKept]);
+
+
   const [running, setRunning] = React.useState(false);
   const [progress, setProgress] = React.useState<{ pct: number; text: string } | null>(null);
   const [compressSummary, setCompressSummary] = React.useState('');
@@ -302,13 +514,18 @@ export default function Compositor() {
       setSessionName((prev) => (prev.trim() ? prev : file.name.replace(/\.[^.]+$/, '')));
       setHeaders(headers);
       setRecords(records);
+      // The sheet itself, so a restored run can still remap columns. A meta singleton rather than
+      // part of the doc: its text runs to megabytes and the homepage reads every doc.
+      setCsvText({ fileName: file.name, text: String(reader.result) });
       setImageCols(imgCols);
       // Detection guesses ONE header; a combination is only ever an explicit choice.
       const tCols = tCol ? [tCol] : [];
       setTitleCols(tCols);
       setOfferCol(oCol);
       setMode('csv');
-      setItems(buildQueue(records, imgCols, tCols, oCol));
+      // Reconciled, not rebuilt — computed OUTSIDE the updater, the purity rule Cleanup's
+      // replaceCsvItems documents: updaters run twice under StrictMode, and this one mints ids.
+      setItems(reconcileQueue(records, imgCols, tCols, oCol, itemsRef.current));
     };
     reader.readAsText(file);
   }
@@ -366,6 +583,11 @@ export default function Compositor() {
    * images onto my CSV run and nothing happened" is indistinguishable from a broken dropzone.
    */
   function handleDrop(files: File[]) {
+    // The visible dropzones are disabled while these are true, but this handler is ALSO wired to
+    // a window-level drop listener that no disabled prop reaches. A drop landing while the file
+    // is still loading would mint row ids from an empty queue — 0, 1, 2… — exactly the ids the
+    // rows still on their way in already carry.
+    if (running || inputsLocked) return;
     const csv = files.find(isCsvFile) ?? null;
     const images = files.filter(isImageFile);
     if (!csv && !images.length) { toast.error('Drop a CSV or image files.'); return; }
@@ -392,6 +614,62 @@ export default function Compositor() {
   // is noise; the ref is read at drop time so the listener never goes stale.
   const handleDropRef = React.useRef(handleDrop);
   React.useEffect(() => { handleDropRef.current = handleDrop; });
+
+  /**
+   * The snapshot the unmount hands to the next mount, restated after every commit.
+   *
+   * The cleanup that reads it has to be mount-once — anything else would tear down and re-arm the
+   * abort on every keystroke — so its closure is stuck with the first render's state, and a ref is
+   * the only thing it can reach that is still current.
+   */
+  const sessionRef = React.useRef<ComposeSession | null>(null);
+  React.useEffect(() => {
+    sessionRef.current = {
+      fileId,
+      items,
+      bands,
+      mode,
+      sessionName,
+      fileName,
+      headers,
+      records,
+      imageCols,
+      titleCols,
+      offerCol,
+      tplTitle,
+      tplOffer,
+      offerVisible,
+      nextItemId: nextItemId.current,
+      csvText,
+      bandSheets,
+    };
+  });
+
+  /**
+   * Leaving the product stops the run and hands the queue to the next mount.
+   *
+   * Object URLs are deliberately NOT released here, which is the opposite of what Cleanup does:
+   * Compose mints one per dropped row and keeps it for the document's life, so the snapshot can
+   * carry them intact — releasing would revive a queue of broken images, the exact trap
+   * lib/session-store.ts:60-69 documents. releaseLocalSources still runs when a ROW goes away,
+   * which is the only moment a URL genuinely stops being needed.
+   *
+   * Statuses come to rest first. The abort's cancellation patches resolve after this component is
+   * gone, so those writes never commit — without this, rows caught mid-run come back as spinners
+   * nothing can finish.
+   */
+  React.useEffect(() => () => {
+    genAbortRef.current?.abort();
+    const snapshot = sessionRef.current;
+    if (!snapshot) return;
+    saveSession(COMPOSE_SESSION, {
+      ...snapshot,
+      items: snapshot.items.map((item) => ({
+        ...item,
+        status: restingStatus(item.status, item.resultImage !== null),
+      })),
+    });
+  }, []);
 
   const [pageDrag, setPageDrag] = React.useState(false);
 
@@ -480,6 +758,65 @@ export default function Compositor() {
     });
   }
 
+  /**
+   * A re-dropped sheet applied to the queue, reusing the row that already holds each record.
+   *
+   * Same contract as Cleanup's replaceCsvItems and Generate's reconcileCsvItems: dropping the
+   * same or an edited CSV must not throw composed tiles away — before this, the drop rebuilt the
+   * queue from scratch and the autosave then deleted every stored tile behind it. Rows are
+   * matched on the record's full content (the sheet IS a row's identity in this mode); a match
+   * keeps its id, its tile and its compressed cache, while presentation — row number, urls,
+   * title, offer — is recomputed from the new sheet and mapping exactly as a fresh build would.
+   * A row edited in the sheet comes back new and un-composed on purpose: its tile was drawn from
+   * the old values.
+   */
+  function reconcileQueue(
+    records: CsvRecord[],
+    imageCols: string[],
+    titleCols: readonly string[],
+    offerCol: string,
+    existing: QueueItem[],
+  ): QueueItem[] {
+    const spare = new Map<string, QueueItem[]>();
+    for (const item of existing) {
+      // Only plain sheet rows take part: band rows belong to their band's own sheet, and image
+      // rows have no record to match on.
+      if (item.bandId || !Object.keys(item.record ?? {}).length) continue;
+      const key = JSON.stringify(item.record);
+      const bucket = spare.get(key);
+      if (bucket) bucket.push(item);
+      else spare.set(key, [item]);
+    }
+    return records.map((record, i) => {
+      const urls = rowUrls(record, imageCols);
+      const title = joinNameColumns(record, titleCols);
+      const offer = offerCol ? record[offerCol] ?? '' : '';
+      const reused = spare.get(JSON.stringify(record))?.shift();
+      if (!reused) {
+        return {
+          id: nextItemId.current++,
+          row: 1 + i,
+          record, urls, title, offer,
+          status: urls.length ? 'ready' : 'no-images',
+          resultImage: null,
+          compressed: null,
+        } satisfies QueueItem;
+      }
+      return {
+        ...reused,
+        row: 1 + i,
+        urls, title, offer,
+        // A composed row rests where it is; an un-composed one follows the new mapping — a row
+        // whose image column just got picked must not stay parked at 'no-images'.
+        status: reused.resultImage
+          ? reused.status
+          : urls.length
+            ? (reused.status === 'no-images' ? 'ready' : reused.status)
+            : 'no-images',
+      };
+    });
+  }
+
   // ---- Banner grid bands ----
 
   /** The band an item belongs to, or undefined outside grid mode. */
@@ -533,6 +870,17 @@ export default function Compositor() {
 
   function patchBand(id: string, patch: Partial<GridBand>) {
     updateBands((prev) => prev.map((b) => (b.id === id ? { ...b, ...patch } : b)));
+    // A band's sheet is the half its doc entry may not carry, so it is mirrored beside it the
+    // moment one lands. Keyed by band id, which is what fattenBand rejoins them on.
+    if (patch.records || patch.headers) {
+      setBandSheets((prev) => ({
+        ...prev,
+        [id]: {
+          headers: patch.headers ?? prev[id]?.headers ?? [],
+          records: patch.records ?? prev[id]?.records ?? [],
+        },
+      }));
+    }
   }
 
   /**
@@ -938,6 +1286,8 @@ export default function Compositor() {
     // Emptying the list is what puts grid mode back on its seed row, so a clear still leaves
     // a drop area on the canvas.
     setBands([]);
+    setBandSheets({});
+    setCsvText(null);
     sel.clear();
     setOpenId(null);
     setFileName(null);
@@ -1242,6 +1592,12 @@ export default function Compositor() {
                     ? { label: `${gridBands.length} grid row${gridBands.length === 1 ? '' : 's'}` }
                     : records.length > 0 && { label: `${records.length} row${records.length === 1 ? '' : 's'}` },
                   activeItems.length > 0 && { label: `${doneCount}/${activeItems.length} tiles` },
+                  fileFailing && { label: 'Autosave failing — retrying', tone: 'warn' as const },
+                  !fileFailing && fileSavedAt !== null && {
+                    label: `Autosaved ${new Date(fileSavedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`,
+                  },
+                  // The expiry rule has to be visible where the work is — see Cleanup's header.
+                  keepChip,
                 ].filter(Boolean) as SessionChip[]
               }
             />
@@ -1596,7 +1952,7 @@ export default function Compositor() {
                       ) : (
                         <DropzoneShell
                           accept=".csv,text/csv"
-                          disabled={running}
+                          disabled={running || inputsLocked}
                           onFiles={(files) => handleBandFile(band.id, files[0])}
                           className="min-h-32 justify-center"
                         >
@@ -1668,12 +2024,12 @@ export default function Compositor() {
                 description="A CSV makes one tile per row, from columns you map in the panel. Images make one tile each — drop a folder and everything inside it comes in."
                 accept=".csv,text/csv,image/*"
                 multiple
-                disabled={running}
+                disabled={running || inputsLocked}
                 onFiles={handleDrop}
               >
                 {/* Dropping a folder already works; browsing to one needs its own control,
                     because a file input is either a file picker or a folder picker. */}
-                <FolderInputButton onFiles={handleDrop} disabled={running} className="mt-1" />
+                <FolderInputButton onFiles={handleDrop} disabled={running || inputsLocked} className="mt-1" />
               </CanvasDropzone>
             ) : (
               <>

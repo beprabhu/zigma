@@ -19,6 +19,7 @@
 // below are defined by the ABSENCE of that stamp rather than by any quality signal. Everything
 // else — numbering, staleness, the rail's summary — reads the same stamps back.
 
+import { exportFileName } from './batch';
 import type { BgItem, CutoutItem } from './batch';
 import type { VerdictLookup } from './quality';
 
@@ -518,4 +519,308 @@ export function summarizeLedger(
   });
 
   return { batches, exported, claimed, ready, waiting, total: items.length };
+}
+
+// ---- Reshaping ------------------------------------------------------------
+//
+// Merging and splitting batches, which is bookkeeping and nothing more.
+//
+// It is only safe because of one accident of the numbering: a file's number comes from the
+// batch's offset plus the item's position, and those positions run CONTINUOUSLY across batches —
+// batch 1 is files 1-500, batch 2 is 501-1000. Join them and the merged batch is files 1-1000:
+// the same numbers, over the same images, in the same order. The ZIPs already on the user's disk
+// stay correct file for file; only the receipt changes.
+//
+// That accident holds while two conditions do, and both are CHECKED rather than assumed:
+//
+//   adjacency   the picked batches must be neighbours whose file ranges touch. Merging batch 1
+//               with batch 5 would put files 1-500 and 2001-2500 under one offset and renumber
+//               the second half onto names the batches in between already own.
+//   order       a merged batch re-derives its members in queue order, and queue order usually
+//               matches seal order — but not always: an image flagged early, fixed late and
+//               sealed into batch 3 can sit in the queue ahead of batch 2's members. So every
+//               reshape REPORTS how many files would change name (`renamed`) instead of
+//               promising none, and the caller says so before the user commits.
+//
+// Restored batches ('unknown' staleness) cannot be reshaped at all. Their records are gone, so
+// there is no way to know which blobs actually shipped, and a merged record would have to either
+// claim every image is current — lying about a file this session never wrote — or call all of
+// them stale. Refusing is the only honest third option.
+
+/** One batch a reshape will create. */
+export interface ReshapeGroup {
+  /** The new number. Old numbers are retired and never reused — see nextAllocation. */
+  batch: number;
+  offset: number;
+  /**
+   * Its members in FINAL order, which is queue order — the same order batchItems will hand back
+   * when the batch is next exported, so the names predicted here are the names that get written.
+   * Each item still carries its OLD stamp at this point, which is what lets the record rebuild
+   * below look up where its blob shipped from.
+   */
+  members: CutoutItem[];
+}
+
+export interface BatchReshape {
+  /** Batch numbers whose ledger rows and stamps are being replaced. */
+  retire: number[];
+  groups: ReshapeGroup[];
+  /**
+   * How many files come out under a different name than the ZIP on disk gave them.
+   *
+   * Zero is the normal answer and means the downloaded folders stay correct with no re-download.
+   * Non-zero means the affected batches must be downloaded again and their folders replaced —
+   * the same rule a re-export after a deletion already follows.
+   */
+  renamed: number;
+  /** Highest number handed out, for advancing the allocation floor. */
+  maxBatch: number;
+}
+
+/** The file name a member currently has on disk, from the batch it shipped in. */
+function shippedName(item: CutoutItem, index: number, offset: number): string {
+  return exportFileName(item.name, index, { offset });
+}
+
+/**
+ * Counts members whose name would move. `before` maps item id → the name its ZIP used; groups
+ * carry the names it would get.
+ */
+function countRenamed(before: Map<number, string>, groups: readonly ReshapeGroup[]): number {
+  let renamed = 0;
+  for (const group of groups) {
+    group.members.forEach((item, index) => {
+      const was = before.get(item.id);
+      if (was !== undefined && was !== shippedName(item, index, group.offset)) renamed++;
+    });
+  }
+  return renamed;
+}
+
+/** Every member's current on-disk name, across the batches a reshape touches. */
+function namesBefore(
+  items: readonly BgItem[],
+  batches: readonly number[],
+  offsetOf: (batch: number) => number,
+): Map<number, string> {
+  const before = new Map<number, string>();
+  for (const batch of batches) {
+    const offset = offsetOf(batch);
+    batchItems(items, batch).forEach((item, index) => {
+      before.set(item.id, shippedName(item, index, offset));
+    });
+  }
+  return before;
+}
+
+export interface ReshapeCheck {
+  ok: boolean;
+  /** Why not, phrased for the user. Empty when ok. */
+  reason: string;
+}
+
+/**
+ * Whether a set of batches may be merged.
+ *
+ * Adjacency is tested on the FILE RANGES, not on the numbers: after earlier merges the numbers
+ * have gaps, and what actually has to be contiguous is the run of files, since that is what the
+ * merged offset has to cover exactly.
+ */
+export function canMergeBatches(
+  summary: readonly LedgerBatch[],
+  picked: readonly number[],
+): ReshapeCheck {
+  if (picked.length < 2) return { ok: false, reason: 'Pick at least two batches to merge.' };
+  const rows = summary.filter((b) => picked.includes(b.batch));
+  if (rows.length !== picked.length) return { ok: false, reason: 'Some picked batches no longer exist.' };
+  if (rows.some((b) => b.staleness === 'unknown' || b.offset === undefined)) {
+    return {
+      ok: false,
+      reason: 'Batches restored from a saved file cannot be merged — this session has no record of what shipped in them.',
+    };
+  }
+  const sorted = [...rows].sort((a, b) => (a.offset ?? 0) - (b.offset ?? 0));
+  for (let i = 1; i < sorted.length; i++) {
+    const prev = sorted[i - 1];
+    const end = (prev.offset ?? 0) + (prev.shipped ?? prev.present);
+    if ((sorted[i].offset ?? 0) !== end) {
+      return {
+        ok: false,
+        reason: 'Only batches whose file numbers run back to back can be merged — otherwise the merged ZIP would renumber over files another batch already owns.',
+      };
+    }
+  }
+  return { ok: true, reason: '' };
+}
+
+/**
+ * Merges adjacent batches into one, under a fresh number at the earliest offset.
+ *
+ * Null when the pick is invalid or nothing is left to merge; call canMergeBatches first for the
+ * reason to show.
+ */
+export function planMerge(
+  items: readonly BgItem[],
+  summary: readonly LedgerBatch[],
+  picked: readonly number[],
+  alloc: Allocation,
+): BatchReshape | null {
+  if (!canMergeBatches(summary, picked).ok) return null;
+  const rows = summary.filter((b) => picked.includes(b.batch));
+  const offsetOf = (batch: number) => rows.find((b) => b.batch === batch)?.offset ?? 0;
+  const offset = Math.min(...rows.map((b) => b.offset ?? 0));
+
+  const pickedSet = new Set(picked);
+  // Queue order across all of them, which is exactly what batchItems will return for the merged
+  // number once the stamps land.
+  const members = items.filter(
+    (item): item is CutoutItem =>
+      typeof item.batch === 'number' && pickedSet.has(item.batch) && isShippable(item),
+  );
+  if (!members.length) return null;
+
+  const groups: ReshapeGroup[] = [{ batch: alloc.batch, offset, members }];
+  return {
+    retire: [...picked].sort((a, b) => a - b),
+    groups,
+    renamed: countRenamed(namesBefore(items, picked, offsetOf), groups),
+    maxBatch: alloc.batch,
+  };
+}
+
+/**
+ * Splits one batch in two at `at` (the count that stays in the first half).
+ *
+ * Names never move here — both halves keep their members' positions, and the second half's
+ * offset is the first's plus its length — but `renamed` is still computed rather than asserted,
+ * because the one thing this module does not do is promise things it has not checked.
+ */
+export function planSplit(
+  items: readonly BgItem[],
+  summary: readonly LedgerBatch[],
+  batch: number,
+  at: number,
+  alloc: Allocation,
+): BatchReshape | null {
+  const row = summary.find((b) => b.batch === batch);
+  if (!row || row.offset === undefined || row.staleness === 'unknown') return null;
+  const members = batchItems(items, batch);
+  if (at < 1 || at >= members.length) return null;
+
+  const groups: ReshapeGroup[] = [
+    { batch: alloc.batch, offset: row.offset, members: members.slice(0, at) },
+    { batch: alloc.batch + 1, offset: row.offset + at, members: members.slice(at) },
+  ];
+  return {
+    retire: [batch],
+    groups,
+    renamed: countRenamed(namesBefore(items, [batch], () => row.offset ?? 0), groups),
+    maxBatch: alloc.batch + 1,
+  };
+}
+
+/**
+ * Re-stamps the queue for a reshape. Pure, like stampBatch, and writes NOTHING but `batch` for
+ * the same reasons — a snapshot patched back wholesale would revert renames and redos that
+ * landed meanwhile, and touching `source` would make in-flight results look stale.
+ *
+ * Unlike stampBatch this deliberately overwrites an existing stamp: moving an image from a
+ * retired batch to its replacement is the entire operation.
+ */
+export function applyReshape(items: BgItem[], reshape: BatchReshape): BgItem[] {
+  const moves = new Map<number, number>();
+  for (const group of reshape.groups) {
+    for (const item of group.members) moves.set(item.id, group.batch);
+  }
+  const retired = new Set(reshape.retire);
+  return items.map((item) => {
+    const next = moves.get(item.id);
+    if (next !== undefined) return { ...item, batch: next };
+    // A retired batch's member that is no longer shippable (deleted mid-reshape, or in flight)
+    // has no group to go to. Leaving the old stamp would point at a row that is gone, so it goes
+    // back to unexported — visible in the tail, which is where an image nothing has shipped
+    // belongs.
+    if (typeof item.batch === 'number' && retired.has(item.batch)) {
+      const next = { ...item };
+      delete next.batch;
+      return next;
+    }
+    return item;
+  });
+}
+
+/**
+ * The ledger rows a reshape produces.
+ *
+ * The shipped set is rebuilt member by member rather than merged: a WeakSet cannot be
+ * enumerated, so the only way to carry identity across is to ask each OLD record whether it
+ * shipped this exact blob. That is also what preserves staleness — an image edited since its
+ * download fails its old record's test, is left out of the new set, and the reshaped batch
+ * reports stale exactly as its predecessor did.
+ */
+export function reshapeRecords(
+  reshape: BatchReshape,
+  ledger: readonly BatchRecord[],
+  details: { savedAt?: number } = {},
+): BatchRecord[] {
+  const old = new Map<number, BatchRecord>();
+  for (const record of ledger) old.set(record.batch, record);
+  const savedAt = details.savedAt ?? Date.now();
+
+  return reshape.groups.map((group) => {
+    const shipped = new WeakSet<Blob>();
+    let fileName: string | undefined;
+    for (const item of group.members) {
+      const source = typeof item.batch === 'number' ? old.get(item.batch) : undefined;
+      if (source?.shipped.has(item.cutout.blob)) shipped.add(item.cutout.blob);
+      // The first contributing batch's file name, purely so the row can still name something on
+      // disk. It is a label; nothing branches on it.
+      if (!fileName && source?.fileName) fileName = source.fileName;
+    }
+    return {
+      batch: group.batch,
+      offset: group.offset,
+      count: group.members.length,
+      savedAt,
+      ...(fileName ? { fileName } : null),
+      shipped,
+    };
+  });
+}
+
+/**
+ * One ZIP holding several batches' files, each keeping the number it already has.
+ *
+ * A convenience over the same machinery as a re-export: same adjacency rule, same offset, so the
+ * combined archive unzips over the separate folders it replaces. It changes NO stamps and
+ * retires NO batches — the receipts stay exactly as they were, the user just clicks save once
+ * instead of eight times.
+ */
+export function planCombined(
+  items: readonly BgItem[],
+  summary: readonly LedgerBatch[],
+  picked: readonly number[],
+): ExportPlan | null {
+  if (!canMergeBatches(summary, picked).ok) return null;
+  const rows = summary.filter((b) => picked.includes(b.batch));
+  const offset = Math.min(...rows.map((b) => b.offset ?? 0));
+  const pickedSet = new Set(picked);
+  const members = items.filter(
+    (item): item is CutoutItem =>
+      typeof item.batch === 'number' && pickedSet.has(item.batch) && isShippable(item),
+  );
+  if (!members.length) return null;
+  return { batch: Math.min(...picked), offset, items: members };
+}
+
+/**
+ * The images in a batch whose picture has changed since its ZIP was written — the "what changed"
+ * list. Empty for a current batch, and for a restored one, where nothing can be compared.
+ */
+export function changedSince(items: readonly BgItem[], record: BatchRecord): BgItem[] {
+  return items.filter(
+    (item) =>
+      item.batch === record.batch &&
+      (item.cutout === null || !record.shipped.has(item.cutout.blob)),
+  );
 }

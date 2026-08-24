@@ -23,7 +23,8 @@
 // Purely presentational: it is handed a progress snapshot per batch and reports clicks back.
 
 import {
-  CircleCheckIcon, DownloadIcon, FilterXIcon, InboxIcon, PackagePlusIcon, RefreshCwIcon,
+  ChevronRightIcon, CircleCheckIcon, DownloadIcon, FilterXIcon, InboxIcon, LayersIcon,
+  PackagePlusIcon, RefreshCwIcon, TriangleAlertIcon,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
@@ -136,6 +137,15 @@ export interface BatchListProps {
    * per-cohort: one run feeds both, and two flags that could disagree would only ever be a bug.
    */
   running?: boolean;
+  /**
+   * Opens the batches modal. When given, the sealed rows COLLAPSE into a single summary line and
+   * the modal becomes the place they are operated on.
+   *
+   * The two live rows never collapse. They are the numbers a run is watched by, and the export
+   * buttons beside them are what a person is reaching for mid-run — putting either behind a
+   * click would be hiding the thing in motion to make room for history.
+   */
+  onOpenAll?: () => void;
   className?: string;
 }
 
@@ -189,6 +199,7 @@ export function BatchList({
   onExportClean,
   exportingClean,
   running,
+  onOpenAll,
   className,
 }: BatchListProps) {
   // A 40-image queue never seals anything, and an empty "Batches" section under the export
@@ -211,12 +222,15 @@ export function BatchList({
         />
       )}
 
-      {batches.length > 0 && (
-        // Capped and scrolled INSIDE the section instead of growing it. 14,000 images seal 28
-        // ZIPs; a 28-row section pushes the tail's Export button — the one control that ships
-        // the images no batch will ever claim — off the bottom of the panel, and buries the
-        // other export settings under it. With the cap, a seal grows this box and moves nothing
-        // outside it, so the button under the pointer stays under the pointer.
+      {batches.length > 0 && onOpenAll && (
+        <BatchSummaryRow batches={batches} onOpen={onOpenAll} />
+      )}
+
+      {batches.length > 0 && !onOpenAll && (
+        // The uncollapsed list, kept for callers with no modal to open. Capped and scrolled
+        // INSIDE the section instead of growing it: 14,000 images seal 28 ZIPs, and a 28-row
+        // section pushes the tail's Export button — the one control that ships the images no
+        // batch will ever claim — off the bottom of the panel.
         //
         // -mx-1/px-1 cancel out, leaving rows aligned with the ones outside the box while the
         // viewport clips 4px further out — enough that a focused row's ring is not sliced off.
@@ -269,6 +283,61 @@ export function BatchList({
         </Button>
       )}
     </div>
+  );
+}
+
+/**
+ * The receipts, as one line.
+ *
+ * It has to carry the stale count in the same amber the rows use. The rows were the only place a
+ * downloaded ZIP could say it was out of date, so a summary that folded them behind a calm
+ * "12 batches" would turn the app's most consequential warning — the one about files already
+ * sent to somebody else — into something you find only by going looking.
+ */
+function BatchSummaryRow({
+  batches,
+  onOpen,
+}: {
+  batches: readonly BatchProgress[];
+  onOpen: () => void;
+}) {
+  const stale = batches.filter((b) => b.stale).length;
+  const pending = batches.filter((b) => !b.downloaded).length;
+  const files = batches.reduce((sum, b) => sum + b.total, 0);
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className={cn(
+        ROW,
+        'w-full cursor-pointer text-left hover:bg-accent/50',
+        stale > 0 && 'border-amber-500/50 bg-amber-500/5',
+      )}
+      title="Open the batches list — download, merge or split them"
+    >
+      <span className={ROW_BODY}>
+        {stale > 0 ? (
+          <TriangleAlertIcon className="size-3.5 shrink-0 text-amber-500" />
+        ) : (
+          <LayersIcon className="size-3.5 shrink-0 text-primary" />
+        )}
+        <span className="min-w-0 truncate text-xs font-medium">
+          {n(batches.length)} batch{batches.length === 1 ? '' : 'es'}
+        </span>
+        {stale > 0 && (
+          <span className="shrink-0 text-xs text-amber-600 dark:text-amber-500">
+            {n(stale)} need re-download
+          </span>
+        )}
+        {stale === 0 && pending > 0 && (
+          <span className="shrink-0 text-xs text-muted-foreground">
+            {n(pending)} not downloaded
+          </span>
+        )}
+        <span className={cn(ROW_COUNT, 'ml-auto')}>{n(files)} files</span>
+        <ChevronRightIcon className="size-3.5 shrink-0 text-muted-foreground" />
+      </span>
+    </button>
   );
 }
 

@@ -54,6 +54,19 @@ export interface LoadedFile<TItem, TDoc> {
   meta: Record<string, unknown>;
   /** True when this file already existed on disk — i.e. the page is resuming, not starting. */
   existing: boolean;
+  /**
+   * The raw records the items were built from, in the same order — each RE-KEYED to its row's
+   * final id, which is not always the stored one (see the collision backstop in the loader).
+   * Anything that patches rows by `record.id` later, the way hydrateImages does, must be handed
+   * the id the row actually wears, or a late patch lands on whichever row inherited the old
+   * number: that is exactly how deleted-row gaps once put every row's picture on its neighbour.
+   *
+   * Here for codecs whose rebuild cannot finish synchronously: itemFrom has to return an item
+   * immediately, but a stored picture is only usable once it has decoded. Generate hands the page
+   * its rows straight away and fills the images in behind them, which needs the blobs these still
+   * hold. Drop the reference once used — they keep every blob in the file alive.
+   */
+  records: ItemRecord[];
 }
 
 export interface UseFileStoreOptions<TItem, TDoc> {
@@ -158,23 +171,8 @@ function sameHeader(a: HeaderWant, b: HeaderWant): boolean {
   );
 }
 
-/**
- * Ids for rows coming off disk.
- *
- * The stored id is used as-is in the normal case — nothing else is in the queue, and keeping it
- * means a ledger naming record ids still resolves after a reload. It is only re-minted when the
- * live queue is not empty, which the page is supposed to prevent by refusing input while the phase
- * is 'loading': `nextItemId` and friends derive from the live array, so anything added during a
- * load is handed 0, 1, 2… — exactly the ids the loading rows carry.
- */
-function assignIds(records: ItemRecord[], taken: Set<ItemId>): ItemId[] {
-  if (!taken.size) return records.map((r) => r.id);
-  let numericBase = 0;
-  for (const id of taken) if (typeof id === 'number' && id >= numericBase) numericBase = id + 1;
-  return records.map((r, i) =>
-    typeof r.id === 'number' ? numericBase + i : `${r.id}-${crypto.randomUUID().slice(0, 8)}`,
-  );
-}
+// (The id backstop for rows coming off disk lives inline in the load effect below — it needs
+// every stored id in hand before it can mint safely, so it runs after the cursor finishes.)
 
 export function useFileStore<TItem, TDoc>(
   opts: UseFileStoreOptions<TItem, TDoc>,
@@ -387,6 +385,7 @@ export function useFileStore<TItem, TDoc>(
       if (cancelled) return;
 
       const rebuilt: TItem[] = [];
+      const rawRecords: ItemRecord[] = [];
       const taken = new Set<ItemId>(latestItemsRef.current.map((i) => codecRef.current.idOf(i)));
       let count = 0;
 
@@ -412,23 +411,65 @@ export function useFileStore<TItem, TDoc>(
           if (!cancelled) setLoadedCount(count);
         });
       } else {
+        // Records first, ids after. A final id can only be chosen once EVERY stored id is known:
+        // a mint inside the stored range would collide with a record still ahead of the cursor,
+        // and re-minting that one would cascade down the rest of the file. Holding them all costs
+        // nothing extra — they are all kept for the page's onLoad anyway.
+        const loaded: ItemRecord[] = [];
         await loadItems(fileId, (chunk) => {
-          const ids = assignIds(chunk, taken);
-          chunk.forEach((record, i) => {
-            const id = ids[i];
-            taken.add(id);
-            rebuilt.push(codecRef.current.itemFrom(record, id));
-            knownRef.current.set(id, {
-              // Seeded from the REBUILT row, not the record: the next pass compares live rows
-              // against this, and a signature taken from anything else would differ on the first
-              // commit and re-put every row that just came off disk.
-              sig: codecRef.current.signatureOf(rebuilt[rebuilt.length - 1]),
-              bytes: sumBlobBytes(record.blobs ?? {}),
-            });
-          });
+          loaded.push(...chunk);
           count += chunk.length;
           if (!cancelled) setLoadedCount(count);
         });
+        if (cancelled) return;
+
+        /**
+         * The id backstop. A stored id is used as-is — a ledger naming record ids still resolves
+         * after a reload — unless a LIVE row already claims it: something the page minted before
+         * the load landed, which every page is supposed to prevent by locking its inputs while
+         * the phase is 'loading'. Only the colliding record is re-minted, and numeric mints start
+         * past every live AND stored id.
+         *
+         * It must never be broader than that. An earlier version re-minted whole chunks by
+         * position whenever anything was in `taken`, and fed each chunk's own ids back into that
+         * check — so every chunk after the first was renumbered `max+1, max+2, …`. On a file with
+         * no gaps that landed on the same numbers by luck; on a file with deleted rows everything
+         * after a gap slid onto its neighbour's id, hydration pasted images back by the OLD ids,
+         * and the pump saved the crossing. Three real Generate files were corrupted this way.
+         */
+        let numericBase = 0;
+        for (const id of taken) if (typeof id === 'number' && id >= numericBase) numericBase = id + 1;
+        for (const r of loaded) if (typeof r.id === 'number' && r.id >= numericBase) numericBase = r.id + 1;
+
+        const moves: { put: ItemRecord; oldId: ItemId }[] = [];
+        for (const record of loaded) {
+          const collides = taken.has(record.id);
+          const id = !collides
+            ? record.id
+            : typeof record.id === 'number'
+              ? numericBase++
+              : `${record.id}-${crypto.randomUUID().slice(0, 8)}`;
+          taken.add(id);
+          const rekeyed = collides ? { ...record, id } : record;
+          if (collides) moves.push({ put: rekeyed, oldId: record.id });
+          // Re-keyed, so anything patching rows by record id later (hydrateImages) hits the id
+          // the row actually wears.
+          rawRecords.push(rekeyed);
+          rebuilt.push(codecRef.current.itemFrom(record, id));
+          knownRef.current.set(id, {
+            // Seeded from the REBUILT row, not the record: the next pass compares live rows
+            // against this, and a signature taken from anything else would differ on the first
+            // commit and re-put every row that just came off disk.
+            sig: codecRef.current.signatureOf(rebuilt[rebuilt.length - 1]),
+            bytes: sumBlobBytes(record.blobs ?? {}),
+          });
+        }
+        // The disk follows a rename NOW, in one transaction, or the record stays keyed under an
+        // id a live row owns — the pump would overwrite it with that row's payload and these
+        // bytes would be gone. Delete-then-put in the same tx makes the move atomic.
+        if (moves.length) {
+          await writeItems(fileId, moves.map((m) => m.put), moves.map((m) => m.oldId));
+        }
       }
       if (cancelled) return;
 
@@ -465,7 +506,14 @@ export function useFileStore<TItem, TDoc>(
       }
 
       if (!adoptedRef.current && (header || rebuilt.length)) {
-        onLoadRef.current?.({ fileId, items: rebuilt, doc: parsedDoc, meta, existing: true });
+        onLoadRef.current?.({
+          fileId,
+          items: rebuilt,
+          records: rawRecords,
+          doc: parsedDoc,
+          meta,
+          existing: true,
+        });
       }
       // The homepage's request has been honoured; a later plain rail click should resume through the
       // session snapshot instead of re-opening from a stale request.
