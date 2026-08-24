@@ -4,8 +4,20 @@ import { readImageQuality, type ImageQuality } from '@/lib/quality';
 import { acquireRpmSlot } from '@/lib/rate';
 import { recordUsage } from '@/lib/usage';
 
+/**
+ * The same-origin URL that serves a remote image through the proxy.
+ *
+ * Exported so an `<img src>` can point straight at it. That is worth doing rather than fetching
+ * into a blob: the browser then owns the request — native lazy-loading, its own cache, and no
+ * object URL for anyone to leak — which is what makes it safe to put a preview on every row of a
+ * sheet with thousands of them.
+ */
+export function proxiedImageUrl(url: string): string {
+  return '/api/fetch-image?url=' + encodeURIComponent(url);
+}
+
 export async function loadImageFromUrl(url: string, signal?: AbortSignal): Promise<HTMLImageElement> {
-  const res = await fetch('/api/fetch-image?url=' + encodeURIComponent(url), { signal });
+  const res = await fetch(proxiedImageUrl(url), { signal });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.error || `Failed to fetch ${url}`);

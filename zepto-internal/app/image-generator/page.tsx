@@ -41,10 +41,13 @@ import { GenDialog, GenGrid } from '@/components/image-generator/gen-grid';
 import { PromptListInput } from '@/components/image-generator/prompt-list';
 import { formatPromptList, parsePromptList } from '@/lib/prompt-list';
 
-import { detectTitleColumn, parseCSV, type CsvRecord } from '@/lib/csv';
+import { detectImageColumns, detectTitleColumn, parseCSV, type CsvRecord } from '@/lib/csv';
 import { GEN_SIZES, createGenItems, genFileStem, reconcileSubjectItems, type GenItem, type GenSize } from '@/lib/gen';
-import { PROMPT_WARN_CHARS, SUBJECT_HEADING, buildRowPrompt, buildSubjectPrompt, isPromptEmpty } from '@/lib/row-prompt';
-import { callAzure, callAzureGenerate, mockGenerate } from '@/lib/pipeline';
+import {
+  PROMPT_WARN_CHARS, ROW_HEADING, SUBJECT_HEADING, buildRowPrompt, buildSubjectPrompt,
+  isPromptEmpty, referenceUrls,
+} from '@/lib/row-prompt';
+import { callAzure, callAzureGenerate, loadImageFromUrl, mockGenerate } from '@/lib/pipeline';
 import { readParallel } from '@/lib/rate';
 import { canvasToPngBlob, mapWithLimit, pickSave, releaseCanvas, saveTo } from '@/lib/bg/batch';
 import { readSession, restingStatus, saveSession, sessionKey } from '@/lib/session-store';
@@ -242,14 +245,51 @@ export default function ImageGenerator() {
     [headers],
   );
 
+  /**
+   * Picked columns whose cells are image URLs. These stop being text and become REFERENCE IMAGES:
+   * each row's URL is fetched and attached to that row's request, so the model is shown the actual
+   * product rather than told a link to it.
+   *
+   * Derived from the sheet rather than asked for, because the answer is already in the data and a
+   * second picker for it would be a question with one correct answer. Unpicking the column in
+   * "Send in the prompt" is how you turn it off — the same control that governs every other
+   * column, doing the same thing.
+   */
+  const referenceColumns = React.useMemo(() => {
+    if (!records.length) return [] as string[];
+    const detected = new Set(detectImageColumns(headers, records));
+    return includedColumns.filter((header) => detected.has(header));
+  }, [headers, records, includedColumns]);
+  const referenceSet = React.useMemo(() => new Set(referenceColumns), [referenceColumns]);
+  // Assembled here rather than inline in JSX: the sentence wraps over several source lines, and
+  // JSX drops the space where a text run continues onto the next one — which silently produced
+  // "product_image holdsimage links".
+  /**
+   * The image URLs one row will be generated from. Subjects typed by hand have no sheet behind
+   * them, so they never have any.
+   */
+  const referencesFor = React.useCallback(
+    (item: GenItem) => (item.subject !== undefined
+      ? []
+      : referenceUrls(headers, item.record, referenceSet)),
+    [headers, referenceSet],
+  );
+
+  const referenceNote = React.useMemo(() => {
+    if (!referenceColumns.length) return '';
+    const cols = referenceColumns.join(' and ');
+    const verb = referenceColumns.length === 1 ? 'holds' : 'hold';
+    return `${cols} ${verb} image links, so every row's picture is fetched and sent to the model as a reference instead of as text.`;
+  }, [referenceColumns]);
+
   // The two row sources assemble differently, and every screen that shows a prompt — the cell,
   // the dialog, the length warning, the request itself — goes through here, so neither source
   // can end up displaying one thing and sending another.
   const promptFor = React.useCallback(
     (item: GenItem, base: string = brief) => (item.subject !== undefined
       ? buildSubjectPrompt(base, item.subject)
-      : buildRowPrompt(base, headers, item.record, excludedSet)),
-    [brief, headers, excludedSet],
+      : buildRowPrompt(base, headers, item.record, excludedSet, ROW_HEADING, referenceSet)),
+    [brief, headers, excludedSet, referenceSet],
   );
 
   /**
@@ -261,13 +301,17 @@ export default function ImageGenerator() {
     (item: GenItem) => {
       const block = item.subject !== undefined
         ? `${SUBJECT_HEADING}\n${item.subject.trim()}`
-        : buildRowPrompt('', headers, item.record, excludedSet);
+        : buildRowPrompt('', headers, item.record, excludedSet, ROW_HEADING, referenceSet);
       return block.startsWith('---\n') ? block.slice(4) : block;
     },
-    [headers, excludedSet],
+    [headers, excludedSet, referenceSet],
   );
   const promptForRef = React.useRef(promptFor);
   React.useEffect(() => { promptForRef.current = promptFor; }, [promptFor]);
+  // Same reason as promptFor: the run loop reads this across awaits and must see the committed
+  // value, not whichever render's closure it started in.
+  const referencesForRef = React.useRef(referencesFor);
+  React.useEffect(() => { referencesForRef.current = referencesFor; }, [referencesFor]);
 
   /**
    * The typed list, applied to the queue. A CSV outranks it — a run is driven by one source or
@@ -390,13 +434,43 @@ export default function ImageGenerator() {
     patchItem(item.id, { status: 'generating', errorMsg: undefined });
     const started = performance.now();
     try {
+      /**
+       * The row's reference images, when a picked column holds URLs.
+       *
+       * Fetched per row rather than once per sheet: each row points at its own product, and this
+       * is the same proxy Compose pulls catalogue images through. A URL that will not load fails
+       * the ROW rather than falling back to text-only — a silent fallback would return a picture
+       * that looks fine and was generated without the product it was supposed to be of, which is
+       * the one failure nobody would catch by eye across a few hundred tiles.
+       *
+       * Skipped entirely when editing from the latest result: that path's reference IS the
+       * previous output, which is what "redo from latest" means.
+       */
+      // The SAME function the grid previews with, so a cell can never show one picture and the
+      // request send another.
+      const refs = editing ? [] : referencesForRef.current(item);
+      let refImages: HTMLImageElement[] = [];
+      if (refs.length && !mock) {
+        try {
+          refImages = await Promise.all(refs.map((url) => loadImageFromUrl(url, signal)));
+        } catch (e) {
+          if ((e as Error).name === 'AbortError') throw e;
+          throw new Error(`Reference image failed to load — ${(e as Error).message}`);
+        }
+      }
+
       const image = mock
         ? await mockGenerate(prompt, 1024, signal)
         : editing
           // The size the set is being generated at, not 'auto': the input is already that
           // shape, and letting the model re-pick would break a row out of the set.
           ? await callAzure([item.image!], { endpoint, apiKey: azureKey, prompt, size, signal })
-          : await callAzureGenerate(prompt, { endpoint, apiKey: azureKey, size, signal });
+          : refImages.length
+            // With references attached this is an EDIT, not a generation — same endpoint Compose
+            // uses. `size` stays the set's, so one row having a portrait source cannot make it
+            // come back a different shape from its neighbours.
+            ? await callAzure(refImages, { endpoint, apiKey: azureKey, prompt, size, signal })
+            : await callAzureGenerate(prompt, { endpoint, apiKey: azureKey, size, signal });
       patchItem(item.id, {
         status: 'done',
         image,
@@ -855,6 +929,9 @@ export default function ImageGenerator() {
                     />
                     <FieldDescription>
                       Unpick anything the model should not see — internal IDs, statuses, links.
+                      {referenceNote && (
+                        <> <span className="text-foreground">{referenceNote}</span></>
+                      )}
                     </FieldDescription>
                   </Field>
                 </FieldGroup>
@@ -919,6 +996,7 @@ export default function ImageGenerator() {
               <GenGrid
                 items={visibleItems}
                 promptFor={promptFor}
+                referencesFor={referencesFor}
                 size={size}
                 running={busy}
                 selected={sel.checked}
@@ -1013,6 +1091,7 @@ export default function ImageGenerator() {
         item={openItem}
         defaultPrompt={brief}
         rowContext={openItem ? rowContextFor(openItem) : ''}
+        references={openItem ? referencesFor(openItem) : []}
         size={size}
         running={busy}
         onClose={() => setOpenId(null)}

@@ -21,6 +21,7 @@ import { Spinner } from '@/components/ui/spinner';
 import { RegenPrompt, type PromptSource } from '@/components/regen-prompt';
 import { ResultCell } from '@/components/result-cell';
 import { pickSave, saveTo } from '@/lib/bg/batch';
+import { proxiedImageUrl } from '@/lib/pipeline';
 import { GEN_ASPECT, genFileStem, type GenItem, type GenSize, type GenStatus } from '@/lib/gen';
 import { cn } from '@/lib/utils';
 
@@ -44,6 +45,7 @@ export function genStatusLine(item: GenItem): { text: string; error: boolean } {
 const GenCell = React.memo(function GenCell({
   item,
   prompt,
+  references,
   size,
   running,
   checked,
@@ -55,6 +57,8 @@ const GenCell = React.memo(function GenCell({
   item: GenItem;
   /** Live preview of what this row would send; the sent prompt wins once it exists. */
   prompt: string;
+  /** Image URLs this row will be generated from — empty unless a picked column holds links. */
+  references: readonly string[];
   /** The panel's output size — the cell reserves that shape before anything is generated. */
   size: GenSize;
   running: boolean;
@@ -84,6 +88,12 @@ const GenCell = React.memo(function GenCell({
       <div className={cn('relative grid place-items-center overflow-hidden rounded-lg border bg-muted/30 p-2', GEN_ASPECT[size])}>
         {src ? (
           <img src={src} alt="" className="max-h-full max-w-full min-h-0 min-w-0 object-contain" />
+        ) : references.length ? (
+          // What this row will be built FROM. Shown in place of the prompt because it answers the
+          // question the prompt cannot: whether the RIGHT product is attached. Getting that wrong
+          // is invisible in the text — every row's prompt looks correct while pointing at another
+          // row's picture — and only becomes obvious once a few hundred images have been paid for.
+          <ReferenceImages urls={references} />
         ) : (
           // Text rows have nothing to preview but themselves, so the cell shows the prompt.
           <p className="line-clamp-6 px-1 text-[11px] leading-snug text-muted-foreground">
@@ -100,9 +110,46 @@ const GenCell = React.memo(function GenCell({
   );
 });
 
+
+/**
+ * The pictures a row will be generated FROM, when a picked column holds image links.
+ *
+ * Pointed straight at the proxy rather than fetched into blobs, so the browser handles caching
+ * and `loading="lazy"` keeps a 3,000-row sheet from requesting 3,000 images to show four of them.
+ *
+ * A reference that will not load renders as nothing rather than as a broken-image glyph, and the
+ * cell falls back to its prompt — the run itself reports a bad URL as a row error, which is the
+ * right place for it; a preview is not the thing that should be raising the alarm.
+ */
+function ReferenceImages({ urls, className }: { urls: readonly string[]; className?: string }) {
+  const [broken, setBroken] = React.useState<ReadonlySet<string>>(() => new Set());
+  const usable = urls.filter((url) => !broken.has(url));
+  if (!usable.length) return null;
+  return (
+    // Absolutely filling a positioned parent, NOT `h-full`: both places this is used centre their
+    // child, which leaves that child's height content-based — so `max-h-full` had nothing definite
+    // to resolve against and a 500px source rendered at 263px inside an 86px box, cropped rather
+    // than fitted. inset-0 gives every image a definite height to be contained within.
+    <div className={cn('absolute inset-0 flex items-center justify-center gap-1 p-2', className)}>
+      {usable.map((url) => (
+        <img
+          key={url}
+          src={proxiedImageUrl(url)}
+          alt=""
+          loading="lazy"
+          decoding="async"
+          onError={() => setBroken((prev) => new Set(prev).add(url))}
+          className="h-full min-h-0 w-full min-w-0 flex-1 object-contain"
+        />
+      ))}
+    </div>
+  );
+}
+
 export function GenGrid({
   items,
   promptFor,
+  referencesFor,
   size,
   running,
   selected,
@@ -112,6 +159,7 @@ export function GenGrid({
 }: {
   items: GenItem[];
   promptFor: (item: GenItem) => string;
+  referencesFor: (item: GenItem) => string[];
   size: GenSize;
   running: boolean;
   selected: ReadonlySet<number>;
@@ -126,6 +174,7 @@ export function GenGrid({
           key={item.id}
           item={item}
           prompt={promptFor(item)}
+          references={referencesFor(item)}
           size={size}
           running={running}
           checked={selected.has(item.id)}
@@ -148,6 +197,7 @@ export function GenDialog({
   item,
   defaultPrompt,
   rowContext,
+  references,
   size,
   running,
   onClose,
@@ -159,6 +209,8 @@ export function GenDialog({
   defaultPrompt: string;
   /** Read-only row/subject block shown under "Send with the prompt", like Cleanup's CSV. */
   rowContext?: string;
+  /** Image URLs sent with this row's prompt — empty unless a picked column holds links. */
+  references?: readonly string[];
   size: GenSize;
   running: boolean;
   onClose: () => void;
@@ -183,6 +235,7 @@ export function GenDialog({
   }
 
   const line = item ? genStatusLine(item) : null;
+  const refs = references ?? [];
   return (
     <Dialog open={item !== null} onOpenChange={(open) => !open && onClose()}>
       {/* Cleanup's shell, verbatim: a fixed-height flex column — pinned header, one scrolling
@@ -224,6 +277,19 @@ export function GenDialog({
                       <span className="text-xs text-muted-foreground">Not generated yet</span>
                     )}
                   </div>
+                  {/* Kept visible even once the result exists, which the cell does not do: this is
+                      the one screen where the two can be compared, and "did it actually follow the
+                      product?" is the question a generated set gets judged on. */}
+                  {refs.length > 0 && (
+                    <>
+                      <div className="mt-1.5 text-xs text-muted-foreground">
+                        Reference{refs.length === 1 ? '' : 's'} sent with the prompt
+                      </div>
+                      <div className="relative h-24 w-full overflow-hidden rounded-lg border bg-muted/30">
+                        <ReferenceImages urls={refs} />
+                      </div>
+                    </>
+                  )}
                 </div>
 
                 {/* Same trick as Cleanup's AI tab: a relative cell the console fills absolutely,

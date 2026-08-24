@@ -14,6 +14,16 @@ export const ROW_HEADING = 'Generate an image for this row:';
 export const SUBJECT_HEADING = 'Generate an image of:';
 
 /**
+ * What a cell reads as once its URL is being sent as an actual image instead of as text.
+ *
+ * The URL itself is deliberately not in the prompt. A model cannot fetch it, so at best the
+ * string is ignored and at worst it gets rendered as literal text somewhere in the picture —
+ * while the thing the column actually means has already been attached to the request. Naming the
+ * column and saying what happened to it keeps the preview honest about what was sent.
+ */
+export const REFERENCE_MARKER = '(attached as a reference image)';
+
+/**
  * base prompt + the row's cells, each labelled with its column header.
  *
  * Column names are sent, not just values: "subject: a diya lamp" carries intent that a bare
@@ -32,12 +42,17 @@ export function buildRowPrompt(
   record: CsvRecord,
   excluded: ReadonlySet<string> = new Set(),
   heading: string = ROW_HEADING,
+  /**
+   * Columns whose cells are image URLs being sent as reference images rather than as text. Their
+   * values are replaced with REFERENCE_MARKER — see the note on that constant.
+   */
+  references: ReadonlySet<string> = new Set(),
 ): string {
   const rowBlock = headers
     .filter((header) => !excluded.has(header))
     .map((header) => [header, (record[header] ?? '').trim()] as const)
     .filter(([, value]) => value.length > 0)
-    .map(([header, value]) => `${header}: ${value}`)
+    .map(([header, value]) => `${header}: ${references.has(header) ? REFERENCE_MARKER : value}`)
     .join('\n');
 
   const parts: string[] = [];
@@ -71,3 +86,21 @@ export function isPromptEmpty(prompt: string): boolean {
 // Azure rejects oversized prompts outright; warn well before that so a long brief is caught
 // while it is still editable rather than N failed requests later.
 export const PROMPT_WARN_CHARS = 30_000;
+
+/**
+ * The image URLs a row contributes, in column order, for the picked reference columns.
+ *
+ * Order matters and is the sheet's: a brief that says "use the first image for the pack and the
+ * second for the flavour" is only meaningful if the request receives them the same way round for
+ * every row.
+ */
+export function referenceUrls(
+  headers: string[],
+  record: CsvRecord,
+  references: ReadonlySet<string>,
+): string[] {
+  return headers
+    .filter((header) => references.has(header))
+    .map((header) => (record[header] ?? '').trim())
+    .filter((value) => /^https?:\/\/\S+$/i.test(value));
+}
