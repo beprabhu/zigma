@@ -1,6 +1,6 @@
 'use client';
 
-// One-time import of the old single-session crash net (lib/bg/autosave.ts's "zesku-bg-autosave")
+// One-time import of the old single-session crash net (the "zesku-bg-autosave" database)
 // into the file store, as one pinned Cleanup file.
 //
 // This is what turns the modal into a card. The old store held exactly one unnamed session and
@@ -235,7 +235,7 @@ async function importOldSession(fileId: string): Promise<number> {
     let ledger: unknown = null;
     if (db.objectStoreNames.contains(OLD_META)) {
       // Both come back FLAT — the old meta store is keyed by `key`, so the payload fields sit
-      // beside it on the record rather than under a `value` (lib/bg/autosave.ts:252-262).
+      // beside it on the record rather than under a `value`.
       csv = await oldTx<unknown>(db, [OLD_META], 'readonly', (tx) =>
         tx.objectStore(OLD_META).get(OLD_CSV_KEY),
       );

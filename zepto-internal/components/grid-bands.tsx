@@ -114,6 +114,28 @@ function RowNumberField({
   disabled: boolean;
   onCommit: (next: number) => void;
 }) {
+  /**
+   * What is being typed, held back from the band until it is finished.
+   *
+   * This field resizes a band, and resizing a band used to destroy the tiles outside the new
+   * window — so committing per keystroke meant every intermediate value was a real, irreversible
+   * edit. Clearing the field to retype committed `min` (`Number('') === 0`, which passes
+   * `Number.isFinite`), which for the tiles field is zero: the whole band, gone before the first
+   * digit landed. Typing `10` over `8` went through `1`.
+   *
+   * setBandCount is non-destructive now, but the field still has no business publishing halfway
+   * states — a band flashing down to one tile mid-keystroke reads as data loss even when it is
+   * recoverable, and each intermediate value costs a full re-derive of the band's slice.
+   * Enter and blur commit; Escape abandons.
+   */
+  const [draft, setDraft] = React.useState<string | null>(null);
+  const commit = (raw: string) => {
+    setDraft(null);
+    // An empty or unparseable field means "no change", never zero.
+    if (raw.trim() === '' || !Number.isFinite(Number(raw))) return;
+    const next = clamp(raw, min, max, value);
+    if (next !== value) onCommit(next);
+  };
   return (
     <InputGroup className="h-7 w-auto rounded-md">
       <InputGroupInput
@@ -123,9 +145,14 @@ function RowNumberField({
         aria-label={label}
         min={min}
         max={max}
-        value={value}
+        value={draft ?? String(value)}
         disabled={disabled}
-        onChange={(e) => onCommit(clamp(e.target.value, min, max, value))}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={(e) => commit(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') { e.preventDefault(); commit(e.currentTarget.value); }
+          else if (e.key === 'Escape') { e.preventDefault(); setDraft(null); }
+        }}
         className="h-7 w-11 flex-none px-2 py-0 text-sm tabular-nums [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
       />
       <InputGroupAddon align="inline-end" className="pr-2 pl-0 text-xs font-normal">

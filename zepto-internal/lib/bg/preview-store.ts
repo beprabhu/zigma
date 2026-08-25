@@ -325,8 +325,3 @@ export function clearPreviews(): void {
   failures.clear();
   for (const cacheKey of held) notify(cacheKey);
 }
-
-/** For diagnostics and tests. */
-export function previewStats(): { entries: number; approxBytes: number; inFlight: number } {
-  return { entries: cache.size, approxBytes: cachedBytes, inFlight: inFlight.size };
-}

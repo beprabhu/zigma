@@ -146,7 +146,23 @@ export const composeCodec: ToolCodec<QueueItem, ComposeDoc> = {
   // `compressed` is deliberately absent: it is a cache the page invalidates whenever the template
   // changes, so putting it in the signature would rewrite every row on a slider drag — and putting
   // it in the record would store bytes that are wrong the moment the template moves.
-  signatureOf: (item) => [item.resultImage, item.title, item.offer, item.status],
+  //
+  // `urls` is here as a joined string, not as the array. It has to be here at all because a
+  // corrected image-column mapping (remapItem) can move nothing else — a composed row keeps its
+  // tile, its text and its 'done' — and `urls` is what a restored row reads its pictures back out
+  // of, so an omitted change means reopening the file re-fetches the wrong column forever. It
+  // cannot be the array itself: the comparison is elementwise by IDENTITY and the page rebuilds
+  // this array on every remap, so a live reference would differ on every pass and re-put the queue.
+  signatureOf: (item) => [
+    item.resultImage,
+    item.title,
+    item.offer,
+    item.status,
+    item.row,
+    // NUL as the joiner, so no cell's own contents can forge a boundary and let two genuinely
+    // different mappings compare equal.
+    item.urls.join('\u0000'),
+  ],
 
   async recordOf(item: QueueItem): Promise<ItemPayload | null> {
     const hasResult = !!item.resultImage;

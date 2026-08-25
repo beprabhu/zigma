@@ -2,8 +2,8 @@
 
 // Mirrors a tool's queue and document into one file, and reads them back.
 //
-// This replaces useAutosave (lib/bg/autosave.ts:539). The mechanism it keeps is the good part of
-// that module — a single-runner pump diffing identity signatures, marking `known` only AFTER a
+// This replaces the BG remover's useAutosave. The mechanism it keeps is the good part of that
+// module — a single-runner pump diffing identity signatures, marking `known` only AFTER a
 // chunk commits, chunked writes, deletes before puts, a visible `failing` flag with a timed retry.
 // What it drops is the restore/discard dialog, and the three-phase 'boot' | 'held' | 'active' gate
 // that existed to support it.
@@ -30,7 +30,6 @@ import {
   patchFile,
   readFile,
   readMeta,
-  releaseLock,
   setKept as setKeptOnDisk,
   subscribe,
   sumBlobBytes,
@@ -251,7 +250,7 @@ export function useFileStore<TItem, TDoc>(
     if (want === undefined) return;
     if (slot.written !== undefined && sameHeader(want, slot.written)) return;
     // Nothing authored yet: no header, so a rail click alone never litters the grid with an empty
-    // Untitled card. The same rule the old module applied to draft rows (autosave.ts:9-10), one
+    // Untitled card. The same drafts rule the old module applied to rows, one
     // level up.
     if (!want.hasContent && !mintedRef.current) return;
 
@@ -279,6 +278,12 @@ export function useFileStore<TItem, TDoc>(
           // Content only. Bumping this on open would hand every card the user merely looked at
           // another week of life, and the 7-day sweep reads exactly this field.
           updatedAt: at,
+          // A file being written into is alive, whatever the sweep decided about it a week ago.
+          // Trash is not read-only — a card there still opens and edits — so carrying the old
+          // stamp forward would leave a file someone has been working in for weeks matching the
+          // purge branch, which weighs `deletedAt` against PURGE_MS and never looks at the work
+          // since. Resuming a file has to give it its own week back; only the sweep sets this.
+          deletedAt: null,
         };
       });
       mintedRef.current = true;
@@ -711,4 +716,3 @@ function docName<TItem, TDoc>(codec: ToolCodec<TItem, TDoc>, doc: TDoc): string 
   return typeof name === 'string' ? name : '';
 }
 
-export { releaseLock };

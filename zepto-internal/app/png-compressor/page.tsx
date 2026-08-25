@@ -188,6 +188,11 @@ function PngCompressorFile() {
     ]);
   }, []);
 
+  // The run loop reads the queue across awaits, so it needs the committed value, not the closure
+  // it started under — a row trashed mid-run is invisible to the pending list captured at the top.
+  const itemsRef = React.useRef<PngItem[]>(items);
+  React.useEffect(() => { itemsRef.current = items; }, [items]);
+
   // The unmount cleanup runs once, so its closure is the FIRST render's. Everything it needs is
   // mirrored here on every commit instead.
   const sessionRef = React.useRef<PngSession>({
@@ -233,8 +238,15 @@ function PngCompressorFile() {
     return () => window.removeEventListener('paste', onPaste);
   }, [addFiles]);
 
+  /** Runs one row. Reports whether it actually produced an output, which is not the same as
+   *  having been reached: Stop skips rows, and rows can be trashed while the batch runs. */
   const compressOne = React.useCallback(
-    async (item: PngItem, signal: AbortSignal) => {
+    async (item: PngItem, signal: AbortSignal): Promise<boolean> => {
+      // The batch works off a list captured before the run started, so both of these arrive here
+      // as normal work: a row queued behind a Stop, and a row the user trashed while earlier rows
+      // were still compressing. Neither may be touched — the first because "the rest are
+      // untouched" is what Stop promises, the second because nothing holds the row any more.
+      if (signal.aborted || !itemsRef.current.some((it) => it.id === item.id)) return false;
       // A row restored from disk carries its result but not its source — inputs are never
       // persisted (see PngItem.file). Nothing routes such a row here today, because restored rows
       // arrive 'done' and only queued/errored ones are run; this says so out loud rather than
@@ -244,7 +256,7 @@ function PngCompressorFile() {
           status: 'error',
           error: 'Original not saved — drop the file again to re-compress it.',
         });
-        return;
+        return false;
       }
       patch(item.id, { status: 'working', error: undefined });
       try {
@@ -260,13 +272,20 @@ function PngCompressorFile() {
         }
         const bytes = await compressPng(source, { colors, lossless, signal });
         const output = new Blob([bytes as BlobPart], { type: 'image/png' });
+        // Asked again on the way out, because the row could have gone while its bytes were in
+        // flight. Minting a url for a row that is no longer in the queue leaks it outright: the
+        // patch below lands on nothing, so no download link ever holds it and no removal path
+        // ever hands it back.
+        if (!itemsRef.current.some((it) => it.id === item.id)) return false;
         patch(item.id, { status: 'done', output, outputUrl: URL.createObjectURL(output) });
+        return true;
       } catch (e) {
         if ((e as Error).name === 'AbortError') {
           patch(item.id, { status: 'queued' });
         } else {
           patch(item.id, { status: 'error', error: (e as Error).message });
         }
+        return false;
       }
     },
     [colors, lossless, patch, proc],
@@ -278,22 +297,27 @@ function PngCompressorFile() {
     const controller = new AbortController();
     abortRef.current = controller;
     setRunning(true);
+    // Two counters, because they answer different questions. `finished` is how far the run has
+    // got and drives the bar — a row skipped by Stop or dropped by an error still moves it, or an
+    // aborted batch would leave the hairline stranded. `compressed` is how many files actually
+    // came out the other side, and is the only honest number for the text.
     let finished = 0;
+    let compressed = 0;
     setProgress({ pct: 0, text: `0 of ${pending.length} compressed…` });
     try {
       await mapWithLimit(pending, 3, async (item) => {
-        await compressOne(item, controller.signal);
+        if (await compressOne(item, controller.signal)) compressed++;
         finished++;
         setProgress({
           pct: (finished / pending.length) * 100,
-          text: `${finished} of ${pending.length} compressed…`,
+          text: `${compressed} of ${pending.length} compressed…`,
         });
       });
     } finally {
       setProgress(
         controller.signal.aborted
-          ? { pct: 100, text: `Stopped — ${finished} of ${pending.length} compressed; the rest are untouched.` }
-          : { pct: 100, text: `Done — ${finished} of ${pending.length} files compressed.` },
+          ? { pct: 100, text: `Stopped — ${compressed} of ${pending.length} compressed; the rest are untouched.` }
+          : { pct: 100, text: `Done — ${compressed} of ${pending.length} files compressed.` },
       );
       setRunning(false);
       abortRef.current = null;
@@ -305,10 +329,19 @@ function PngCompressorFile() {
     if (!done.length) return;
     // The outputs are already Blobs — hand them to the zip as-is instead of materializing
     // every compressed PNG into memory first.
-    const entries: ZipStreamEntry[] = done.map((it) => ({
-      name: tinyName(it.name),
-      data: it.output!,
-    }));
+    const used = new Map<string, number>();
+    const entries: ZipStreamEntry[] = done.map((it) => {
+      // Two sources from different folders can share a basename, and the queue is flat, so
+      // repeats get -2, -3 rather than writing one entry twice and losing all but the last on
+      // extract. Same rule as Compose's and Generate's exports.
+      const stem = tinyName(it.name).replace(/\.png$/i, '');
+      const seen = (used.get(stem) ?? 0) + 1;
+      used.set(stem, seen);
+      return {
+        name: seen === 1 ? `${stem}.png` : `${stem}-${seen}.png`,
+        data: it.output!,
+      };
+    });
     const url = URL.createObjectURL(await buildZipStream(entries));
     const a = document.createElement('a');
     a.href = url;
@@ -387,7 +420,13 @@ function PngCompressorFile() {
                 <ClearAllButton
                   title="Clear the queue?"
                   disabled={running || fileLoading}
-                  onConfirm={() => setItems([])}
+                  // Hand the urls back on the way out. Dropping the rows is the last reference
+                  // to them, and the unmount sweep only ever sees rows that are still in the
+                  // queue — whatever leaves it early has to release itself.
+                  onConfirm={() => {
+                    items.forEach(releasePngItem);
+                    setItems([]);
+                  }}
                   description={
                     <>
                       Removes all {items.length} file{items.length === 1 ? '' : 's'}, including
@@ -470,7 +509,12 @@ function PngCompressorFile() {
                     size="icon"
                     className="size-8"
                     disabled={it.status === 'working'}
-                    onClick={() => setItems((prev) => prev.filter((p) => p.id !== it.id))}
+                    // Released here for the same reason Clear all does it: this row is about to
+                    // stop being reachable, and nothing downstream revokes what it was holding.
+                    onClick={() => {
+                      releasePngItem(it);
+                      setItems((prev) => prev.filter((p) => p.id !== it.id));
+                    }}
                   >
                     <Trash2Icon />
                   </Button>

@@ -36,7 +36,6 @@ import {
 import { Spinner } from '@/components/ui/spinner';
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
-import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 
 import { ResultCell } from '@/components/result-cell';
 import { BUDGET_KB_MIN, BudgetControls } from '@/components/budget-controls';
@@ -58,7 +57,7 @@ import {
   type BgModelId, type LoadProgress, type RemoveResult, type RemoveStage,
 } from '@/lib/bg/engine';
 import {
-  DEFAULT_SAFE_AREA, TRANSPARENT, renderTile, scaleBounds, subjectBounds,
+  DEFAULT_SAFE_AREA, renderTile, scaleBounds, subjectBounds,
   type SafeAreaConfig,
 } from '@/lib/bg/safe-area';
 import {
@@ -91,7 +90,6 @@ import { VERIFY_MODEL_ID, compareCutouts, filteredRects } from '@/lib/bg/verify'
 import { askSemantic, probeSemanticSidecar } from '@/lib/bg/semantic';
 import { QueueFilters } from '@/components/bg-remover/queue-filters';
 import { QueueSearch, matchesTerms, searchTerms } from '@/components/queue-search';
-import { ColorPicker } from '@/components/color-picker';
 import { ColumnPicker } from '@/components/column-picker';
 import { normalizeNameColumns } from '@/lib/csv-name';
 import { BatchPromptDialog, resolvePromptSource, type PromptSource } from '@/components/regen-prompt';
@@ -119,8 +117,6 @@ import { buildZipStream, type ZipStreamEntry } from '@/lib/zip';
 import { cn } from '@/lib/utils';
 import { usePersistedState } from '@/hooks/use-persisted-state';
 
-const WHITE = '#ffffff';
-const DEFAULT_CUSTOM_BG = '#f4f4f5';
 // Select sentinel for "no name column" — Base UI Select values must be non-empty strings.
 // Two pooled workers plus two images decoding ahead of them.
 const POOL_CONCURRENCY = 4;
@@ -325,7 +321,7 @@ function BgRemoverFile() {
   const outputBg = safeArea.background;
   const setOutputBg = React.useCallback(
     (next: string) => setSafeArea((prev) => ({ ...prev, background: next })),
-    [],
+    [setSafeArea],
   );
   // Azure credentials are the compositor's own keys, read from the same storage so the two
   // products never hold different values; only the default prompt is this product's.
@@ -451,8 +447,12 @@ function BgRemoverFile() {
        * every ledger change, and it names its members by id — so it is the only copy that is
        * still right after a reshape.
        */
+      const storedLedger = (loaded.meta[LEDGER_KEY] as ExportedBatch[] | undefined) ?? [];
+      // Held so the mirror can carry these batches forward — this session will never be able to
+      // rebuild them into BatchRecords, so this is their only surviving copy.
+      restoredLedgerRef.current = storedLedger;
       const shipped = new Map<number, number>();
-      for (const row of (loaded.meta[LEDGER_KEY] as ExportedBatch[] | undefined) ?? []) {
+      for (const row of storedLedger) {
         for (const id of row.ids) shipped.set(id, row.batch);
       }
       const restored = shipped.size
@@ -544,6 +544,16 @@ function BgRemoverFile() {
   const wasRunningRef = React.useRef(false);
   /** Ids per shipped batch — what the crash net needs to re-stamp a restored queue. */
   const batchIdsRef = React.useRef(new Map<number, number[]>());
+  /**
+   * The ledger rows this file was opened with, kept exactly as they were read.
+   *
+   * `ledger` cannot hold them — a BatchRecord owns a WeakSet of blob identities that die with the
+   * tab, which is why a reopened file shows those batches as 'unknown' rather than pretending to
+   * know what shipped. But their MEMBERSHIP is still true and still the only thing standing
+   * between a shipped image and a second trip through the exporter, so the mirror carries them
+   * forward untouched. See the mirror effect for the failure this prevents.
+   */
+  const restoredLedgerRef = React.useRef<ExportedBatch[]>([]);
   const allocFloorRef = React.useRef<Allocation>(
     opened.snapshot?.allocFloor ?? { batch: 1, offset: 0 },
   );
@@ -636,6 +646,8 @@ function BgRemoverFile() {
   // Mirrors verifyingRef for rendering. The sweep drives the progress bar and holds the pool,
   // so it is a visible working phase and must be stoppable — the Stop button renders on this.
   const [verifying, setVerifying] = React.useState(false);
+  /** Mirrors semanticRef so the Stop button can see the sweep — see runSemanticSweep. */
+  const [semanticSweeping, setSemanticSweeping] = React.useState(false);
   /** The removal run's line. Owned by runBatchInner alone — see exportProgress. */
   const [progress, setProgress] = React.useState<{ pct: number; text: string } | null>(null);
   /** The Azure phase's own progress line — it may run concurrently with a removal batch. */
@@ -1255,19 +1267,33 @@ function BgRemoverFile() {
   // time, under different numbers.
   const ledgerMirrored = React.useRef(false);
   React.useEffect(() => {
-    if (!ledger.length && !ledgerMirrored.current) return;
+    if (!ledger.length && !restoredLedgerRef.current.length && !ledgerMirrored.current) return;
     ledgerMirrored.current = true;
-    setFileMeta(
-      LEDGER_KEY,
-      ledger.length
-        ? ledger.map((row) => ({
-            batch: row.batch,
-            ids: batchIdsRef.current.get(row.batch) ?? [],
-            exportedAt: row.savedAt,
-            fileName: row.fileName ?? '',
-          }))
-        : null,
-    );
+    const live = ledger.map((row) => ({
+      batch: row.batch,
+      ids: batchIdsRef.current.get(row.batch) ?? [],
+      exportedAt: row.savedAt,
+      fileName: row.fileName ?? '',
+    }));
+    /**
+     * Batches this session never wrote, carried forward verbatim.
+     *
+     * `ledger` holds live BatchRecords, which cannot be serialized (they own a WeakSet over blob
+     * identities) and so start EMPTY after every reload — the session snapshot is the only thing
+     * that ever refilled them. Emitting `ledger` alone therefore replaced the durable record with
+     * whatever this session happened to seal: on the first export after reopening a file, every
+     * earlier batch's id list vanished, the restore path read those rows as "stamped but in no
+     * ledger row", stripped their stamps, and images already shipped to the CDN re-entered the
+     * clean cohort and went out again under different numbers.
+     *
+     * The union is safe because the only thing that retires a batch is a reshape, and reshaping is
+     * refused for restored batches (canMergeBatches / planSplit both reject `staleness: 'unknown'`)
+     * — so a restored row can never be one this session was supposed to drop.
+     */
+    const liveBatches = new Set(ledger.map((row) => row.batch));
+    const carried = restoredLedgerRef.current.filter((row) => !liveBatches.has(row.batch));
+    const merged = [...carried, ...live].sort((a, b) => a.batch - b.batch);
+    setFileMeta(LEDGER_KEY, merged.length ? merged : null);
   }, [ledger, setFileMeta]);
 
   // Mirrors the sheet alongside the items. The ref stops a fresh mount from writing a null before
@@ -1609,6 +1635,10 @@ function BgRemoverFile() {
         // from a live run. Leaving the mark set would keep the row permanently out of the
         // verify band and out of the clean cohorts, for a file it no longer resembles.
         qualityUnknown: undefined,
+        // A person's override belongs to the cutout they judged. Carried onto a new matte it is
+        // an unexamined verdict: a stale 'clear' walks a bad result straight into a clean batch
+        // ahead of every heuristic, and a stale 'flag' pins a fixed image out of one forever.
+        manualFlag: undefined,
         error: undefined,
       },
       (live) => ({ status: live.cutout ? 'done' : 'ready', original: null }),
@@ -1782,6 +1812,10 @@ function BgRemoverFile() {
   async function runSemanticSweep() {
     if (!semanticPass || runningRef.current || semanticRef.current) return;
     semanticRef.current = true;
+    // Mirrored into state, not just the ref: the Stop button renders off state, and without this
+    // a post-batch semantic sweep — sequential, one paid VLM call per image, an hour or more on a
+    // large queue — drew a progress bar with no way to stop it short of leaving the product.
+    setSemanticSweeping(true);
     const ctrl = new AbortController();
     semanticAbortRef.current = ctrl;
     let checked = 0;
@@ -1850,6 +1884,7 @@ function BgRemoverFile() {
     } finally {
       semanticRef.current = false;
       semanticAbortRef.current = null;
+      setSemanticSweeping(false);
     }
   }
 
@@ -2085,6 +2120,12 @@ function BgRemoverFile() {
       if (src.kind === 'archived') return null; // callers exclude this via canRetry
       const loaded =
         src.kind === 'url' ? await loadImageFromUrl(src.url) : await loadImageFromFile(src.file);
+      // loadImageFromFile deliberately leaves its object URL alive — item.original normally takes
+      // ownership and releaseItem frees it later. Nothing takes ownership here: the patch below
+      // sets `original` to the AZURE OUTPUT, so this element is unreachable the moment the edit
+      // lands. Left alone it pinned a full-resolution blob per edit for the life of the tab, and a
+      // "fix flagged" pass over a few thousand images pinned a few thousand.
+      const editInputUrl = src.kind === 'file' ? loaded.src : null;
       const source = aiFocusCrop ? await cropToHero(item, loaded) : loaded;
       const edited = mock
         ? await mockComposite([source])
@@ -2121,6 +2162,8 @@ function BgRemoverFile() {
         status: 'ready',
         error: undefined,
         durationMs: undefined,
+        // See cutOut: the override described the matte this edit just replaced.
+        manualFlag: undefined,
         // Undo restores the pre-edit input AND its cutout in one step — with the evidence
         // that was measured from that cutout, not the AI run's.
         prev: { source: item.source, cutout: item.cutout, ...cutoutEvidence(item) },
@@ -2130,6 +2173,7 @@ function BgRemoverFile() {
         originalSource: item.originalSource ?? item.source,
       };
       patchItem(item.id, patch);
+      if (editInputUrl) URL.revokeObjectURL(editInputUrl);
       return { ...item, ...patch };
     } catch (e) {
       if (isAbortError(e)) {
@@ -2152,6 +2196,10 @@ function BgRemoverFile() {
     const controller = new AbortController();
     aiAbortRef.current = controller;
     setAiFixing(true);
+    // A manual send is an attempt, exactly as it is in aiEditMany. Without this the auto-fix
+    // watcher sees an image it has no record of trying, and an edit that comes back still flagged
+    // is immediately sent to Azure a second time — the double-spend the set exists to prevent.
+    aiAttemptedRef.current.add(item.id);
     let updated: BgItem | null = null;
     try {
       // The dialog's per-image prompt wins for this one run; blank falls back to the default,
@@ -2277,6 +2325,8 @@ function BgRemoverFile() {
       status: 'ready',
       error: undefined,
       durationMs: undefined,
+      // The spread would carry the override onto whatever the redo produces — see cutOut.
+      manualFlag: undefined,
       prev: { source: item.source, cutout: item.cutout, ...cutoutEvidence(item) },
     };
     patchItem(item.id, reset);
@@ -2308,6 +2358,7 @@ function BgRemoverFile() {
       verify: item.prev.verify,
       semantic: item.prev.semantic,
       bands: item.prev.bands,
+      manualFlag: item.prev.manualFlag,
     });
   }
 
@@ -2338,6 +2389,7 @@ function BgRemoverFile() {
       status: 'ready' as const,
       error: undefined,
       durationMs: undefined,
+      manualFlag: undefined,
       prev: { source: it.source, cutout: it.cutout, ...cutoutEvidence(it) },
     }));
     for (const r of resets) dropPreview(r.id);
@@ -2404,6 +2456,7 @@ function BgRemoverFile() {
     abortRef.current?.abort();
     aiAbortRef.current?.abort();
     verifyAbortRef.current?.abort();
+    semanticAbortRef.current?.abort();
     // from_pretrained takes no signal, so a download in flight runs to completion and the abort
     // only lands at the next checkpoint. Say so, or a 452 MB fetch looks like a hung button.
     if (stage === 'loading') {
@@ -3203,7 +3256,7 @@ function BgRemoverFile() {
             ? 'All images cut out'
             : 'Nothing queued'}
       </Button>
-      {(running || aiFixing || verifying) && (
+      {(running || aiFixing || verifying || semanticSweeping) && (
         <Button variant="outline" onClick={handleCancel}>
           <CircleStopIcon data-icon="inline-start" />
           Stop
@@ -3532,6 +3585,18 @@ function BgRemoverFile() {
                               ? `${items.length.toLocaleString()} image${items.length === 1 ? '' : 's'}`
                               : `${displayItems.length.toLocaleString()} of ${items.length.toLocaleString()}`
                         }
+                      />
+                      {/* The way back in. The canvas dropzone is the empty state, so once a
+                          queue exists it unmounts — and with it the only visible way to add
+                          more. The window drop and paste handlers below cover the gestures;
+                          this covers the click, which is the only one a menu can teach. */}
+                      <ImageDropzone
+                        size="button"
+                        onAdd={handleAdd}
+                        onCsv={handleCsv}
+                        onProject={(file) => void handleProject(file)}
+                        itemCount={items.length}
+                        disabled={inputsLocked}
                       />
                       <ClearAllButton
                         title="Clear the queue?"

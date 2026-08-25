@@ -20,7 +20,7 @@ export interface PngItem {
    * Null is the honest answer rather than an inconvenience. Inputs are deliberately NOT persisted:
    * they are sitting on the user's disk, re-dropping them costs a drag, and writing every original
    * would double what this tool occupies in a store now shared by four products (the rule
-   * lib/bg/autosave.ts:9-10 set, applied here). What IS worth keeping is the compressed output —
+   * drafts rule, applied here). What IS worth keeping is the compressed output —
    * that took a pngquant + oxipng round trip to produce.
    *
    * Everything that needs the bytes therefore has to check: a restored row can be downloaded,

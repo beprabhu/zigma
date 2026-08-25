@@ -17,7 +17,8 @@
 
 import { buildZipStream, readZipIndex, type ZipStreamEntry } from '../zip';
 import { normalizeNameColumns } from '../csv-name';
-import type { BgCutout, BgItem, BgItemSource, BgVerify, CsvOrigin } from './batch';
+import type { DetectedBand } from './bands';
+import type { BgCutout, BgItem, BgItemSource, BgSemantic, BgVerify, CsvOrigin } from './batch';
 import type { InkFootprint, OriginalComponentReport, RegionReport } from './regions';
 import { ANCHORS, DEFAULT_SAFE_AREA, type SafeAreaConfig, type SubjectBounds } from './safe-area';
 
@@ -82,7 +83,7 @@ interface ManifestItem {
   manualFlag?: 'flag' | 'clear';
   /**
    * v2: the embedded original is an AI edit's output, not a dropped input. Autosave decides
-   * which file sources are worth persisting from this flag (lib/bg/autosave.ts recordOf), so
+   * which file sources are worth persisting from this flag, so
    * losing it on a reopen quietly drops paid Azure bytes out of crash recovery.
    */
   regenerated?: boolean;
@@ -117,6 +118,19 @@ interface ManifestItem {
   components?: OriginalComponentReport[];
   /** v2-additive: the second-model cross-check verdict, when the verify sweep ran one. */
   verify?: BgVerify;
+  /**
+   * v2-additive: the semantic sidecar's verdict, when that pass ran. Dropping it costs twice —
+   * every flag whose only evidence was "something besides the product" clears on reopen, and the
+   * sidecar is billed again for the whole queue because no row can say it was already asked.
+   */
+  semantic?: BgSemantic;
+  /**
+   * v2-additive: the flat edge strips masked out of the matte. Nothing else in the manifest
+   * records them — bands run after component survival is measured and before the region report
+   * is built — so without them a reopened project shows a masked strip as neither kept nor
+   * removed, with the element table still claiming it survived intact.
+   */
+  bands?: DetectedBand[];
 }
 
 /** Where the CSV text lives and how its columns were mapped; the text itself is a zip entry. */
@@ -269,6 +283,57 @@ function parseComponents(raw: unknown[]): OriginalComponentReport[] {
     });
   }
   return out;
+}
+
+/** Same trim as packRegions: `fill` arrives as a full double and no reader needs the digits. */
+function packBands(bands: DetectedBand[]): DetectedBand[] {
+  return bands.map((band) => ({
+    x: band.x,
+    y: band.y,
+    width: band.width,
+    height: band.height,
+    fill: Math.round(band.fill * 1000) / 1000,
+    covered: band.covered,
+  }));
+}
+
+/**
+ * Field-by-field, like parseRegions. A strip is printed as evidence ("2 flat edge strips masked
+ * out (120×900, …)"), so a wrong-typed box would put NaN×NaN in front of someone deciding
+ * whether the pipeline ate a badge. A degenerate box describes no strip at all and is dropped.
+ */
+function parseBands(raw: unknown[]): DetectedBand[] {
+  const out: DetectedBand[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue;
+    const b = entry as Partial<DetectedBand>;
+    const width = Math.round(num(b.width, 0));
+    const height = Math.round(num(b.height, 0));
+    if (width <= 0 || height <= 0) continue;
+    out.push({
+      x: Math.round(num(b.x, 0)),
+      y: Math.round(num(b.y, 0)),
+      width,
+      height,
+      fill: num(b.fill, 0),
+      covered: Math.round(num(b.covered, 0)),
+    });
+  }
+  return out;
+}
+
+/**
+ * `extra` is validated rather than coerced with `=== true`, for the same reason as verify's
+ * `agree`: a stored verdict is what keeps the sweep from asking again (the pass skips any row
+ * that already has one), so a truncated record read as "nothing found" would sit there
+ * permanently unchecked. `what` is only the words the tooltip prints — absent, the verdict still
+ * reads true and assessQuality falls back to its unnamed wording.
+ */
+function parseSemantic(raw: unknown): BgSemantic | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const s = raw as Partial<BgSemantic>;
+  if (typeof s.model !== 'string' || typeof s.extra !== 'boolean') return null;
+  return { model: s.model, extra: s.extra, what: typeof s.what === 'string' ? s.what : '' };
 }
 
 /**
@@ -430,6 +495,19 @@ export async function saveProject(
             },
           }
         : null),
+      // Paid inference, same as verify: a verdict that does not survive the round trip is both a
+      // flag lost (nothing else in the manifest can say a bowl was in the frame) and a sidecar
+      // call re-billed for every row the next time the pass runs.
+      ...(item.semantic
+        ? {
+            semantic: {
+              model: item.semantic.model,
+              extra: item.semantic.extra,
+              what: item.semantic.what,
+            },
+          }
+        : null),
+      ...(item.bands?.length ? { bands: packBands(item.bands) } : null),
       ...(item.csv ? { csv: { row: item.csv.row, column: item.csv.column } } : null),
       // Only a URL survives the round trip: an original that was a dropped FILE is already
       // embedded under originals/ when the save includes them, and re-embedding it a second
@@ -497,6 +575,8 @@ export interface RestoredItem {
   originalInk?: InkFootprint;
   components?: OriginalComponentReport[];
   verify?: BgVerify;
+  semantic?: BgSemantic;
+  bands?: DetectedBand[];
 }
 
 export interface RestoredProject {
@@ -661,6 +741,11 @@ export async function loadProject(file: File): Promise<RestoredProject> {
           const verify = parseVerify(rec.verify);
           return verify ? { verify } : null;
         })(),
+        ...(() => {
+          const semantic = parseSemantic(rec.semantic);
+          return semantic ? { semantic } : null;
+        })(),
+        ...(Array.isArray(rec.bands) ? { bands: parseBands(rec.bands) } : null),
       });
     }
   }

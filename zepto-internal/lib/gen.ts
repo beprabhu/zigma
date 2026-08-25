@@ -106,6 +106,19 @@ export function reconcileSubjectItems(subjects: string[], existing: GenItem[]): 
  * NEW row without its old image — deliberate: the image was generated from the old values, and
  * quietly keeping it would pin a stale picture on a row that no longer says what it said.
  */
+/**
+ * A row's identity as a string, independent of column ORDER.
+ *
+ * `JSON.stringify` of a record serialises keys in insertion order, which for a parsed sheet is the
+ * header order — so the same products re-exported with two columns swapped would match nothing,
+ * rebuild every row imageless, and let the pump delete the images off disk. Sorting the entries
+ * costs nothing at these sizes and makes the key describe the DATA rather than the spreadsheet's
+ * column layout.
+ */
+function recordKey(record: CsvRecord): string {
+  return JSON.stringify(Object.entries(record ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+}
+
 export function reconcileCsvItems(
   records: CsvRecord[],
   nameColumns: readonly string[],
@@ -114,14 +127,14 @@ export function reconcileCsvItems(
   const spare = new Map<string, GenItem[]>();
   for (const item of existing) {
     if (item.subject !== undefined) continue; // typed rows are the other reconcile's business
-    const key = JSON.stringify(item.record);
+    const key = recordKey(item.record);
     const bucket = spare.get(key);
     if (bucket) bucket.push(item);
     else spare.set(key, [item]);
   }
   let nextId = nextGenId(existing);
   return records.map((record, i) => {
-    const reused = spare.get(JSON.stringify(record))?.shift();
+    const reused = spare.get(recordKey(record))?.shift();
     const name = joinNameColumns(record, nameColumns) || `Row ${i + 1}`;
     if (reused) return { ...reused, name };
     return { id: nextId++, record, name, status: 'ready' as const, image: null };

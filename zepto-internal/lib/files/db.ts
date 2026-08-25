@@ -2,8 +2,8 @@
 
 // The IndexedDB connection for the file store, and the one-time migration gate in front of it.
 //
-// Connection handling is lib/bg/autosave.ts:136-191 ported as-is, because every line of it was paid
-// for: a per-operation open-and-close so a stalled version change clears within a tick, an
+// Connection handling is carried over from the crash net this replaces, because every line of it
+// was paid for: a per-operation open-and-close so a stalled version change clears within a tick, an
 // onblocked that rejects LOUDLY rather than leaving a promise unsettled, and a late-arriving
 // connection from a cleared block closed on arrival — an open connection being precisely what
 // blocks the next upgrade. The cost is real (a 3,000-item restore at WRITE_CHUNK is ~125 opens) but
@@ -20,7 +20,7 @@ const DB_NAME = 'zigma-files';
 // v1, and it should stay v1 for a very long time. A version bump re-runs onupgradeneeded against
 // every live database, and here that database is not one crash net — it is every file the user has.
 // Additive change belongs in FileRecord.schema (owned by the codec) or in a new meta key, neither of
-// which needs the version to move; lib/bg/autosave.ts:51-59 is the precedent.
+// which needs the version to move.
 const DB_VERSION = 1;
 
 export const FILES_STORE = 'files';
@@ -39,7 +39,7 @@ export const BY_TOOL = 'by_tool';
  * a synthetic key plus a fileId index, and that choice is what makes a whole file one request: one
  * getAll(range) to load it, one delete(range) to erase it. IndexedDB has no delete-by-index, so the
  * index variant needs a cursor step per record — 3,000 of them for a project this code is explicitly
- * built to handle (autosave.ts:205-207) — and it would add a B-tree write to every single item put,
+ * built to handle — and it would add a B-tree write to every single item put,
  * in a pump whose whole design is about not paying per-item costs.
  *
  * The upper sentinel is `[]` and MUST NOT be a number. Item ids are mixed across the suite: counters
@@ -70,7 +70,7 @@ export function openDb(): Promise<IDBDatabase> {
       const db = req.result;
       // Guarded by name, always. createObjectStore throws ConstraintError on a repeat, and that
       // aborts the version change — leaving the database unopenable at this version for good
-      // (autosave.ts:141-147). The guards cost nothing and the failure mode is unrecoverable.
+      // The guards cost nothing and the failure mode is unrecoverable.
       if (!db.objectStoreNames.contains(FILES_STORE)) {
         const files = db.createObjectStore(FILES_STORE, { keyPath: 'id' });
         files.createIndex(BY_UPDATED, 'updatedAt');

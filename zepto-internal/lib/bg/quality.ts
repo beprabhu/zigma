@@ -841,19 +841,6 @@ export function qualityRank(level: QualityLevel): number {
   return level === 'bad' ? 0 : level === 'warn' ? 1 : 2;
 }
 
-/** Worst-first, stable within a tier (Array#sort is stable, so ties keep queue order). */
-export function sortByQuality<T extends BgItem>(items: T[]): T[] {
-  return sortByQualityWith(items, assessQuality);
-}
-
-export function countFlagged(items: BgItem[]): number {
-  let n = 0;
-  for (const item of items) {
-    if (assessQuality(item).level !== 'ok') n++;
-  }
-  return n;
-}
-
 /**
  * A verdict the caller already has. assessQuality is cheap per call but not free per CELL per
  * RENDER: a virtualized 3,000-tile grid re-runs every predicate on each scroll frame, and the
@@ -1013,7 +1000,7 @@ export function countQueueFilters(
   return counts;
 }
 
-/** sortByQuality against a prebuilt verdict table — see VerdictLookup for why that matters. */
+/** Worst-first, stable within a tier, against a prebuilt verdict table — see VerdictLookup. */
 export function sortByQualityWith<T extends BgItem>(items: T[], verdictOf: VerdictLookup): T[] {
   return [...items].sort((a, b) => qualityRank(verdictOf(a).level) - qualityRank(verdictOf(b).level));
 }

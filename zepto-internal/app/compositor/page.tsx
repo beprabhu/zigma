@@ -269,7 +269,9 @@ function CompositorFile() {
   // A grid holds several sheets at once, so a row's sheet index can no longer be its queue id.
   const nextItemId = React.useRef(revived?.nextItemId ?? 0);
   // Grid mode is never empty-handed: there is always a row on screen to drop a CSV into.
-  const gridBands = bands.length ? bands : [SEED_BAND];
+  // Memoised because `windowed` closes over it, and a fresh array each render would rebuild that
+  // callback — and every memo downstream of it — on every keystroke in the page.
+  const gridBands = React.useMemo(() => (bands.length ? bands : [SEED_BAND]), [bands]);
   /** Band writes go through the SAME list the UI reads, seed included. */
   function updateBands(fn: (prev: GridBand[]) => GridBand[]) {
     setBands((prev) => fn(prev.length ? prev : [SEED_BAND]));
@@ -445,9 +447,37 @@ function CompositorFile() {
    * one and shows the other instead of throwing either away — and neither can ship tiles the
    * canvas is not showing.
    */
+  /**
+   * Band rows past their band's tile count, dropped from view.
+   *
+   * The count is a WINDOW, not a delete: lowering a row from 8 tiles to 4 means "show four", and
+   * the four that left have to still be there when the number goes back up — the alternative is
+   * that a number field quietly destroys composed tiles, which is what it used to do (the rows
+   * left `items`, so the store's pump deleted their records and blobs, and raising the count
+   * rebuilt them as empty rows under new ids). Parking them here costs a filter and keeps the
+   * promise the control implies.
+   *
+   * Everything downstream reads the windowed list, so a parked row cannot be generated, counted,
+   * exported or searched — it is only kept alive.
+   */
+  const windowed = React.useCallback(
+    (list: QueueItem[]) => {
+      const seen = new Map<string, number>();
+      return list.filter((it) => {
+        if (!it.bandId) return true;
+        const band = gridBands.find((b) => b.id === it.bandId);
+        if (!band) return false;
+        const n = (seen.get(it.bandId) ?? 0) + 1;
+        seen.set(it.bandId, n);
+        return n <= band.count;
+      });
+    },
+    [gridBands],
+  );
+
   const activeItems = React.useMemo(
-    () => items.filter((it) => (gridMode ? !!it.bandId : !it.bandId)),
-    [items, gridMode],
+    () => windowed(items).filter((it) => (gridMode ? !!it.bandId : !it.bandId)),
+    [items, gridMode, windowed],
   );
 
   const imageItemCount = React.useMemo(
@@ -682,10 +712,16 @@ function CompositorFile() {
    * page cannot say which row it was meant for. Those bands keep their own zones.
    */
   React.useEffect(() => {
-    if (running || gridMode) return;
     const hasFiles = (e: DragEvent) => !!e.dataTransfer?.types.includes('Files');
+    // Bound in EVERY state, because the listener is also the navigation guard. Skipping it while a
+    // run was going or the grid was up left the browser default in place, so a stray drop — the
+    // natural "add these too" gesture — navigated the tab to the dropped file and took the run and
+    // the session snapshot with it. Only the IMPORT is conditional now; the drop is always caught.
+    const importable = !running && !gridMode;
     const onDragOver = (e: DragEvent) => {
       if (!hasFiles(e)) return;
+      // preventDefault even when the drop will be refused — without it the browser navigates.
+      if (!importable) { e.preventDefault(); setPageDrag(false); return; }
       // A dropzone under the pointer has already claimed this hover (it calls preventDefault),
       // and it draws its own highlight — two at once reads as two targets.
       if (e.defaultPrevented) { setPageDrag(false); return; }
@@ -701,6 +737,12 @@ function CompositorFile() {
       if (!hasFiles(e) || !e.dataTransfer) return;
       if (e.defaultPrevented) return; // a zone already imported it
       e.preventDefault();
+      if (!importable) {
+        toast.info(running
+          ? 'Stop the run before adding more files.'
+          : 'Drop the CSV on the grid row it belongs to.');
+        return;
+      }
       void filesFromDataTransfer(e.dataTransfer).then((files) => {
         if (files.length) handleDropRef.current(files);
       });
@@ -787,7 +829,13 @@ function CompositorFile() {
       if (bucket) bucket.push(item);
       else spare.set(key, [item]);
     }
-    return records.map((record, i) => {
+    // Everything the reuse map skipped is PARKED work, not absent work: band rows belong to their
+    // own band's sheet, and image rows have no record to match on. They were being left out of the
+    // returned array as well, and the call site replaces the whole queue — so one CSV drop in single
+    // mode deleted every banner-grid tile and every restored image row in the file. Same predicate
+    // as the skip above, so the two can never disagree about what "parked" means.
+    const parked = existing.filter((it) => it.bandId || !Object.keys(it.record ?? {}).length);
+    const rebuilt = records.map((record, i) => {
       const urls = rowUrls(record, imageCols);
       const title = joinNameColumns(record, titleCols);
       const offer = offerCol ? record[offerCol] ?? '' : '';
@@ -815,9 +863,23 @@ function CompositorFile() {
             : 'no-images',
       };
     });
+    return [...rebuilt, ...parked];
   }
 
   // ---- Banner grid bands ----
+
+  /**
+   * Whether a row has anything to compose FROM.
+   *
+   * Two kinds of source answer to this: a sheet row's image-column links, and a dropped file's
+   * local blob. generateItem has always decoded both, but every gate around it tested `urls`
+   * alone — so a folder drop produced fifty rows the primary CTA refused to run, composable only
+   * one at a time through each row's own dialog. Anything that asks "can this row be generated"
+   * has to ask it here.
+   */
+  function hasSources(item: QueueItem): boolean {
+    return item.urls.length > 0 || (item.localSources?.length ?? 0) > 0;
+  }
 
   /** The band an item belongs to, or undefined outside grid mode. */
   function bandOf(item: QueueItem): GridBand | undefined {
@@ -864,7 +926,16 @@ function CompositorFile() {
       for (const band of gridBands) {
         mine.set(band.id, band.id === bandId ? next : prev.filter((it) => it.bandId === band.id));
       }
-      return gridBands.flatMap((band) => mine.get(band.id) ?? []);
+      // Rows belonging to no band ride through untouched, at the front.
+      //
+      // They are the single-template run PARKED behind grid mode (see activeItems — flipping the
+      // preset hides one population and shows the other, deliberately throwing neither away).
+      // Rebuilding the array from gridBands alone silently dropped every one of them, so any band
+      // edit at all — a count keystroke, a preset change, a sheet drop — deleted the parked run and
+      // the pump then removed its tiles from disk. Grid mode never renders these; it just has to
+      // stop destroying them.
+      const parked = prev.filter((it) => !it.bandId);
+      return [...parked, ...gridBands.flatMap((band) => mine.get(band.id) ?? [])];
     });
   }
 
@@ -889,11 +960,21 @@ function CompositorFile() {
    * mean the same thing whichever control sent it.
    */
   function applyBandPatch(band: GridBand, patch: Partial<GridBand>) {
-    if (patch.presetId !== undefined) setBandPreset(band, patch.presetId);
-    else if (patch.count !== undefined) setBandCount(band, patch.count);
-    else if (patch.fileName === null) clearBandFile(band.id);
-    else if (patch.imageCols || patch.titleCols !== undefined || patch.offerCol !== undefined) remapBand(band, patch);
-    else patchBand(band.id, patch);
+    // Every field the patch names, not just the first one. This was an if/else-IF chain, so a patch
+    // carrying two fields silently dropped all but the highest-priority one — a preset change beat
+    // a count change, a count change beat a file clear. `rest` keeps the plain fields (columns) on
+    // the same single-patch path they were on before.
+    const { presetId, count, fileName, imageCols, titleCols, offerCol, ...rest } = patch;
+    if (fileName === null) { clearBandFile(band.id); return; }
+    if (imageCols || titleCols !== undefined || offerCol !== undefined) {
+      remapBand(band, { imageCols, titleCols, offerCol });
+    }
+    if (presetId !== undefined) setBandPreset(band, presetId);
+    if (Object.keys(rest).length || fileName !== undefined) {
+      patchBand(band.id, { ...rest, ...(fileName !== undefined ? { fileName } : null) });
+    }
+    // Last: it re-derives the band's slice, so it must see the mapping the lines above applied.
+    if (count !== undefined) setBandCount({ ...band, ...patch }, count);
   }
 
   function addBand() {
@@ -903,6 +984,15 @@ function CompositorFile() {
   function removeBand(id: string) {
     updateBands((prev) => prev.filter((b) => b.id !== id));
     setItems((prev) => prev.filter((it) => it.bandId !== id));
+    // The band's sheet goes with it. Left behind it is unreachable — no band names it any more —
+    // yet it is still headers plus every parsed row, re-mirrored into the BANDS_KEY singleton on
+    // every later band change and carried in the session snapshot until the run is cleared.
+    setBandSheets((prev) => {
+      if (!(id in prev)) return prev;
+      const rest = { ...prev };
+      delete rest[id];
+      return rest;
+    });
     setOpenId((prev) => (prev !== null && itemsRef.current.find((it) => it.id === prev)?.bandId === id ? null : prev));
     setCompressSummary('');
   }
@@ -932,7 +1022,18 @@ function CompositorFile() {
         fileName: file.name, headers, records,
         imageCols: imgCols, titleCols: tCols, offerCol: oCol, count,
       });
-      setBandItems(bandId, buildQueue(records.slice(0, count), imgCols, tCols, oCol, { bandId }));
+      // Reconciled against the new sheet, not rebuilt from it. Replace on a band that already has
+      // composed tiles is the common case — a corrected export of the same products — and the
+      // rebuild silently threw every tile away, on disk as well as on screen. Rows the new sheet
+      // still contains keep their tile; the rest leave, exactly as in single mode.
+      setBandItems(
+        bandId,
+        reconcileBand(
+          { ...(band ?? newBand()), id: bandId, records, imageCols: imgCols, titleCols: tCols, offerCol: oCol },
+          count,
+          itemsRef.current,
+        ),
+      );
     };
     reader.readAsText(file);
   }
@@ -946,24 +1047,57 @@ function CompositorFile() {
   }
 
   /**
-   * The tile count is a window onto the band's sheet: lowering it drops the tail, raising it
-   * appends the next rows. Tiles that survive keep their object identity, so lowering and
-   * raising the count again never costs a generated tile.
+   * The tile count is a window onto the band's sheet: it names how many of the sheet's rows the
+   * band shows.
+   *
+   * Reconciled against the SHEET, never sliced off the queue. The old version windowed the live
+   * array — `mine.slice(0, capped)` on the way down, fresh `buildQueue` rows on the way up — which
+   * made the docstring's promise ("lowering and raising the count again never costs a generated
+   * tile") false: the sliced tiles were dropped from state, the pump deleted their records and
+   * blobs, and the raise minted brand-new ids that could never rebind them. With a field that
+   * commits per keystroke, typing `10` over `8` destroyed seven paid tiles on the way through `1`.
+   *
+   * Matching on record content instead means the window is derived, not destructive: any row still
+   * inside it keeps its identity, its tile and its compressed cache no matter how the number got
+   * there. `row` follows the sheet position rather than the queue length, so a tile deleted with ✕
+   * can no longer hand a later row a duplicate export number.
    */
   function setBandCount(band: GridBand, count: number) {
     const capped = Math.min(Math.max(0, count), band.records.length);
     patchBand(band.id, { count: capped });
-    const mine = items.filter((it) => it.bandId === band.id);
-    if (capped <= mine.length) {
-      setBandItems(band.id, mine.slice(0, capped));
-      return;
-    }
+    // Only ever GROWS the queue. Lowering the count is a windowing change and touches no rows at
+    // all — `windowed` stops drawing them and the tiles wait there for the number to come back up.
+    // Raising past what the band has ever held appends the sheet rows it has not reached yet.
+    const mine = itemsRef.current.filter((it) => it.bandId === band.id);
+    if (capped <= mine.length) return;
+    // Computed OUTSIDE the updater, like every other id-minting path here: buildQueue advances
+    // nextItemId, and StrictMode invokes updaters twice.
     const extra = buildQueue(
       band.records.slice(mine.length, capped),
       band.imageCols, band.titleCols, band.offerCol,
       { bandId: band.id, rowStart: mine.length + 1 },
     );
     setBandItems(band.id, [...mine, ...extra]);
+  }
+
+  /** One band's slice of the queue, re-derived from its sheet while keeping the tiles it already has. */
+  function reconcileBand(band: GridBand, count: number, existing: QueueItem[]): QueueItem[] {
+    const spare = new Map<string, QueueItem[]>();
+    for (const item of existing) {
+      if (item.bandId !== band.id) continue;
+      const key = JSON.stringify(item.record);
+      const bucket = spare.get(key);
+      if (bucket) bucket.push(item);
+      else spare.set(key, [item]);
+    }
+    return band.records.slice(0, count).map((record, i) => {
+      const reused = spare.get(JSON.stringify(record))?.shift();
+      if (reused) return { ...reused, row: i + 1 };
+      return buildQueue([record], band.imageCols, band.titleCols, band.offerCol, {
+        bandId: band.id,
+        rowStart: i + 1,
+      })[0];
+    });
   }
 
   /** One band's column mapping, re-derived in place exactly the way updateMapping does. */
@@ -1125,7 +1259,7 @@ function CompositorFile() {
 
   async function handleGenerateAll() {
     if (!guards()) return;
-    await runTiles(activeItems.filter((it) => it.urls.length), 'generated');
+    await runTiles(activeItems.filter(hasSources), 'generated');
   }
 
   /**
@@ -1228,7 +1362,7 @@ function CompositorFile() {
   async function handleRegenerateSelected() {
     if (!guards()) return;
     // Rows without image URLs can't generate; quietly skip them like Generate-all does.
-    const todo = items.filter((it) => sel.checked.has(it.id) && it.urls.length);
+    const todo = items.filter((it) => sel.checked.has(it.id) && hasSources(it));
     await runTiles(todo, 'regenerated');
     offerUndo(todo, 'regenerated');
   }
@@ -1236,7 +1370,7 @@ function CompositorFile() {
   /** The wand's targets: only rows that HAVE a tile — the tile itself is the input. */
   const aiEditTargets = items.filter((it) => sel.checked.has(it.id) && it.resultImage);
   /** The same selection seen the other way: rows with photos, which can be built from scratch. */
-  const regenTargets = items.filter((it) => sel.checked.has(it.id) && it.urls.length);
+  const regenTargets = items.filter((it) => sel.checked.has(it.id) && hasSources(it));
 
   async function handleAiEditSelected(promptOverride: string, from: PromptSource = 'latest') {
     if (!guards()) return;
@@ -1244,7 +1378,7 @@ function CompositorFile() {
     // recomposite, and excluding them would silently drop rows the toolbar counted as selected.
     const todo =
       from === 'original'
-        ? items.filter((it) => sel.checked.has(it.id) && it.urls.length)
+        ? items.filter((it) => sel.checked.has(it.id) && hasSources(it))
         : aiEditTargets;
     if (!todo.length) return;
     const verb = from === 'original' ? 'regenerated' : 'edited';
@@ -1307,7 +1441,7 @@ function CompositorFile() {
    * tile from scratch, and the latest is the tile itself, which the prompt edits in place.
    */
   function sourceChoices(item: QueueItem) {
-    return { hasLatest: !!item.resultImage, hasOriginal: item.urls.length > 0 };
+    return { hasLatest: !!item.resultImage, hasOriginal: hasSources(item) };
   }
 
   async function handleRegenerate(
@@ -1350,10 +1484,16 @@ function CompositorFile() {
     // that ships, and editing a field mid-encode must not give the ZIP two different answers.
     // Per item, not per batch — in Banner grid mode each band brings its own sheet, template
     // and offer mapping.
-    const plan = new Map(done.map((it) => [
-      it.id,
-      { template: templateFor(it), rules: rulesFor(it) },
-    ]));
+    const plan = new Map(done.map((it) => {
+      const template = templateFor(it);
+      const rules = rulesFor(it);
+      return [it.id, {
+        template,
+        rules,
+        // Everything that changes the drawn pixels, in one comparable value — see QueueItem.compressed.
+        fingerprint: JSON.stringify([exportScale, proc.compressOn, template, rules, it.title, it.offer]),
+      }];
+    }));
     if (!done.length) return;
     // Save dialog first, while the click still counts as user activation — TinyPNG passes can
     // take minutes, after which Chrome would refuse to open it. Cancelling cancels the export.
@@ -1383,7 +1523,9 @@ function CompositorFile() {
       const raw = await mapWithLimit(done, ENCODE_CONCURRENCY, async (item, n) => {
         // The cached TinyPNG bytes were negotiated under no budget, so a budgeted run encodes
         // fresh from the canvas instead of trusting them.
-        if (!budget && item.compressed) return item.compressed.data;
+        if (!budget && item.compressed && item.compressed.fingerprint === plan.get(item.id)!.fingerprint) {
+          return item.compressed.data;
+        }
         // Rasterised here rather than lifted off the grid: the cell on screen is sized for
         // looking at, and export resolution is a separate decision. Same template, same row
         // text (tileOptsFor is the one rule), just more pixels.
@@ -1425,10 +1567,15 @@ function CompositorFile() {
       const compressEta = createEta();
       const finalBytes = await mapWithLimit(raw, COMPRESS_CONCURRENCY, async (data, n) => {
         const item = done[n];
-        if (!proc.compressOn || (!budget && item.compressed)) return data;
+        if (!proc.compressOn) return data;
+        if (!budget && item.compressed && item.compressed.fingerprint === plan.get(item.id)!.fingerprint) {
+          return data;
+        }
         try {
           const out = await proc.compressBytes(data);
-          patchItem(item.id, { compressed: { data: out, inputSize: data.length } });
+          patchItem(item.id, {
+            compressed: { data: out, inputSize: data.length, fingerprint: plan.get(item.id)!.fingerprint },
+          });
           inTotal += data.length;
           outTotal += out.length;
           return out;
@@ -1448,6 +1595,8 @@ function CompositorFile() {
       });
 
       const used = new Map<string, number>();
+
+      const rowDigits = Math.max(2, String(Math.max(...done.map((it) => it.row), 0)).length);
       done.forEach((item, n) => {
         const base = (item.title || `tile-${item.row}`).replace(/[^\w\- ]+/g, '').trim().replace(/\s+/g, '-').toLowerCase() || `tile-${item.row}`;
         // A banner grid ships as folders, one per row of the grid, so the ZIP has the same
@@ -1457,7 +1606,9 @@ function CompositorFile() {
         const folder = bandIndex >= 0 ? `row-${bandIndex + 1}/` : '';
         let name: string;
         if (numberFiles) {
-          name = `${folder}${String(item.row).padStart(2, '0')}-${base}.png`;
+          // Padded to the widest row number in the export, so a file manager's name sort matches
+          // the sheet order. A fixed two digits put 100 between 10 and 11 on any sheet past 99.
+          name = `${folder}${String(item.row).padStart(rowDigits, '0')}-${base}.png`;
         } else {
           // Repeated titles get -2, -3 so nothing in the ZIP is silently overwritten. Counted
           // per folder: the same title in two rows of the grid is not a collision.
@@ -1532,7 +1683,7 @@ function CompositorFile() {
   }
 
   const doneCount = activeItems.filter((it) => it.status === 'done').length;
-  const canGenerate = activeItems.some((it) => it.urls.length);
+  const canGenerate = activeItems.some(hasSources);
   // Greyed out with a reason beats erroring on click — same gate as Cleanup's AI edit.
   const aiReady = mock || (endpoint.trim().length > 0 && azureKey.trim().length > 0);
 
@@ -1905,7 +2056,7 @@ function CompositorFile() {
                  land in the row it was dropped on. */
               <div className="flex flex-col gap-6">
                 {gridBands.map((band, i) => {
-                  const bandItems = items.filter((it) => it.bandId === band.id);
+                  const bandItems = windowed(items).filter((it) => it.bandId === band.id);
                   // What this band DRAWS. bandItems stays whole above so the band's own counts and
                   // its row-count control keep describing the band rather than the search.
                   const bandVisible = searchIn(bandItems);
@@ -1934,7 +2085,12 @@ function CompositorFile() {
                       {bandItems.length ? (
                         <TileGrid
                           items={bandVisible}
-                          template={preset.template}
+                          /* Preset geometry, batch colours — the same rule templateFor applies for
+                             the dialog and the export plan. Passing the preset raw left the grid
+                             showing a band's default palette while the ZIP shipped the Colours
+                             panel's, so the one surface the user judges the batch on was the one
+                             surface not wearing its colours. */
+                          template={withTileColors(preset.template, template)}
                           columns={band.columns}
                           fallbackTitle={tplTitle}
                           fallbackOffer={tplOffer}
@@ -1962,7 +2118,7 @@ function CompositorFile() {
                               full rows it would draw — the same promise the old copy made in
                               words, made in the tiles themselves instead. */}
                           <TileGridSkeleton
-                            template={preset.template}
+                            template={withTileColors(preset.template, template)}
                             columns={band.columns}
                             count={band.count || band.columns * 2}
                             className="mb-1"

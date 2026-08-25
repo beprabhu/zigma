@@ -264,15 +264,6 @@ export function scaleBounds(bounds: SubjectBounds, factor: number): SubjectBound
   };
 }
 
-export function scaleRect(rect: Rect, factor: number): Rect {
-  return {
-    x: rect.x * factor,
-    y: rect.y * factor,
-    width: rect.width * factor,
-    height: rect.height * factor,
-  };
-}
-
 export interface RenderTileOptions {
   // Precomputed bbox from measureSubject. Pass it to keep preview renders free of the alpha
   // scan; pass null to declare "already known to be empty"; omit to scan the source here.

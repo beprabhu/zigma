@@ -51,6 +51,10 @@ export function cutoutEvidence(item: BgItem): Omit<NonNullable<BgItem['prev']>, 
     verify: item.verify,
     semantic: item.semantic,
     bands: item.bands,
+    // A person's verdict is evidence about ONE cutout, so it travels with the rest of that
+    // cutout's evidence — an undo that put the picture back without it would leave the override
+    // describing a matte the user never looked at.
+    manualFlag: item.manualFlag,
   };
 }
 
@@ -233,6 +237,7 @@ export interface BgItem {
     verify?: BgVerify;
     semantic?: BgSemantic;
     bands?: DetectedBand[];
+    manualFlag?: 'flag' | 'clear';
   };
   /**
    * The source this item was FIRST imported with, captured once and immutable from then on.
@@ -249,9 +254,12 @@ export interface BgItem {
    */
   originalSource?: BgItemSource;
   /**
-   * Which group of the queue this item belongs to. Nothing sets or reads it yet — it exists so
-   * the batching phase can land without another pass over every shape that carries a BgItem;
-   * absent means the single implicit batch that every item is in today.
+   * Which sealed export this item shipped in. Absent means it has not shipped yet, which is what
+   * the unexported cohorts are built from.
+   *
+   * Deliberately OUTSIDE the file-store change signature: stamping a 500-image cohort must not
+   * re-put 500 cutout blobs to record one number each. That is why the stamp's durable copy lives
+   * in the LEDGER_KEY singleton and why a reopened file trusts that over the rows' own numbers.
    */
   batch?: number;
   /**

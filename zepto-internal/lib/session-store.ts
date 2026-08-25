@@ -13,7 +13,7 @@
 // HTMLImageElements, Blobs and File handles exactly as the page held them — that is what makes a
 // snapshot cheap enough to take on every unmount, and it is also why the whole thing dies with
 // the tab. A real reload, a crash, or a second tab all start empty; surviving those is
-// lib/bg/autosave.ts's job (IndexedDB, incremental, written as work lands). This store covers
+// the file store's job (IndexedDB, incremental, written as work lands). This store covers
 // only the navigation the sidebar makes trivially easy to do by accident.
 //
 // A stored snapshot pins whatever it references until the product overwrites it or the tab

@@ -24,6 +24,20 @@ export const SUBJECT_HEADING = 'Generate an image of:';
 export const REFERENCE_MARKER = '(attached as a reference image)';
 
 /**
+ * Whether a reference column's cell is something the request can actually attach.
+ *
+ * The single place that decides: both the marker and the URLs referenceUrls hands to the fetcher
+ * come from here, so the prompt cannot claim an attachment the request never made. Reference
+ * columns are detected across the sheet as a whole, which leaves any individual row free to hold
+ * a code, a relative path or a typo where its neighbours hold links. Such a cell keeps its own
+ * text, exactly as it would in a column that was never detected — a picture generated from text
+ * alone, under a prompt saying a reference was used, is the wrong result nobody catches by eye.
+ */
+function isReferenceUrl(value: string): boolean {
+  return /^https?:\/\/\S+$/i.test(value);
+}
+
+/**
  * base prompt + the row's cells, each labelled with its column header.
  *
  * Column names are sent, not just values: "subject: a diya lamp" carries intent that a bare
@@ -44,7 +58,8 @@ export function buildRowPrompt(
   heading: string = ROW_HEADING,
   /**
    * Columns whose cells are image URLs being sent as reference images rather than as text. Their
-   * values are replaced with REFERENCE_MARKER — see the note on that constant.
+   * values are replaced with REFERENCE_MARKER — see the note on that constant — for the cells
+   * referenceUrls would actually attach, and only those.
    */
   references: ReadonlySet<string> = new Set(),
 ): string {
@@ -52,7 +67,10 @@ export function buildRowPrompt(
     .filter((header) => !excluded.has(header))
     .map((header) => [header, (record[header] ?? '').trim()] as const)
     .filter(([, value]) => value.length > 0)
-    .map(([header, value]) => `${header}: ${references.has(header) ? REFERENCE_MARKER : value}`)
+    .map(([header, value]) => {
+      const attached = references.has(header) && isReferenceUrl(value);
+      return `${header}: ${attached ? REFERENCE_MARKER : value}`;
+    })
     .join('\n');
 
   const parts: string[] = [];
@@ -93,6 +111,9 @@ export const PROMPT_WARN_CHARS = 30_000;
  * Order matters and is the sheet's: a brief that says "use the first image for the pack and the
  * second for the flavour" is only meaningful if the request receives them the same way round for
  * every row.
+ *
+ * Cells this drops are the ones buildRowPrompt leaves as text, so prompt and request describe
+ * the same call.
  */
 export function referenceUrls(
   headers: string[],
@@ -102,5 +123,5 @@ export function referenceUrls(
   return headers
     .filter((header) => references.has(header))
     .map((header) => (record[header] ?? '').trim())
-    .filter((value) => /^https?:\/\/\S+$/i.test(value));
+    .filter(isReferenceUrl);
 }

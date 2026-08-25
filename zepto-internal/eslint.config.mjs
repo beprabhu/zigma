@@ -15,6 +15,9 @@ const eslintConfig = defineConfig([
     // Vendored onnxruntime-web runtime — minified third-party glue, not ours to lint.
     // Populated by scripts/setup-bg-assets.mjs.
     "public/vendor/**",
+    // Scratch git worktrees. Local only and never part of the project, but they hold a full
+    // copy of the tree, so without this every file in the repo gets linted twice.
+    ".claude/worktrees/**",
   ]),
 ]);
 

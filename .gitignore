@@ -4,3 +4,6 @@ desktop/node_modules/
 
 # Labelled cutout-quality training data (45MB of images) — see zesku-quality-labels/HANDOFF.md
 zesku-quality-labels/
+
+# Claude Code scratch worktrees — local only, never part of the project.
+**/.claude/worktrees/

@@ -35,7 +35,17 @@ export interface QueueItem {
   status: ItemStatus;
   errorMsg?: string;
   resultImage: HTMLImageElement | null;
-  compressed: { data: Uint8Array; inputSize: number } | null;
+  /**
+   * The tile's compressed export bytes, with a fingerprint of the settings they were made under.
+   *
+   * The fingerprint is what makes the cache safe to reuse. These bytes are a rendered picture, not
+   * just a smaller copy of one — export scale, the template, the fallback title and offer text and
+   * the offer toggle all change what is drawn — and the invalidation sites only ever covered a
+   * template or row-text edit. Everything else silently shipped stale pixels: a 1x cache going out
+   * as a 3x export, an offer bar that had since been switched off, or bytes a previous budgeted run
+   * had already shrunk. A hit now has to match the settings as well as the row.
+   */
+  compressed: { data: Uint8Array; inputSize: number; fingerprint: string } | null;
   /**
    * One-slot undo: the tile the last regenerate replaced. Only set when there WAS a previous
    * result; overwritten by the next regenerate, cleared by undo.

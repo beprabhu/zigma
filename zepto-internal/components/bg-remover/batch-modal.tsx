@@ -428,14 +428,36 @@ function SealSizeField({
   // queue commit — correct, but a surprise worth naming before it happens rather than after six
   // ZIPs have appeared.
   const burst = cleanWaiting > sealSize ? Math.floor(cleanWaiting / Math.max(1, sealSize)) : 0;
+  /**
+   * Held back until the number is finished.
+   *
+   * The committed value feeds the live seal effect, so every intermediate keystroke was a real
+   * decision: typing 500 over 50 passed through 5, sealing a five-image batch on the spot — and a
+   * seal is irreversible, claiming its items and bumping the batch number and file offset for good.
+   * `Number('') || 1` made clearing the field commit 1, which is the worst case of the same thing.
+   * Enter and blur commit; Escape abandons.
+   */
+  const [draft, setDraft] = React.useState<string | null>(null);
+  const commit = (raw: string) => {
+    setDraft(null);
+    const next = Number(raw);
+    if (raw.trim() === '' || !Number.isFinite(next)) return;
+    const clamped = Math.max(1, Math.round(next));
+    if (clamped !== sealSize) onChange(clamped);
+  };
   return (
     <div className="mt-4 flex flex-wrap items-center gap-2 rounded-lg border border-dashed px-2.5 py-2">
       <span className="text-xs text-muted-foreground">Seal a batch every</span>
       <Input
         type="number"
         min={1}
-        value={sealSize}
-        onChange={(e) => onChange(Math.max(1, Number(e.target.value) || 1))}
+        value={draft ?? String(sealSize)}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={(e) => commit(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') { e.preventDefault(); commit(e.currentTarget.value); }
+          else if (e.key === 'Escape') { e.preventDefault(); setDraft(null); }
+        }}
         className="h-7 w-24 text-xs"
         aria-label="Images per batch"
       />

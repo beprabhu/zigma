@@ -6,7 +6,7 @@
 // so a CSV reads the same in Compose, Generate and Cleanup once it is in.
 
 import * as React from 'react';
-import { FileSpreadsheetIcon, XIcon } from 'lucide-react';
+import { XIcon } from 'lucide-react';
 
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
@@ -15,17 +15,11 @@ import {
 } from '@/components/ui/alert-dialog';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { DropzoneShell } from '@/components/dropzone';
 import {
   Item, ItemActions, ItemContent, ItemDescription, ItemMedia, ItemTitle,
 } from '@/components/ui/item';
 import { cn } from '@/lib/utils';
 
-interface CsvDropzoneProps {
-  fileName: string | null;
-  rowCount: number;
-  onFile: (file: File) => void;
-}
 
 /** Spreadsheet-mark file icon — same hand-drawn stroke style as MdFileIcon, so a .csv card and
     a .md card sit side by side as siblings rather than strangers. */
@@ -47,56 +41,6 @@ export function DocFileIcon(props: React.SVGProps<SVGSVGElement>) {
   );
 }
 
-export function CsvFileIcon(props: React.SVGProps<SVGSVGElement>) {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.75"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-      {...props}
-    >
-      <rect x="2" y="5" width="20" height="14" rx="2.5" />
-      <path d="M2 10.5h20" />
-      <path d="M9.25 10.5V19" />
-      <path d="M15.75 10.5V19" />
-    </svg>
-  );
-}
-
-export function CsvDropzone({ fileName, rowCount, onFile }: CsvDropzoneProps) {
-  return (
-    <DropzoneShell accept=".csv,text/csv" onFiles={(files) => onFile(files[0])}>
-      {fileName ? (
-        <>
-          <CsvFileIcon className="size-6" />
-          <span>
-            <strong className="text-foreground">{fileName}</strong>
-            {' — '}{rowCount} row{rowCount === 1 ? '' : 's'}
-          </span>
-        </>
-      ) : (
-        <>
-          <FileSpreadsheetIcon className="size-6" />
-          <span>Drop CSV here or <span className="text-primary underline underline-offset-2">browse</span></span>
-        </>
-      )}
-    </DropzoneShell>
-  );
-}
-
-/**
- * The loaded-CSV card — MdFileTile's shape (icon, name, one-line preview, status chip) with the
- * two actions a sheet needs instead of an editor: click the body to replace the file, the ✕ to
- * remove it. Two sibling buttons in one Item, same reason as MdFileTile's switcher variant —
- * button-in-button is invalid HTML.
- *
- * Removal takes an optional confirm: pass `removeConfirm` copy wherever the CSV's rows carry
- * generated work that leaves with them, omit it where removal only drops a mapping.
- */
 export function CsvFileTile({
   name,
   description,

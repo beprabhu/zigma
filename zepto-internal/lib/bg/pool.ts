@@ -74,11 +74,18 @@ interface Job {
   reject: (e: unknown) => void;
   /** Set when the caller aborts: the worker still finishes, but the result is dropped. */
   abandoned: boolean;
+  /** The slot it was dispatched to, so a worker's death only fails the work that was on it. */
+  slot: Slot | null;
 }
 
 interface Slot {
   worker: Worker;
   busy: boolean;
+  /**
+   * Retired after a worker-level error: its model instance cannot be trusted again. The slot
+   * stays in the pool regardless, so disposePool still terminates the worker.
+   */
+  dead: boolean;
 }
 
 // Two workers is the sweet spot: it is enough to overlap one image's CPU stages with another's
@@ -111,17 +118,20 @@ function spawn(size: number): Slot[] {
   for (let i = 0; i < size; i++) {
     // new URL(..., import.meta.url) is what lets Turbopack discover and bundle the worker.
     const worker = new Worker(new URL('./bg.worker.ts', import.meta.url), { type: 'module' });
-    const slot: Slot = { worker, busy: false };
+    const slot: Slot = { worker, busy: false, dead: false };
     worker.addEventListener('message', (event: MessageEvent<WorkerResponse>) =>
       handleMessage(slot, event.data)
     );
     worker.addEventListener('error', (event) => {
-      // A worker-level failure must not strand its job forever.
+      // A worker-level failure must not strand its job forever — but only the work on THIS
+      // worker is lost. A sibling's in-flight job is still on its way back, and rejecting it
+      // here would both fail an image that succeeds and make handleMessage drop its result.
+      slot.dead = true;
       for (const [id, job] of pending) {
-        if (!job.abandoned) job.reject(new Error(event.message || 'Worker crashed'));
+        if (job.slot !== slot) continue;
         pending.delete(id);
+        if (!job.abandoned) job.reject(new Error(event.message || 'Worker crashed'));
       }
-      slot.busy = false;
       pump();
     });
     made.push(slot);
@@ -191,8 +201,17 @@ function handleMessage(slot: Slot, msg: WorkerResponse) {
 /** Hands queued jobs to idle workers. */
 function pump() {
   if (!slots) return;
+  if (slots.every((s) => s.dead)) {
+    // No worker is left to run the backlog on, and a job whose promise never settles hangs its
+    // caller forever — fail it here instead, releasing the bitmap the queue still owns.
+    for (const job of queue.splice(0)) {
+      job.bitmap.close();
+      if (!job.abandoned) job.reject(new Error('Background worker pool crashed'));
+    }
+    return;
+  }
   for (const slot of slots) {
-    if (slot.busy) continue;
+    if (slot.dead || slot.busy) continue;
     const job = queue.shift();
     if (!job) return;
     if (job.abandoned) {
@@ -200,6 +219,7 @@ function pump() {
       continue;
     }
     slot.busy = true;
+    job.slot = slot;
     pending.set(job.id, job);
     const req: WorkerRequest = {
       type: 'remove',
@@ -266,7 +286,7 @@ export function poolRemoveBackground(
         reject(e);
         return;
       }
-      const job: Job = { id: nextJobId++, bitmap, opts, resolve, reject, abandoned: false };
+      const job: Job = { id: nextJobId++, bitmap, opts, resolve, reject, abandoned: false, slot: null };
 
       if (opts.signal?.aborted) {
         bitmap.close();
@@ -307,9 +327,11 @@ export function disposePool(): void {
   slots = null;
   // Anything still outstanding must be rejected, not silently dropped — a queued job whose
   // promise never settles hangs its caller (and any batch awaiting it) forever.
-  const orphans = [...queue, ...pending.values()];
-  queue.length = 0;
+  const queued = queue.splice(0);
+  const orphans = [...queued, ...pending.values()];
   pending.clear();
+  // A job that never reached a worker still owns its bitmap; a dispatched one had it transferred.
+  for (const job of queued) job.bitmap.close();
   for (const job of orphans) {
     if (!job.abandoned) job.reject(new DOMException('Aborted', 'AbortError'));
   }

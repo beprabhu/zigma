@@ -14,10 +14,19 @@ import {
   withTx,
 } from './db';
 import { forgetOpen } from './open';
+import { clearSession, readSession, sessionKey } from '../session-store';
+import type { SessionSnapshot } from '../session-store';
 import type { FileRecord, ItemId, ItemRecord, MetaRecord, ToolSlug } from './types';
 
 /** Per-file singleton keys. */
 export const CSV_KEY = 'csv';
+/**
+ * Generate's brief — the instruction document every row's prompt is built on.
+ *
+ * A singleton rather than part of the doc for the same reason the sheet is one: it runs to
+ * document length, and listFiles() reads every doc on every homepage mount.
+ */
+export const BRIEF_KEY = 'brief';
 export const LEDGER_KEY = 'ledger';
 /** The open-tab heartbeat — see `touchLock`. */
 export const LOCK_KEY = 'lock';
@@ -25,7 +34,7 @@ export const LOCK_KEY = 'lock';
 /**
  * One sealed export, as stored under LEDGER_KEY.
  *
- * It exists because `BgItem.batch` is deliberately outside autosave's change signature — stamping
+ * It exists because `BgItem.batch` is deliberately outside the change signature — stamping
  * a 500-image cohort must not re-put 500 cutout blobs to record one number each — so a stamp that
  * moves on its own never reaches the item records. A merge or a split moves nothing BUT stamps,
  * which makes this the only copy of batch membership that is still correct afterwards, and
@@ -175,10 +184,10 @@ export function setName(id: string, name: string): Promise<FileRecord | null> {
 
 // ---- Items ----------------------------------------------------------------
 
-/** Matches lib/bg/autosave.ts:205-208: ~1 MB blobs, two dozen per transaction. */
+/** ~1 MB blobs, two dozen per transaction — sized so one failure cannot lose a whole restore. */
 export const WRITE_CHUNK = 24;
 /**
- * The read side of the same argument. autosave.ts sized its writes so one transaction could not
+ * The read side of the same argument. Writes are sized so one transaction cannot
  * move gigabytes and fail wholesale; a getAll over a 3,000-item file has exactly that shape, and it
  * also spikes memory with every blob deserialized at once. A cursor hands them over in chunks.
  */
@@ -223,7 +232,7 @@ export async function loadItems(
 /**
  * One chunk of puts and deletes.
  *
- * Deletes run FIRST, in their own pass, for the reason autosave.ts:791-796 gives: under quota
+ * Deletes run FIRST, in their own pass: under quota
  * pressure the user's own pruning has to be able to free space, or failing puts starve the deletes
  * forever and the store wedges.
  */
@@ -276,9 +285,6 @@ export function touchLock(fileId: string): Promise<void> {
   return writeMeta(fileId, LOCK_KEY, { tabId: TAB_ID, at: Date.now() } satisfies LockValue);
 }
 
-export function releaseLock(fileId: string): Promise<void> {
-  return clearMeta(fileId, LOCK_KEY);
-}
 
 /** Whether ANOTHER tab has beaten recently. Reads inside the caller's transaction where it matters. */
 export function isHeldElsewhere(lock: unknown, now: number): boolean {
@@ -295,6 +301,28 @@ export interface DeleteResult {
   deleted: boolean;
   /** Set when the delete was refused because another tab has the file open. */
   heldElsewhere?: boolean;
+}
+
+/**
+ * Drops the tab's live snapshot of this file, wherever a product is holding one.
+ *
+ * The resume pointer is not the only thing that can still name a dead file. Every product saves a
+ * snapshot carrying its fileId on unmount, and resolveOpen (lib/files/open.ts) prefers that
+ * snapshot over the pointer — so without this the next rail click mounts the page 'adopted' over
+ * the deleted queue, `known` starts empty because there is nothing left on disk to seed it from,
+ * the pump reads every row as new and the header writer re-mints the header. The file comes back
+ * whole, minutes after the user watched it go.
+ *
+ * Matched by fileId rather than cleared by tool: the snapshot under a tool's slug is very often a
+ * DIFFERENT file of that tool, and it holds the only copy of everything the disk never sees —
+ * dropped File handles, decoded originals — so clearing it over an unrelated delete loses work.
+ */
+function forgetSession(fileId: string): void {
+  for (const tool of ['compositor', 'bg-remover', 'image-generator', 'png-compressor'] as const) {
+    // Snapshots are keyed by product slug; see lib/session-store.ts.
+    const key = sessionKey<SessionSnapshot>(tool);
+    if (readSession(key)?.fileId === fileId) clearSession(key);
+  }
 }
 
 /**
@@ -328,6 +356,7 @@ export async function deleteFile(fileId: string, opts: { force?: boolean } = {})
   // so without this the deleting tab keeps a resume pointer naming a file that no longer exists
   // and the next rail click opens a ghost.
   forgetOpen(fileId);
+  forgetSession(fileId);
   // Announced so a tab with this file open parks its pump instead of writing records back into a
   // file that no longer has a header.
   broadcast({ type: 'deleted', fileId });
@@ -341,16 +370,3 @@ export function sumBlobBytes(blobs: Record<string, Blob>): number {
   return total;
 }
 
-export async function measureFile(fileId: string): Promise<number> {
-  let bytes = 0;
-  await withTx([ITEMS_STORE], 'readonly', (tx) => {
-    const req = tx.objectStore(ITEMS_STORE).openCursor(fileRange(fileId));
-    req.onsuccess = () => {
-      const cursor = req.result;
-      if (!cursor) return;
-      bytes += sumBlobBytes((cursor.value as ItemRecord).blobs ?? {});
-      cursor.continue();
-    };
-  });
-  return bytes;
-}

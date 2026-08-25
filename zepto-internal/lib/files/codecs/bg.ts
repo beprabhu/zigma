@@ -2,7 +2,7 @@
 
 // Cleanup's adapter into the file store.
 //
-// This is lib/bg/autosave.ts's recordOf (:379-415), Signature (:439-458) and the page's
+// This is the old crash net's recordOf, its change signature and the page's
 // itemFromAutosave (app/bg-remover/page.tsx:255-303) re-cut against the generic shape: the plain
 // fields become `data`, the two binaries become `blobs`, and everything the old AutosaveRecord said
 // about WHY a field is or is not persisted still holds and is repeated where it applies.
@@ -55,6 +55,8 @@ export interface BgItemData {
   components?: OriginalComponentReport[];
   verify?: BgVerify;
   semantic?: BgSemantic;
+  /** "This row's evidence was never saved" — see the note on BgItem.qualityUnknown. */
+  qualityUnknown?: boolean;
   bands?: DetectedBand[];
   manualFlag?: 'flag' | 'clear';
   tileFit?: boolean;
@@ -101,7 +103,7 @@ export const bgCodec: ToolCodec<BgItem, BgDoc> = {
   idOf: (item) => item.id,
 
   // Identity comparison throughout: a cutout blob or a regenerated file is only ever swapped
-  // wholesale, so pointer checks do the work content hashing would (autosave.ts:417-419).
+  // wholesale, so pointer checks do the work content hashing would.
   //
   // What is NOT here is the load-bearing part. `batch` is excluded so sealing a 500-item cohort
   // rewrites no rows at all; what makes that safe is not that a stale stamp is harmless but that
@@ -113,10 +115,12 @@ export const bgCodec: ToolCodec<BgItem, BgDoc> = {
     regeneratedFile(item),
     item.name,
     // Each of these is written at most once per row — by the verify sweep, the semantic sidecar,
-    // or a keypress — strictly after the cutout exists. One re-put per affected row, never a
-    // queue-wide rewrite, which is what earns them a place here.
+    // a keypress, or the import that found no evidence to judge the row on — strictly after the
+    // cutout exists. One re-put per affected row, never a queue-wide rewrite, which is what earns
+    // them a place here.
     item.verify ?? null,
     item.semantic ?? null,
+    item.qualityUnknown ?? null,
     item.manualFlag ?? null,
     item.tileFit ?? null,
   ],
@@ -156,6 +160,11 @@ export const bgCodec: ToolCodec<BgItem, BgDoc> = {
       ...(item.originalComponents?.length ? { components: item.originalComponents } : null),
       ...(item.verify ? { verify: item.verify } : null),
       ...(item.semantic ? { semantic: item.semantic } : null),
+      // The mark has to survive the reload it exists to outlive. A row imported from a
+      // pre-signals .zesku has no evidence to be re-judged on, so coming back unmarked would let
+      // the export cohorts read its bounding-box-only 'ok' as verified and seal it into the clean
+      // ZIP — the same silent promotion the mark was added to stop.
+      ...(item.qualityUnknown ? { qualityUnknown: true } : null),
       ...(item.bands?.length ? { bands: item.bands } : null),
       ...(item.manualFlag ? { manualFlag: item.manualFlag } : null),
       ...(item.tileFit !== undefined ? { tileFit: item.tileFit } : null),
@@ -241,6 +250,7 @@ export function itemFromRecord(record: ItemRecord, id: number): BgItem {
     ...(d.components?.length ? { originalComponents: d.components } : null),
     ...(d.verify ? { verify: d.verify } : null),
     ...(d.semantic ? { semantic: d.semantic } : null),
+    ...(d.qualityUnknown ? { qualityUnknown: true } : null),
     ...(d.bands?.length ? { bands: d.bands } : null),
     ...(d.manualFlag ? { manualFlag: d.manualFlag } : null),
     ...(d.tileFit !== undefined ? { tileFit: d.tileFit } : null),

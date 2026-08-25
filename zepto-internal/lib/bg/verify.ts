@@ -43,7 +43,8 @@ const COMPARE_ALPHA = 128;
  *
  * Known gap: band strips (lib/bg/bands.ts) are masked before the region pass and leave no
  * region entry, so a banded cutout can still show a strip of honest-looking disagreement.
- * Bands are not persisted on the item today; carrying them would close this.
+ * `item.bands` now survives both the file store and a .zesku round trip, so closing this is a
+ * matter of folding those strips in here — the data is no longer the obstacle.
  */
 export function filteredRects(item: BgItem): SubjectBounds[] {
   return (item.regionReport ?? []).filter((r) => r.removed).map((r) => r.bounds);

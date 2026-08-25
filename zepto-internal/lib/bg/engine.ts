@@ -335,9 +335,20 @@ function throwIfAborted(signal?: AbortSignal) {
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
 }
 
-/** Normalises any accepted source into a canvas we own and can read pixels from. */
-async function toCanvas(source: BgSource): Promise<HTMLCanvasElement> {
-  if (source instanceof HTMLCanvasElement) return source;
+/**
+ * Normalises any accepted source into a canvas we own and can read pixels from.
+ *
+ * `flatten` composites onto white first and belongs to model INPUTS only. A decoded model OUTPUT
+ * carries its cutout in the alpha channel, so flattening one would set alpha to 255 everywhere
+ * and hand back the background the model just removed.
+ */
+async function toCanvas(
+  source: BgSource,
+  { flatten }: { flatten: boolean },
+): Promise<HTMLCanvasElement> {
+  // Only the unflattened path may hand back the caller's own canvas; flattening has to happen on
+  // a canvas we own, never by repainting theirs.
+  if (source instanceof HTMLCanvasElement && !flatten) return source;
 
   let width: number;
   let height: number;
@@ -365,11 +376,13 @@ async function toCanvas(source: BgSource): Promise<HTMLCanvasElement> {
   canvas.width = width;
   canvas.height = height;
   const c2d = canvas.getContext('2d')!;
-  // Same reason as the worker's drawToCanvas: a fresh canvas is transparent BLACK and the
-  // model is handed RGB with alpha dropped, so a transparent PNG would be inferred as a
-  // product on a black field and any baked semi-transparent shadow as solid black.
-  c2d.fillStyle = '#fff';
-  c2d.fillRect(0, 0, width, height);
+  if (flatten) {
+    // Same reason as the worker's drawToCanvas: a fresh canvas is transparent BLACK and the
+    // model is handed RGB with alpha dropped, so a transparent PNG would be inferred as a
+    // product on a black field and any baked semi-transparent shadow as solid black.
+    c2d.fillStyle = '#fff';
+    c2d.fillRect(0, 0, width, height);
+  }
   c2d.drawImage(drawable, 0, 0);
   if (source instanceof ImageBitmap || source instanceof Blob) {
     (drawable as ImageBitmap).close?.();
@@ -403,7 +416,7 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
   const { spec, model, processor, backend } = await loadModel(id, opts.onLoadProgress);
   throwIfAborted(signal);
 
-  const sourceCanvas = await toCanvas(source);
+  const sourceCanvas = await toCanvas(source, { flatten: true });
   const width = sourceCanvas.width;
   const height = sourceCanvas.height;
   if (!width || !height) throw new Error('Image has no dimensions');
@@ -424,7 +437,7 @@ export async function removeBackground(source: BgSource, opts: RemoveOptions = {
       throw new Error((await res.text()) || `Background server error ${res.status}`);
     }
     const outBlob = await res.blob();
-    const outCanvas = await toCanvas(outBlob);
+    const outCanvas = await toCanvas(outBlob, { flatten: false });
     const ctx = outCanvas.getContext('2d')!;
     const pixels = ctx.getImageData(0, 0, outCanvas.width, outCanvas.height);
     if (refine) {

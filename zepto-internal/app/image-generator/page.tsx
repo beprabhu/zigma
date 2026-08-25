@@ -39,7 +39,7 @@ import { Canvas, CanvasToolbar, LeftPanel, PanelSection, RightPanel, StudioShell
 import { QueueSearch, matchesTerms, recordValues, searchTerms } from '@/components/queue-search';
 import { useFileStore, type LoadedFile } from '@/lib/files/use-file-store';
 import { EMPTY_GEN_DOC, genCodec, hydrateImages, type GenDoc } from '@/lib/files/codecs/gen';
-import { CSV_KEY } from '@/lib/files/store';
+import { BRIEF_KEY, CSV_KEY } from '@/lib/files/store';
 import { daysUntilExpiry } from '@/lib/files/sweep';
 import { useNewFileGeneration } from '@/components/new-file-boundary';
 import { GenDialog, GenGrid } from '@/components/image-generator/gen-grid';
@@ -126,10 +126,11 @@ function ImageGeneratorFile() {
   const [opened] = React.useState(() => resolveOpen('image-generator', readSession(GEN_SESSION)));
   const revived = opened.snapshot;
 
-  // Brief: never written to storage, on purpose. It is document-sized and specific to one batch,
-  // so persisting it would silently apply an old brief to a new CSV. Surviving a product switch
-  // is a different matter — the CSV it was written for is still sitting in the panel — so it
-  // rides along in the session snapshot with the rest of the run.
+  // Brief: stored per FILE, never globally. The distinction is the whole point — a brief belongs to
+  // one batch, so a global setting would silently apply an old one to a new CSV, but a brief that
+  // dies with the tab is worse: the file reopens showing brief.md in the panel while `brief` is
+  // empty, and Generate then bills Azure for prompts missing the half that shapes them. It lives in
+  // its own meta singleton (BRIEF_KEY) beside the sheet, mirrored below.
   const [brief, setBrief] = React.useState(() => revived?.brief ?? '');
   const [briefName, setBriefName] = React.useState<string | null>(() => revived?.briefName ?? null);
   // The brief renders as an .md tile in the panel; this opens its editor modal.
@@ -215,6 +216,11 @@ function ImageGeneratorFile() {
       if (doc.nameCols.length) setNameCols((prev) => (prev.length ? prev : doc.nameCols));
       if (doc.excluded.length) setExcluded((prev) => (prev.length ? prev : doc.excluded));
     }
+    // The brief, from its own singleton. Seeded before anything can send a prompt, so a restored
+    // run never bills Azure for the briefless half of its own instructions.
+    const storedBrief = loaded.meta[BRIEF_KEY] as { text?: string; name?: string | null } | undefined;
+    if (storedBrief?.text) setBrief((prev) => (prev.trim() ? prev : storedBrief.text ?? ''));
+    if (storedBrief?.name) setBriefName((prev) => prev ?? storedBrief.name ?? null);
     const sheet = loaded.meta[CSV_KEY] as { text?: string } | undefined;
     // Re-parsed rather than stored twice: the rows the panel needs for a column remap come from
     // the same text the sheet was imported from, so the two can never disagree.
@@ -225,6 +231,19 @@ function ImageGeneratorFile() {
     }
     if (loaded.items.length) {
       setItems((prev) => (prev.length ? [...prev, ...loaded.items] : loaded.items));
+      /**
+       * The typed list, put back beside the rows it produced.
+       *
+       * Not cosmetic — it is the difference between a restore and a data-loss trap. The box is
+       * live from the moment the page mounts, and applySubjects reconciles the WHOLE queue against
+       * whatever it contains; leaving it empty meant the first keystroke matched nothing, dropped
+       * every restored row, and the pump then deleted their images off disk. Rebuilt with the same
+       * helper dropItems uses after a delete, so the text and the rows can never disagree.
+       */
+      if (!doc?.csvName) {
+        const lines = loaded.items.map((it) => it.subject ?? '').filter(Boolean);
+        if (lines.length) setSubjects((prev) => (prev.trim() ? prev : formatPromptList(lines)));
+      }
       void hydrateImages(loaded.records, (id, image) => {
         setItems((prev) =>
           prev.map((it) => (it.id === id ? { ...it, image, status: 'done' as const } : it)),
@@ -245,7 +264,7 @@ function ImageGeneratorFile() {
     codec: genCodec,
     items,
     doc: fileDoc,
-    metaKeys: [CSV_KEY],
+    metaKeys: [CSV_KEY, BRIEF_KEY],
     fileId: opened.fileId,
     // A queue carried across a product switch is not a file being opened: its rows are already on
     // screen AND already on disk.
@@ -266,6 +285,18 @@ function ImageGeneratorFile() {
     csvMirrored.current = true;
     setFileMeta(CSV_KEY, csvText);
   }, [csvText, setFileMeta]);
+
+  /**
+   * Mirrors the brief into the file. Same one-slot writer and same mount guard as the sheet above:
+   * only a brief that existed in THIS session may clear one, so a fresh mount cannot write a null
+   * over the brief still on its way in from disk.
+   */
+  const briefMirrored = React.useRef(false);
+  React.useEffect(() => {
+    if (!brief && !briefName && !briefMirrored.current) return;
+    briefMirrored.current = true;
+    setFileMeta(BRIEF_KEY, brief || briefName ? { text: brief, name: briefName } : null);
+  }, [brief, briefName, setFileMeta]);
 
   /**
    * "Kept" / "Deletes in N days", and the toggle for both. Absent until the file exists on disk —
@@ -795,6 +826,10 @@ function ImageGeneratorFile() {
     setCsvName(null);
     setHeaders([]);
     setRecords([]);
+    // The mirror too, or the sheet outlives the clear: the meta singleton is what handleLoadedFile
+    // re-parses on open, so a file cleared and reloaded came back with ghost headers, ghost records
+    // driving reference detection, and a row count on the homepage card for rows that do not exist.
+    setCsvText(null);
     setNameCols([]);
     setExcluded([]);
     setProgress(null);
@@ -811,6 +846,9 @@ function ImageGeneratorFile() {
     setCsvName(null);
     setHeaders([]);
     setRecords([]);
+    // See clearAll: the mirror is the copy that survives a reload, so dropping the sheet has to
+    // drop it too or the next open resurrects the sheet the user just removed.
+    setCsvText(null);
     setNameCols([]);
     setExcluded([]);
     setProgress(null);
@@ -973,7 +1011,11 @@ function ImageGeneratorFile() {
                     id="gen-subjects"
                     value={subjects}
                     onChange={applySubjects}
-                    disabled={busy}
+                    // inputsLocked, not busy: this box MINTS ROW IDS, and until the load lands the
+                    // live array it mints from is empty — so a line typed during the load is handed
+                    // ids 0, 1, 2…, the very ids the rows still arriving already carry. Every
+                    // sibling input is gated this way; this one was the hole.
+                    disabled={inputsLocked}
                   />
                 </Field>
               )}
