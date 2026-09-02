@@ -319,7 +319,8 @@ function ImageModelPane() {
         />
         <FieldDescription>
           Raise it until the deployment&rsquo;s rate limit pushes back (429s), then step down
-          one — or set a request budget below instead.
+          one — or set a request budget below instead. A rate-limited row is retried through
+          that budget rather than failed.
         </FieldDescription>
       </Field>
       <Field>
@@ -340,7 +341,7 @@ function ImageModelPane() {
         />
         <FieldDescription>
           {rpm === 0
-            ? 'No throttle — products only cap how many requests run at once.'
+            ? 'No throttle until Azure pushes back: on the first 429 this tab pauses every lane, then paces itself from the wait Azure asked for. Set a number to pace from the start.'
             : `One request every ${Math.round(600 / rpm) / 10}s, evenly spaced — Azure meters RPM in per-second slices, so a burst 429s even under the minute total. Match your deployment's limit.`}
         </FieldDescription>
       </Field>

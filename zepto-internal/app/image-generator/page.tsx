@@ -52,8 +52,8 @@ import {
   PROMPT_WARN_CHARS, ROW_HEADING, SUBJECT_HEADING, buildRowPrompt, buildSubjectPrompt,
   isPromptEmpty, referenceUrls,
 } from '@/lib/row-prompt';
-import { callAzure, callAzureGenerate, loadImageFromUrl, mockGenerate } from '@/lib/pipeline';
-import { readParallel } from '@/lib/rate';
+import { callAzure, callAzureGenerate, loadImageFromUrl, mockGenerate, type RetryInfo } from '@/lib/pipeline';
+import { readParallel, throttleNote } from '@/lib/rate';
 import { canvasToPngBlob, mapWithLimit, pickSave, releaseCanvas, saveTo } from '@/lib/bg/batch';
 import { readSession, restingStatus, saveSession, sessionKey } from '@/lib/session-store';
 import { resolveOpen } from '@/lib/files/open';
@@ -369,6 +369,7 @@ function ImageGeneratorFile() {
         items: session.items.map((item) => ({
           ...item,
           status: restingStatus(item.status, item.image !== null),
+          retry: undefined,
         })),
       });
     },
@@ -507,6 +508,7 @@ function ImageGeneratorFile() {
 
   const openItem = items.find((it) => it.id === openId) ?? null;
   const doneCount = items.filter((it) => it.status === 'done' && it.image).length;
+  const failedCount = items.filter((it) => it.status === 'error').length;
 
   // Sampled from the first row: the brief dominates the length, so one row is representative
   // and this stays cheap no matter how long the CSV is.
@@ -618,6 +620,8 @@ function ImageGeneratorFile() {
     const editing = resolvePromptSource(from, { hasLatest: !!item.image, hasOriginal: true }) === 'latest';
     patchItem(item.id, { status: 'generating', errorMsg: undefined });
     const started = performance.now();
+    // A 429 is not this row's failure yet — the shared gate is holding it for another go.
+    const onRetry = (retry: RetryInfo) => patchItem(item.id, { retry });
     try {
       /**
        * The row's reference images, when a picked column holds URLs.
@@ -649,19 +653,20 @@ function ImageGeneratorFile() {
         : editing
           // The size the set is being generated at, not 'auto': the input is already that
           // shape, and letting the model re-pick would break a row out of the set.
-          ? await callAzure([item.image!], { endpoint, apiKey: azureKey, prompt, size, signal })
+          ? await callAzure([item.image!], { endpoint, apiKey: azureKey, prompt, size, signal, onRetry })
           : refImages.length
             // With references attached this is an EDIT, not a generation — same endpoint Compose
             // uses. `size` stays the set's, so one row having a portrait source cannot make it
             // come back a different shape from its neighbours.
-            ? await callAzure(refImages, { endpoint, apiKey: azureKey, prompt, size, signal })
-            : await callAzureGenerate(prompt, { endpoint, apiKey: azureKey, size, signal });
+            ? await callAzure(refImages, { endpoint, apiKey: azureKey, prompt, size, signal, onRetry })
+            : await callAzureGenerate(prompt, { endpoint, apiKey: azureKey, size, signal, onRetry });
       patchItem(item.id, {
         status: 'done',
         image,
         sentPrompt: prompt,
         durationMs: performance.now() - started,
         errorMsg: undefined,
+        retry: undefined,
         // `item` is the pre-run snapshot: if it had a result, that result becomes the undo slot.
         ...(item.image
           ? { prev: { image: item.image, sentPrompt: item.sentPrompt, durationMs: item.durationMs } }
@@ -671,10 +676,10 @@ function ImageGeneratorFile() {
     } catch (e) {
       if ((e as Error).name === 'AbortError') {
         // Stopped, not failed: the row goes back exactly where it was before this run.
-        patchItem(item.id, { status: item.status, errorMsg: undefined });
+        patchItem(item.id, { status: item.status, errorMsg: undefined, retry: undefined });
         return false;
       }
-      patchItem(item.id, { status: 'error', errorMsg: (e as Error).message });
+      patchItem(item.id, { status: 'error', errorMsg: (e as Error).message, retry: undefined });
       return false;
     }
   }
@@ -682,6 +687,15 @@ function ImageGeneratorFile() {
   async function handleGenerateAll() {
     if (busy || !guards()) return;
     await runBatch(itemsRef.current, 'generated');
+  }
+
+  /**
+   * Every row the last run left in error, sent again. Errors cluster — a rate-limit storm
+   * leaves a grid of them at once — and clearing that one row at a time is the wrong shape.
+   */
+  async function handleRetryFailed() {
+    if (busy || !guards()) return;
+    await runBatch(itemsRef.current.filter((it) => it.status === 'error'), 'retried');
   }
 
   /** One run over `todo` — Generate-all and Regenerate-selected share everything but the verb. */
@@ -708,9 +722,10 @@ function ImageGeneratorFile() {
         if (await generateOne(item, controller.signal, promptOverride, from)) ok++;
         finished++;
         const left = eta.remaining(finished, todo.length);
+        const throttled = throttleNote();
         setProgress({
           pct: (finished / todo.length) * 100,
-          text: `${finished} of ${todo.length} — ${limit} at a time with ${mock ? 'mock' : 'azure'}…${left ? ` · ${left}` : ''}`,
+          text: `${finished} of ${todo.length} — ${limit} at a time with ${mock ? 'mock' : 'azure'}…${left ? ` · ${left}` : ''}${throttled ? ` · ${throttled}` : ''}`,
         });
       });
     } finally {
@@ -911,6 +926,12 @@ function ImageGeneratorFile() {
         {running ? <Spinner data-icon="inline-start" /> : <SparklesIcon data-icon="inline-start" />}
         {items.length ? `Generate ${items.length} image${items.length > 1 ? 's' : ''}` : 'Generate'}
       </Button>
+      {!running && failedCount > 0 && (
+        <Button variant="outline" onClick={handleRetryFailed} title="Send every row that ended in error again">
+          <RefreshCwIcon data-icon="inline-start" />
+          Retry failed ({failedCount})
+        </Button>
+      )}
       {running && (
         <Button variant="outline" onClick={() => genAbortRef.current?.abort()}>
           <CircleStopIcon data-icon="inline-start" />

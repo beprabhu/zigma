@@ -4,6 +4,7 @@
 // AI-edit prompt the same way, and one assembly rule for both is what keeps the two previews
 // honest about each other.
 
+import type { RetryInfo } from '@/lib/pipeline';
 import type { CsvRecord } from './csv';
 import { joinNameColumns } from './csv-name';
 
@@ -60,6 +61,14 @@ export interface GenItem {
    * image; overwritten by the next regenerate, cleared by undo.
    */
   prev?: { image: HTMLImageElement; sentPrompt?: string; durationMs?: number };
+  /**
+   * Set while a rate-limited row waits for its next attempt, so the cell can say "retrying"
+   * instead of looking stuck. Transient by construction — outside the codec's signature, never
+   * written to disk, dropped from the session snapshot — and cleared by whichever patch ends
+   * the run. Deliberately NOT a status: a status this suite does not know how to rest comes
+   * back from a product switch as a spinner that never finishes (see lib/session-store.ts).
+   */
+  retry?: RetryInfo;
 }
 
 /**
@@ -93,6 +102,19 @@ export function reconcileSubjectItems(subjects: string[], existing: GenItem[]): 
 }
 
 /**
+ * A row's identity as a string, independent of column ORDER.
+ *
+ * `JSON.stringify` of a record serialises keys in insertion order, which for a parsed sheet is the
+ * header order — so the same products re-exported with two columns swapped would match nothing,
+ * rebuild every row imageless, and let the pump delete the images off disk. Sorting the entries
+ * costs nothing at these sizes and makes the key describe the DATA rather than the spreadsheet's
+ * column layout.
+ */
+function recordKey(record: CsvRecord): string {
+  return JSON.stringify(Object.entries(record ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+}
+
+/**
  * A dropped sheet as queue items, reusing the item that already holds each row.
  *
  * The sheet-mode twin of reconcileSubjectItems above, matched on the row's RECORD — in a CSV run
@@ -106,19 +128,6 @@ export function reconcileSubjectItems(subjects: string[], existing: GenItem[]): 
  * NEW row without its old image — deliberate: the image was generated from the old values, and
  * quietly keeping it would pin a stale picture on a row that no longer says what it said.
  */
-/**
- * A row's identity as a string, independent of column ORDER.
- *
- * `JSON.stringify` of a record serialises keys in insertion order, which for a parsed sheet is the
- * header order — so the same products re-exported with two columns swapped would match nothing,
- * rebuild every row imageless, and let the pump delete the images off disk. Sorting the entries
- * costs nothing at these sizes and makes the key describe the DATA rather than the spreadsheet's
- * column layout.
- */
-function recordKey(record: CsvRecord): string {
-  return JSON.stringify(Object.entries(record ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
-}
-
 export function reconcileCsvItems(
   records: CsvRecord[],
   nameColumns: readonly string[],

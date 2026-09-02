@@ -17,6 +17,21 @@ pnpm setup:bg     # one-time: fetches the ONNX weights + WASM runtime (see below
 pnpm dev          # http://localhost:3000
 ```
 
+### Locking it down
+
+The dev server listens on every interface, so on an office network the app — and the Azure
+budget behind it — is one URL away from anyone. Set a shared secret and every page and API
+route requires it:
+
+```bash
+ZIGMA_ACCESS_TOKEN=some-long-random-string pnpm dev
+```
+
+Share `http://<your-ip>:3000/?token=some-long-random-string` once; opening it sets an httpOnly
+cookie and redirects to the plain address, which then works for 30 days. Scripts can send
+`Authorization: Bearer <token>` instead. With the variable unset, nothing is gated — a local
+`pnpm dev` behaves as it always has. It is a shared password, not per-user identity.
+
 `http://localhost:3000/compositor?mock=1` runs the compositor without an Azure key — generation
 is mocked, which is the fastest way to exercise the whole pipeline including background removal.
 

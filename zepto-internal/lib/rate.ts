@@ -105,7 +105,14 @@ const admitted: number[] = [];
 export async function acquireRpmSlot(signal?: AbortSignal): Promise<void> {
   for (;;) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    const rpm = readRpm();
+    // A 429 anywhere in the tab holds EVERY lane here until Azure's wait is over — checked
+    // before the budget, so it applies even when no budget is set.
+    const cooling = cooldownUntil - Date.now();
+    if (cooling > 0) {
+      await sleep(cooling + 25, signal);
+      continue;
+    }
+    const rpm = effectiveRpm();
     if (rpm <= 0) break;
     const now = Date.now();
     while (admitted.length && now - admitted[0] >= 60_000) admitted.shift();
@@ -120,4 +127,65 @@ export async function acquireRpmSlot(signal?: AbortSignal): Promise<void> {
     await sleep(Math.max(gapWait, windowWait) + 25, signal);
   }
   admitted.push(Date.now());
+}
+
+// ---- Backing off after a 429 ---------------------------------------------------------------
+// The budget above only helps once someone has set it, and the default is unlimited — which is
+// why a fresh install's first big batch is a burst, and a burst is an instant 429 on any real
+// deployment. So a 429 teaches the tab two things, both in memory and both for this tab only:
+// a cooldown every lane waits out together, and a pace derived from the wait Azure asked for,
+// used whenever no budget is set. Neither is written to Settings: a value the user never typed
+// must not appear there, and the deployment's limit is Azure's to state, not ours to guess and
+// save.
+
+/** Nothing before this may start. Shared by every lane and every product in the tab. */
+let cooldownUntil = 0;
+/**
+ * The pace the deployment actually tolerates, learned from Retry-After. Applies only while the
+ * Settings budget is 0, and only tightens — a second 429 with a shorter wait does not loosen it.
+ */
+let sessionRpm = 0;
+/** 429s since the last success, for the fallback back-off when Azure states no wait. */
+let streak = 0;
+
+const FALLBACK_WAIT_MS = 5_000;
+const MAX_WAIT_MS = 60_000;
+/** The realistic S0 pace when Azure gave us nothing to derive one from. */
+const FALLBACK_SESSION_RPM = 10;
+
+/**
+ * Records a 429 and returns how long the tab will hold before the next request. `retryAfterMs`
+ * is Azure's own figure when it stated one (see lib/retry-after.ts), else the wait doubles per
+ * consecutive 429. Jittered so repeated penalties never line up to the millisecond.
+ */
+export function penalize(retryAfterMs: number | null): number {
+  streak += 1;
+  const asked = retryAfterMs ?? FALLBACK_WAIT_MS * 2 ** (streak - 1);
+  const wait = Math.min(MAX_WAIT_MS, Math.round(asked * (0.8 + Math.random() * 0.4)));
+  cooldownUntil = Math.max(cooldownUntil, Date.now() + wait);
+  if (readRpm() <= 0) {
+    const derived = retryAfterMs ? Math.floor(60_000 / Math.max(retryAfterMs, 1_000)) : FALLBACK_SESSION_RPM;
+    const paced = Math.max(1, clampRpm(derived));
+    sessionRpm = sessionRpm ? Math.min(sessionRpm, paced) : paced;
+  }
+  return wait;
+}
+
+/** A request got through: the back-off ladder resets. The learned pace stays — the limit did not move. */
+export function clearPenalty(): void {
+  streak = 0;
+}
+
+/** The Settings budget when set, else whatever a 429 taught this tab, else unlimited. */
+function effectiveRpm(): number {
+  const set = readRpm();
+  return set > 0 ? set : sessionRpm;
+}
+
+/** For progress lines: '' while nothing is throttling, else a short note on what is. */
+export function throttleNote(): string {
+  const cooling = cooldownUntil - Date.now();
+  if (cooling > 0) return `Throttled by Azure — waiting ${Math.ceil(cooling / 1000)}s`;
+  if (readRpm() <= 0 && sessionRpm > 0) return `Pacing at ${sessionRpm}/min after a rate limit`;
+  return '';
 }

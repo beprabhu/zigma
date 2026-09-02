@@ -4,6 +4,7 @@
 // quantization). Returns image bytes with X-Input-Size / X-Output-Size, mirroring
 // /api/compress so callers can swap between the two.
 import { NextRequest, NextResponse } from 'next/server';
+import { PayloadTooLarge, readBodyCapped } from '@/lib/api-guard';
 import { execFile } from 'node:child_process';
 import { access, copyFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -32,8 +33,17 @@ async function findBinary(name: string): Promise<string | null> {
   }
 }
 
+/** A 4K RGBA PNG is ~30 MB; nothing this tool exports is bigger. */
+const MAX_PNG_BYTES = 40 * 1024 * 1024;
+
 export async function POST(req: NextRequest) {
-  const png = Buffer.from(await req.arrayBuffer());
+  let png: Uint8Array<ArrayBuffer>;
+  try {
+    png = await readBodyCapped(req, MAX_PNG_BYTES);
+  } catch (e) {
+    if (e instanceof PayloadTooLarge) return e.response();
+    throw e;
+  }
   if (!png.byteLength) return NextResponse.json({ error: 'Empty body' }, { status: 400 });
 
   const lossless = req.headers.get('x-lossless') === '1';
@@ -81,7 +91,10 @@ export async function POST(req: NextRequest) {
       },
     });
   } catch (e) {
-    return NextResponse.json({ error: `Compression failed: ${(e as Error).message}` }, { status: 500 });
+    // The exec error names the binary's path and the temp file — the log's business, not the
+    // browser's. The response says what failed; the detail is one server log line away.
+    console.error('[compress-local] compression failed', e);
+    return NextResponse.json({ error: 'Compression failed on the server — the file was exported uncompressed.' }, { status: 500 });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

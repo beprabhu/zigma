@@ -1,8 +1,8 @@
 // Client-side image pipeline: fetch via proxy, preprocess, call Azure, decode result.
 
 import { readImageQuality, type ImageQuality } from '@/lib/quality';
-import { acquireRpmSlot } from '@/lib/rate';
-import { recordUsage } from '@/lib/usage';
+import { acquireRpmSlot, clearPenalty, penalize } from '@/lib/rate';
+import { recordUsage, type AzureUsage } from '@/lib/usage';
 
 /**
  * The same-origin URL that serves a remote image through the proxy.
@@ -76,6 +76,64 @@ export function mockComposite(images: HTMLImageElement[]): Promise<HTMLImageElem
   });
 }
 
+/** An Azure answer that was not an image. `status` is Azure's; 429 carries its stated wait. */
+export class AzureError extends Error {
+  constructor(message: string, readonly status: number, readonly retryAfterMs: number | null = null) {
+    super(message);
+    this.name = 'AzureError';
+  }
+}
+
+/** One rate-limited retry, as reported to a caller that wants to show it. */
+export interface RetryInfo {
+  attempt: number;
+  of: number;
+  /** When the tab will let the row try again. */
+  until: number;
+}
+
+/** 429 retries per call — five attempts in all, each one paced by the shared gate. */
+const RATE_LIMIT_RETRIES = 4;
+
+/**
+ * The proxy round trip, retried through the shared gate on 429.
+ *
+ * The retry lives HERE, not in the route, because a 429 is information every lane needs: the
+ * moment one row learns Azure is throttling, penalize() holds the whole tab, and the next
+ * acquireRpmSlot — this one and every other lane's — waits it out together, then re-admits at
+ * the pace Azure asked for. A route that slept and retried privately would leave the other
+ * lanes firing into the same limit. The body is built once by the caller and re-sent as-is;
+ * the hop it re-sends over is localhost, and the Azure leg costs the same wherever the loop is.
+ */
+async function postGenerate(
+  body: string,
+  signal: AbortSignal | undefined,
+  onRetry: ((retry: RetryInfo) => void) | undefined,
+): Promise<{ b64: string; usage: AzureUsage | null }> {
+  for (let attempt = 0; ; attempt++) {
+    await acquireRpmSlot(signal);
+    const res = await fetch('/api/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal,
+      body,
+    });
+    const json = await res.json().catch(() => ({}));
+    if (res.ok) {
+      clearPenalty();
+      return json;
+    }
+    const error = new AzureError(
+      json.error || `Generate failed (${res.status})`,
+      res.status,
+      typeof json.retryAfterMs === 'number' ? json.retryAfterMs : null,
+    );
+    if (res.status !== 429 || attempt >= RATE_LIMIT_RETRIES) throw error;
+    const wait = penalize(error.retryAfterMs);
+    onRetry?.({ attempt: attempt + 1, of: RATE_LIMIT_RETRIES, until: Date.now() + wait });
+  }
+}
+
 export async function callAzure(
   images: HTMLImageElement[],
   opts: {
@@ -88,27 +146,22 @@ export async function callAzure(
     size?: 'auto' | '1024x1024' | '1536x1024' | '1024x1536';
     /** Stop button support: aborts the proxy request (the route forwards the abort to Azure). */
     signal?: AbortSignal;
+    /** Told each time a 429 schedules another attempt — for a row that wants to say so. */
+    onRetry?: (retry: RetryInfo) => void;
   },
 ): Promise<HTMLImageElement> {
-  // Suite-wide RPM throttle, from Settings → Image model (lib/rate.ts). No-op when unset.
-  await acquireRpmSlot(opts.signal);
-  const res = await fetch('/api/generate', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    signal: opts.signal,
-    body: JSON.stringify({
-      endpoint: opts.endpoint,
-      apiKey: opts.apiKey,
-      prompt: opts.prompt,
-      images: images.map(preprocess),
-      background: 'auto',
-      // Suite-wide, from Settings → Quality (lib/quality.ts). Products no longer pass this.
-      quality: opts.quality ?? readImageQuality(),
-      size: opts.size ?? 'auto',
-    }),
+  // Encoded once: a retry re-sends these bytes rather than re-encoding every source canvas.
+  const body = JSON.stringify({
+    endpoint: opts.endpoint,
+    apiKey: opts.apiKey,
+    prompt: opts.prompt,
+    images: images.map(preprocess),
+    background: 'auto',
+    // Suite-wide, from Settings → Quality (lib/quality.ts). Products no longer pass this.
+    quality: opts.quality ?? readImageQuality(),
+    size: opts.size ?? 'auto',
   });
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(json.error || `Generate failed (${res.status})`);
+  const json = await postGenerate(body, opts.signal, opts.onRetry);
   recordUsage('edits', json.usage);
   return b64ToImage(json.b64);
 }
@@ -147,26 +200,20 @@ export async function callAzureGenerate(
     size?: 'auto' | '1024x1024' | '1536x1024' | '1024x1536';
     /** Stop button support: aborts the proxy request (the route forwards the abort to Azure). */
     signal?: AbortSignal;
+    /** Told each time a 429 schedules another attempt — for a row that wants to say so. */
+    onRetry?: (retry: RetryInfo) => void;
   },
 ): Promise<HTMLImageElement> {
-  // Suite-wide RPM throttle, from Settings → Image model (lib/rate.ts). No-op when unset.
-  await acquireRpmSlot(opts.signal);
-  const res = await fetch('/api/generate', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    signal: opts.signal,
-    body: JSON.stringify({
-      mode: 'generations',
-      endpoint: opts.endpoint,
-      apiKey: opts.apiKey,
-      prompt,
-      // Suite-wide, from Settings → Quality (lib/quality.ts).
-      quality: opts.quality ?? readImageQuality(),
-      size: opts.size ?? '1024x1024',
-    }),
+  const body = JSON.stringify({
+    mode: 'generations',
+    endpoint: opts.endpoint,
+    apiKey: opts.apiKey,
+    prompt,
+    // Suite-wide, from Settings → Quality (lib/quality.ts).
+    quality: opts.quality ?? readImageQuality(),
+    size: opts.size ?? '1024x1024',
   });
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(json.error || `Generate failed (${res.status})`);
+  const json = await postGenerate(body, opts.signal, opts.onRetry);
   recordUsage('generations', json.usage);
   return b64ToImage(json.b64);
 }
