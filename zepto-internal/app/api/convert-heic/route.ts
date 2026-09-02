@@ -12,13 +12,23 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
+import { PayloadTooLarge, readBodyCapped } from '@/lib/api-guard';
+
 const run = promisify(execFile);
+/** An iPhone HEIC is single-digit MB; a ProRAW is not what this converts. */
+const MAX_HEIC_BYTES = 40 * 1024 * 1024;
 
 export async function POST(request: Request): Promise<Response> {
   if (process.platform !== 'darwin') {
     return new Response('HEIC fallback conversion needs macOS (sips)', { status: 501 });
   }
-  const bytes = Buffer.from(await request.arrayBuffer());
+  let bytes: Uint8Array<ArrayBuffer>;
+  try {
+    bytes = await readBodyCapped(request, MAX_HEIC_BYTES);
+  } catch (e) {
+    if (e instanceof PayloadTooLarge) return e.response();
+    throw e;
+  }
   if (!bytes.length) return new Response('Empty body', { status: 400 });
 
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zesku-heic-'));
@@ -32,8 +42,9 @@ export async function POST(request: Request): Promise<Response> {
       headers: { 'content-type': 'image/jpeg', 'cache-control': 'no-store' },
     });
   } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    return new Response(`sips could not convert this file: ${message}`, { status: 422 });
+    // sips' message names the temp path; the caller only needs to know the fallback failed too.
+    console.error('[convert-heic] sips could not convert this file', e);
+    return new Response('sips could not convert this file', { status: 422 });
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }

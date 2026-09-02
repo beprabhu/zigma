@@ -13,9 +13,12 @@
 //           Ollama answered, so the UI can hide the pass instead of failing per image
 //   POST -> JPEG bytes in, {extra, what} out
 import { NextRequest, NextResponse } from 'next/server';
+import { PayloadTooLarge, readBodyCapped } from '@/lib/api-guard';
 
 const OLLAMA_URL = process.env.OLLAMA_URL ?? 'http://127.0.0.1:11434';
 const MODEL = process.env.SEMANTIC_MODEL ?? 'qwen2.5vl:7b';
+/** The white-flattened cutout the checker looks at — a PNG, single-digit MB. */
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 
 /**
  * Measured 93.1% recall on semantic defects / 77.0% specificity, zero-shot, over 405 labelled
@@ -73,14 +76,20 @@ export async function GET() {
         { status: 503 },
       );
     }
-    return NextResponse.json({ available: true, model: MODEL, url: OLLAMA_URL });
+    return NextResponse.json({ available: true, model: MODEL });
   } catch (e) {
     return NextResponse.json({ available: false, reason: (e as Error).message }, { status: 503 });
   }
 }
 
 export async function POST(req: NextRequest) {
-  const body = await req.arrayBuffer();
+  let body: Uint8Array<ArrayBuffer>;
+  try {
+    body = await readBodyCapped(req, MAX_IMAGE_BYTES);
+  } catch (e) {
+    if (e instanceof PayloadTooLarge) return e.response();
+    throw e;
+  }
   if (!body.byteLength) return NextResponse.json({ error: 'Empty body' }, { status: 400 });
 
   try {
@@ -135,12 +144,10 @@ export async function POST(req: NextRequest) {
       model: MODEL,
     });
   } catch (e) {
+    // Same rule as remove-hq: the address and the start command go to the log, not the client.
+    console.error(`[semantic] Ollama unreachable at ${OLLAMA_URL} — start it with: ollama serve`, e);
     return NextResponse.json(
-      {
-        error:
-          `Cannot reach the Qwen sidecar at ${OLLAMA_URL}. ` +
-          `Start it with: ollama serve (${(e as Error).message})`,
-      },
+      { error: 'The semantic-check sidecar is not running. Turn the check off, or ask whoever runs this server to start it.' },
       { status: 502 },
     );
   }

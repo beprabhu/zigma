@@ -39,6 +39,10 @@ export function genStatusLine(item: GenItem): { text: string; error: boolean } {
   if (item.status === 'done' && item.durationMs !== undefined) {
     return { text: `✓ done in ${(item.durationMs / 1000).toFixed(1)} s`, error: false };
   }
+  // Waiting out a 429 looks identical to generating from the cell's point of view; say so.
+  if (item.status === 'generating' && item.retry) {
+    return { text: `rate limited — retry ${item.retry.attempt} of ${item.retry.of} shortly`, error: false };
+  }
   return { text: STATUS_TEXT[item.status], error: false };
 }
 
