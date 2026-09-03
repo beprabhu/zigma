@@ -428,6 +428,34 @@ export function recordBatch(
  */
 export type BatchStaleness = 'current' | 'stale' | 'unknown';
 
+/**
+ * Where a batch stands, across all three places its existence is recorded.
+ *
+ * A batch is not one row in one table. It is a sealed PLAN until its ZIP is written, a ledger
+ * RECORD afterwards, and a set of per-row STAMPS that outlive the record across a reload. Every
+ * screen used to union some subset of those for itself and reach its own conclusions, which is
+ * how the rail could count a batch the dialog could not show.
+ */
+export type BatchState =
+  /** Sealed, its ZIP never written. Exists only as an open plan — nothing is stamped yet. */
+  | 'waiting'
+  /** Written, and every image still matches what went into it. */
+  | 'current'
+  /** Written, but an image changed afterwards, so the file on disk is out of date. */
+  | 'stale'
+  /** Stamps survived a reload. What shipped cannot be verified, and may not even be numbered. */
+  | 'restored';
+
+/** What a batch will allow, decided once here rather than re-derived by each surface. */
+export interface BatchAbilities {
+  /** Its ZIP can be produced again (or for the first time) under the names it already owns. */
+  download: boolean;
+  /** It can take part in a multi-batch action — it is on disk and its numbering is known. */
+  select: boolean;
+  /** It can be merged or split: on disk, numbered, and its contents accounted for. */
+  reshape: boolean;
+}
+
 export interface LedgerBatch {
   batch: number;
   /** How many images the ZIP holds, or null when only stamps survive (a restored project). */
@@ -438,10 +466,15 @@ export interface LedgerBatch {
    * stays reserved (see nextAllocation).
    */
   present: number;
+  state: BatchState;
+  /** Kept as the older name for the same fact, so guards reading it do not all have to move. */
   staleness: BatchStaleness;
   offset?: number;
   savedAt?: number;
   fileName?: string;
+  can: BatchAbilities;
+  /** Why `can.download` is false, in words a person can act on. Absent when it is true. */
+  blocked?: string;
 }
 
 /**
@@ -474,11 +507,20 @@ export interface LedgerSummary {
 export function summarizeLedger(
   items: readonly BgItem[],
   ledger: readonly BatchRecord[] = [],
-  options: CohortOptions = {},
+  options: CohortOptions & {
+    /**
+     * Sealed batches whose ZIP has not been written. THE third source: a plan is stamped onto its
+     * rows and recorded in the ledger only once the save lands, so before that a batch exists
+     * nowhere else — and a summary built without them reports finished work as not existing.
+     */
+    plans?: readonly ExportPlan[];
+  } = {},
 ): LedgerSummary {
-  const { claimed: claimedIds } = options;
+  const { claimed: claimedIds, plans = [] } = options;
   const records = new Map<number, BatchRecord>();
   for (const record of ledger) records.set(record.batch, record);
+  const unwritten = new Map<number, ExportPlan>();
+  for (const plan of plans) if (!records.has(plan.batch)) unwritten.set(plan.batch, plan);
 
   const present = new Map<number, number>();
   const changed = new Set<number>();
@@ -514,16 +556,45 @@ export function summarizeLedger(
 
   // Union of both sides: a record whose items were all deleted still describes a file on disk,
   // and a stamp with no record behind it is a restored project's batch.
-  const numbers = [...new Set([...records.keys(), ...present.keys()])].sort((a, b) => a - b);
+  const numbers = [...new Set([...records.keys(), ...present.keys(), ...unwritten.keys()])]
+    .sort((a, b) => a - b);
   const batches = numbers.map((batch): LedgerBatch => {
     const record = records.get(batch);
+    const plan = unwritten.get(batch);
+    const state: BatchState = plan
+      ? 'waiting'
+      : !record || record.restored
+        ? 'restored'
+        : changed.has(batch)
+          ? 'stale'
+          : 'current';
+    // A plan carries its own numbering; a record carries what it was written with; a batch known
+    // only by its stamps has none, and nothing may invent one — see `blocked` below.
+    const offset = plan ? plan.offset : record?.offset;
+    const numbered = offset !== undefined;
+    const onDisk = state !== 'waiting';
+    const can: BatchAbilities = {
+      download: state === 'waiting' || numbered,
+      select: onDisk && numbered,
+      reshape: onDisk && numbered && state !== 'restored',
+    };
     return {
       batch,
-      shipped: record ? record.count : null,
-      present: present.get(batch) ?? 0,
-      staleness: !record || record.restored ? 'unknown' : changed.has(batch) ? 'stale' : 'current',
-      ...(record ? { offset: record.offset, savedAt: record.savedAt } : null),
+      shipped: plan ? plan.items.length : record ? record.count : null,
+      present: plan ? plan.items.length : present.get(batch) ?? 0,
+      state,
+      // The same fact under the name the reshape guards already read.
+      staleness: state === 'waiting' ? 'current' : state === 'restored' ? 'unknown' : state,
+      ...(numbered ? { offset } : null),
+      ...(record ? { savedAt: record.savedAt } : null),
       ...(record?.fileName ? { fileName: record.fileName } : null),
+      can,
+      ...(can.download
+        ? null
+        : {
+            blocked:
+              'This batch was restored from an earlier session without its file numbering, so it cannot be rebuilt under the same names. The ZIP you already downloaded is still valid.',
+          }),
     };
   });
 
@@ -652,10 +723,10 @@ export function canCombineBatches(
   if (picked.length < 2) return { ok: false, reason: 'Pick two or more batches.' };
   const rows = summary.filter((b) => picked.includes(b.batch));
   if (rows.length !== picked.length) return { ok: false, reason: 'Some picked batches no longer exist.' };
-  if (rows.some((b) => b.offset === undefined)) {
+  if (rows.some((b) => !b.can.select)) {
     return {
       ok: false,
-      reason: 'A batch restored without its file numbering cannot be combined — the ZIP would have to invent names that collide with the one already on disk.',
+      reason: 'Only batches already on disk with known file numbering can be combined — otherwise the ZIP would have to invent names that collide with one already written.',
     };
   }
   const ordered = [...rows].sort((a, b) => (a.offset ?? 0) - (b.offset ?? 0));
@@ -678,7 +749,7 @@ export function canMergeBatches(
   const combinable = canCombineBatches(summary, picked);
   if (!combinable.ok) return combinable;
   const rows = summary.filter((b) => picked.includes(b.batch));
-  if (rows.some((b) => b.staleness === 'unknown')) {
+  if (rows.some((b) => !b.can.reshape)) {
     return {
       ok: false,
       reason: 'Batches restored from a saved file cannot be merged — this session has no record of what shipped in them.',
@@ -748,7 +819,7 @@ export function planSplit(
   alloc: Allocation,
 ): BatchReshape | null {
   const row = summary.find((b) => b.batch === batch);
-  if (!row || row.offset === undefined || row.staleness === 'unknown') return null;
+  if (!row || !row.can.reshape || row.offset === undefined) return null;
   const members = batchItems(items, batch);
   if (at < 1 || at >= members.length) return null;
 

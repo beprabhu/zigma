@@ -43,8 +43,6 @@ export interface BatchModalProps {
   onOpenChange: (open: boolean) => void;
   /** Ascending by batch number — the same rows the rail summarises. */
   batches: readonly LedgerBatch[];
-  /** Batch numbers that are sealed but whose ZIP has never been written. */
-  pendingBatches: ReadonlySet<number>;
   /** The images in a given batch whose picture changed since its ZIP — for the changed list. */
   changedIn: (batch: number) => BgItem[];
   /** Narrows the results grid to one batch. Closing is the caller's job — see onSelect below. */
@@ -74,7 +72,6 @@ export function BatchModal({
   open,
   onOpenChange,
   batches,
-  pendingBatches,
   changedIn,
   onSelect,
   onDownload,
@@ -120,7 +117,7 @@ export function BatchModal({
   const combineReason = pickedList.length >= 2 ? combineBlocked(pickedList) : '';
   const mergeReason = pickedList.length >= 2 ? mergeBlocked(pickedList) : '';
   const blockedReason = combineReason || mergeReason;
-  const staleCount = batches.filter((b) => b.staleness === 'stale').length;
+  const staleCount = batches.filter((b) => b.state === 'stale').length;
 
   const toggle = (batch: number) =>
     setPicked((prev) => {
@@ -152,7 +149,6 @@ export function BatchModal({
               <BatchDetailRow
                 key={entry.batch}
                 entry={entry}
-                pending={pendingBatches.has(entry.batch)}
                 picked={picked.has(entry.batch)}
                 onPick={() => toggle(entry.batch)}
                 expanded={expanded === entry.batch}
@@ -256,7 +252,6 @@ export function BatchModal({
 
 function BatchDetailRow({
   entry,
-  pending,
   picked,
   onPick,
   expanded,
@@ -272,7 +267,6 @@ function BatchDetailRow({
   onConfirmSplit,
 }: {
   entry: LedgerBatch;
-  pending: boolean;
   picked: boolean;
   onPick: () => void;
   expanded: boolean;
@@ -287,26 +281,16 @@ function BatchDetailRow({
   onSplitAtChange: (at: number) => void;
   onConfirmSplit: () => void;
 }) {
-  const stale = entry.staleness === 'stale';
-  const unknown = entry.staleness === 'unknown';
+  const stale = entry.state === 'stale';
+  const pending = entry.state === 'waiting';
+  const unknown = entry.state === 'restored';
   const total = entry.shipped ?? entry.present;
   const missing = total - entry.present;
   // A restored batch cannot be reshaped and has no comparison to show — see the reshape notes in
   // ledger.ts. Its row stays informational rather than offering actions that would have to lie.
-  const reshapeable = !unknown && !pending;
-  /**
-   * Whether a rebuild can name the files the way the ZIP on disk names them. A sealed-but-unsent
-   * batch ships from its open plan; any other needs a known starting number, which only a batch
-   * whose numbering reached disk still has.
-   */
-  const downloadable = pending || entry.offset !== undefined;
-  /**
-   * Whether this row may take part in a multi-batch action. Gated on knowing its file numbers,
-   * NOT on being reshapeable: a restored batch cannot be merged, but it can still be packaged
-   * into one ZIP alongside its neighbours, and gating the checkbox on merge rules made that
-   * impossible even to attempt.
-   */
-  const selectable = !pending && entry.offset !== undefined;
+  // Decided once in summarizeLedger, which is the only thing that sees all three of the places a
+  // batch is recorded. Re-deriving them per surface is what let the rail and this dialog disagree.
+  const { download: downloadable, select: selectable, reshape: reshapeable } = entry.can;
 
   return (
     <div
@@ -375,7 +359,7 @@ function BatchDetailRow({
           onClick={onDownload}
           title={
             !downloadable
-              ? 'This batch was restored from an earlier session without its file numbering, so it cannot be rebuilt under the same names. The ZIP you already downloaded is still valid.'
+              ? entry.blocked ?? 'This batch cannot be rebuilt.'
               : stale
                 ? 'An image changed after this ZIP was built — build it again'
                 : 'Download this batch again'

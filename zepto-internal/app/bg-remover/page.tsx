@@ -104,7 +104,6 @@ import {
   unverifiedUnexported,
   type Allocation, type BatchRecord, type BatchReshape, type ExportPlan,
 } from '@/lib/bg/ledger';
-import type { LedgerBatch } from '@/lib/bg/ledger';
 import { BatchModal } from '@/components/bg-remover/batch-modal';
 import { readParallel } from '@/lib/rate';
 import { createEta } from '@/lib/eta';
@@ -630,8 +629,8 @@ function BgRemoverFile() {
     [items, claimed],
   );
   const ledgerSummary = React.useMemo(
-    () => summarizeLedger(items, ledger, { claimed }),
-    [items, ledger, claimed],
+    () => summarizeLedger(items, ledger, { claimed, plans: openPlans }),
+    [items, ledger, claimed, openPlans],
   );
 
   /**
@@ -641,54 +640,25 @@ function BgRemoverFile() {
    * being invisible until its file exists.
    */
   /** Sealed but never written to disk. They have no record, so they cannot be reshaped. */
-  const pendingBatchNumbers = React.useMemo(
-    () => new Set(openPlans.map((plan) => plan.batch)),
-    [openPlans],
-  );
-
   /**
-   * What the batches dialog lists: the shipped ones AND the sealed ones still waiting for a save.
+   * The rail's rows, projected from the one summary.
    *
-   * summarizeLedger cannot see a waiting batch — a plan is stamped onto its rows and recorded in
-   * the ledger only once the ZIP has actually been written, so before that it exists nowhere but
-   * `openPlans`. The rail's own summary counted them from there and said "1 batch · 1 not
-   * downloaded", while the dialog behind it read the ledger alone and said nothing had been
-   * exported yet, with no row and therefore no Download button. That is precisely the batch that
-   * most needs one: it is finished work that has never reached disk.
+   * Both this and the dialog used to union `ledgerSummary.batches` with `openPlans` themselves,
+   * with slightly different rules — which is exactly how the rail could report "1 batch · 1 not
+   * downloaded" while the dialog said nothing had been exported. summarizeLedger now reads all
+   * three sources, so this only reshapes what it already decided.
    */
-  const modalBatches = React.useMemo(() => {
-    const known = new Set(ledgerSummary.batches.map((b) => b.batch));
-    const waiting = openPlans
-      .filter((plan) => !known.has(plan.batch))
-      .map((plan): LedgerBatch => ({
-        batch: plan.batch,
-        shipped: plan.items.length,
-        present: plan.items.length,
-        // Nothing can have gone stale in a ZIP that was never written.
-        staleness: 'current',
-        offset: plan.offset,
-      }));
-    return [...ledgerSummary.batches, ...waiting].sort((a, b) => a.batch - b.batch);
-  }, [ledgerSummary, openPlans]);
-
-  const batchRows = React.useMemo(() => {
-    const shipped = ledgerSummary.batches.map((b) => ({
-      batch: b.batch,
-      done: b.present,
-      total: b.shipped ?? b.present,
-      downloaded: true,
-      stale: b.staleness === 'stale',
-    }));
-    // No custom label: the list renders its own state chip, and "Batch 1 · ready" beside a
-    // "ready" chip said the same thing twice.
-    const waiting = openPlans.map((plan) => ({
-      batch: plan.batch,
-      done: plan.items.length,
-      total: plan.items.length,
-      downloaded: false,
-    }));
-    return [...shipped, ...waiting].sort((a, b) => a.batch - b.batch);
-  }, [ledgerSummary, openPlans]);
+  const batchRows = React.useMemo(
+    () =>
+      ledgerSummary.batches.map((b) => ({
+        batch: b.batch,
+        done: b.present,
+        total: b.shipped ?? b.present,
+        downloaded: b.state !== 'waiting',
+        stale: b.state === 'stale',
+      })),
+    [ledgerSummary],
+  );
 
   // ---- Run state ----
   const [running, setRunning] = React.useState(false);
@@ -1349,7 +1319,7 @@ function BgRemoverFile() {
      * clean cohort and went out again under different numbers.
      *
      * The union is safe because the only thing that retires a batch is a reshape, and reshaping is
-     * refused for restored batches (canMergeBatches / planSplit both reject `staleness: 'unknown'`)
+     * refused for restored batches (canMergeBatches / planSplit both reject `can.reshape: false`)
      * — so a restored row can never be one this session was supposed to drop.
      */
     const liveBatches = new Set(ledger.map((row) => row.batch));
@@ -3874,8 +3844,7 @@ function BgRemoverFile() {
       <BatchModal
         open={batchesOpen}
         onOpenChange={setBatchesOpen}
-        batches={modalBatches}
-        pendingBatches={pendingBatchNumbers}
+        batches={ledgerSummary.batches}
         changedIn={(batch) => {
           const row = ledger.find((r) => r.batch === batch);
           return row ? changedSince(itemsRef.current, row) : [];
