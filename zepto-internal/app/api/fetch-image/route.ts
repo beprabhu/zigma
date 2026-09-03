@@ -53,6 +53,28 @@ function portOf(url: URL): string {
   return url.port || (url.protocol === 'https:' ? '443' : '80');
 }
 
+/**
+ * The hosts this tool exists to read, trusted by NAME rather than by where they resolve.
+ *
+ * Zepto's own domains land inside 100.64.0.0/10 on the corporate network — shared address space,
+ * which the range check below rightly distrusts for a caller-supplied target. That check asks the
+ * wrong question here: the danger in an SSRF is the caller CHOOSING an internal address, and no
+ * caller can choose what zepto.com resolves to without owning its DNS (the rebinding residual this
+ * route already documents). So these names are settled before any address is looked at.
+ *
+ * It also makes uniform a trust the route was already extending unevenly: the product-page branch
+ * below fetches zepto.com with no check at all, while every other zepto.com URL got the strictest
+ * treatment and was refused.
+ */
+const FIRST_PARTY_HOSTS = new Set([
+  'zepto.com', 'www.zepto.com',
+  'zeptonow.com', 'www.zeptonow.com', 'cdn.zeptonow.com',
+]);
+
+function isFirstParty(host: string): boolean {
+  return FIRST_PARTY_HOSTS.has(host) || host.endsWith('.zeptonow.com');
+}
+
 /** Why `target` must not be fetched, or null when it may be. Resolves names to check them. */
 async function refusal(target: URL, own: URL): Promise<string | null> {
   if (target.protocol !== 'http:' && target.protocol !== 'https:') return 'Only http(s) URLs are proxied';
@@ -62,6 +84,7 @@ async function refusal(target: URL, own: URL): Promise<string | null> {
     // Never itself: pointed at /api the proxy would loop, or spend Azure money on the caller's behalf.
     return target.pathname.startsWith('/api/') ? 'The proxy does not fetch its own API routes' : null;
   }
+  if (isFirstParty(host)) return null;
   if (host === 'localhost' || /\.(localhost|local|internal|home\.arpa)$/.test(host)) {
     return 'Private hosts are not proxied';
   }
