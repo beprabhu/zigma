@@ -104,6 +104,7 @@ import {
   unverifiedUnexported,
   type Allocation, type BatchRecord, type BatchReshape, type ExportPlan,
 } from '@/lib/bg/ledger';
+import type { LedgerBatch } from '@/lib/bg/ledger';
 import { BatchModal } from '@/components/bg-remover/batch-modal';
 import { readParallel } from '@/lib/rate';
 import { createEta } from '@/lib/eta';
@@ -644,6 +645,31 @@ function BgRemoverFile() {
     () => new Set(openPlans.map((plan) => plan.batch)),
     [openPlans],
   );
+
+  /**
+   * What the batches dialog lists: the shipped ones AND the sealed ones still waiting for a save.
+   *
+   * summarizeLedger cannot see a waiting batch — a plan is stamped onto its rows and recorded in
+   * the ledger only once the ZIP has actually been written, so before that it exists nowhere but
+   * `openPlans`. The rail's own summary counted them from there and said "1 batch · 1 not
+   * downloaded", while the dialog behind it read the ledger alone and said nothing had been
+   * exported yet, with no row and therefore no Download button. That is precisely the batch that
+   * most needs one: it is finished work that has never reached disk.
+   */
+  const modalBatches = React.useMemo(() => {
+    const known = new Set(ledgerSummary.batches.map((b) => b.batch));
+    const waiting = openPlans
+      .filter((plan) => !known.has(plan.batch))
+      .map((plan): LedgerBatch => ({
+        batch: plan.batch,
+        shipped: plan.items.length,
+        present: plan.items.length,
+        // Nothing can have gone stale in a ZIP that was never written.
+        staleness: 'current',
+        offset: plan.offset,
+      }));
+    return [...ledgerSummary.batches, ...waiting].sort((a, b) => a.batch - b.batch);
+  }, [ledgerSummary, openPlans]);
 
   const batchRows = React.useMemo(() => {
     const shipped = ledgerSummary.batches.map((b) => ({
@@ -3848,7 +3874,7 @@ function BgRemoverFile() {
       <BatchModal
         open={batchesOpen}
         onOpenChange={setBatchesOpen}
-        batches={ledgerSummary.batches}
+        batches={modalBatches}
         pendingBatches={pendingBatchNumbers}
         changedIn={(batch) => {
           const row = ledger.find((r) => r.batch === batch);
