@@ -25,14 +25,24 @@ const TIMEOUT_MS = 20_000;
 const MAX_BYTES = 20 * 1024 * 1024;
 const MAX_REDIRECTS = 5;
 
+/**
+ * The ranges a caller must not be able to reach through this server.
+ *
+ * 100.64.0.0/10 (RFC 6598 shared address space) is deliberately NOT here, though the textbook
+ * says it should be. On Zepto's network that range is not the internal estate — it is where the
+ * corporate resolver puts the company's own PUBLIC assets: zepto.com answers 100.64.1.8 and the
+ * S3 product-image bucket answers 100.64.1.6, both fetched happily and both refused by an earlier
+ * version of this guard. Blocking it bought nothing an attacker cares about — reaching this
+ * machine's own services means 127/8, and the LAN means RFC 1918, both still refused — while
+ * breaking the single thing the proxy exists to do.
+ */
 function isPrivateV4(ip: string): boolean {
   const [a, b] = ip.split('.').map(Number);
   return (
     a === 0 || a === 10 || a === 127 ||
     (a === 169 && b === 254) ||          // link-local, incl. 169.254.169.254 metadata
     (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 168) ||
-    (a === 100 && b >= 64 && b <= 127)   // carrier-grade NAT
+    (a === 192 && b === 168)
   );
 }
 
@@ -54,6 +64,31 @@ function portOf(url: URL): string {
 }
 
 /**
+ * The image this actually is, read from its first bytes, or null if it is not one.
+ *
+ * A stored object's declared type cannot be trusted: Zepto's S3 bucket serves genuine JPEGs as
+ * `binary/octet-stream`, which is S3's default for anything uploaded without a type. Refusing on
+ * the label alone rejected real product photos; accepting the label alone would let this route
+ * hand back a page of HTML. The signature is the thing that is actually true.
+ */
+function sniffImageType(bytes: Uint8Array): string | null {
+  const b = bytes;
+  if (b.length < 12) return null;
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'image/jpeg';
+  if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return 'image/png';
+  if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return 'image/gif';
+  if (b[0] === 0x42 && b[1] === 0x4d) return 'image/bmp';
+  const ascii = (at: number, s: string) => [...s].every((c, i) => b[at + i] === c.charCodeAt(0));
+  if (ascii(0, 'RIFF') && ascii(8, 'WEBP')) return 'image/webp';
+  // ISO-BMFF: AVIF and HEIC both carry their brand at offset 4.
+  if (ascii(4, 'ftyp')) {
+    if (ascii(8, 'avif') || ascii(8, 'avis')) return 'image/avif';
+    if (ascii(8, 'heic') || ascii(8, 'heix') || ascii(8, 'mif1')) return 'image/heic';
+  }
+  return null;
+}
+
+/**
  * The hosts this tool exists to read, trusted by NAME rather than by where they resolve.
  *
  * Zepto's own domains land inside 100.64.0.0/10 on the corporate network — shared address space,
@@ -71,8 +106,15 @@ const FIRST_PARTY_HOSTS = new Set([
   'zeptonow.com', 'www.zeptonow.com', 'cdn.zeptonow.com',
 ]);
 
+/**
+ * The catalogue's images are served from an S3 bucket as well as the CDN — real sheets carry
+ * `prod-zepto-public-assets.s3.<region>.amazonaws.com` URLs — so the bucket is first-party too.
+ * Matched on the bucket name rather than a bare amazonaws.com suffix, which would hand every S3
+ * bucket on earth a pass through the guard.
+ */
 function isFirstParty(host: string): boolean {
-  return FIRST_PARTY_HOSTS.has(host) || host.endsWith('.zeptonow.com');
+  if (FIRST_PARTY_HOSTS.has(host) || host.endsWith('.zeptonow.com')) return true;
+  return /^prod-zepto-[a-z0-9-]+\.s3\.[a-z0-9-]+\.amazonaws\.com$/.test(host);
 }
 
 /** Why `target` must not be fetched, or null when it may be. Resolves names to check them. */
@@ -166,12 +208,14 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ error: `Upstream ${upstream.status} for ${target.href}` }, { status: 502 });
     }
 
-    // An image proxy returns images. octet-stream is tolerated because some CDNs label images
-    // that way, and a browser sniffs an <img> body regardless; HTML, JSON and the rest are not.
+    // An image proxy returns images. A type that names something else — HTML, JSON — is refused on
+    // the spot; an octet-stream or a missing type is UNDECIDED and settled by the bytes below,
+    // because that is what a store with no type recorded against the object sends.
     const type = (upstream.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
-    if (!type.startsWith('image/') && type !== 'application/octet-stream') {
+    const undecided = !type || type.endsWith('/octet-stream');
+    if (!type.startsWith('image/') && !undecided) {
       await upstream.body?.cancel();
-      return NextResponse.json({ error: `Not an image (${type || 'no content type'})` }, { status: 415 });
+      return NextResponse.json({ error: `Not an image (${type})` }, { status: 415 });
     }
     const declared = Number(upstream.headers.get('content-length'));
     if (declared > MAX_BYTES) {
@@ -202,10 +246,18 @@ export async function GET(req: NextRequest) {
       body.set(chunk, offset);
       offset += chunk.byteLength;
     }
+    const sniffed = sniffImageType(body);
+    if (undecided && !sniffed) {
+      return NextResponse.json(
+        { error: `Not an image (${type || 'no content type'}, and the bytes are not one either)` },
+        { status: 415 },
+      );
+    }
     return new NextResponse(body.buffer, {
       status: 200,
       headers: {
-        'Content-Type': type || 'application/octet-stream',
+        // The sniffed type wins over an undecided label, so the browser is told what it truly got.
+        'Content-Type': sniffed && undecided ? sniffed : type,
         'Cache-Control': 'no-store',
         // The body depends on the caller's Accept (see above), so no cache may serve one client's
         // format to another.
