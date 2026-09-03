@@ -47,6 +47,16 @@ export interface ExportedBatch {
   exportedAt: number;
   /** What the ZIP was saved as. Display only. */
   fileName: string;
+  /**
+   * Where this batch's file numbers begin, and how many it wrote — the two facts a reopened file
+   * needs to hand the same names back.
+   *
+   * Both optional because files written before this existed have neither, and a batch restored
+   * without them can still be listed; it just cannot be downloaded again, because guessing a
+   * starting number would write a ZIP whose names collide with the one already on disk.
+   */
+  offset?: number;
+  count?: number;
 }
 
 /**

@@ -97,7 +97,8 @@ import { parseCSV } from '@/lib/csv';
 import { buildRowPrompt } from '@/lib/row-prompt';
 import { BatchList } from '@/components/bg-remover/batch-list';
 import {
-  DEFAULT_SEAL_SIZE, applyReshape, batchItems, canMergeBatches, changedSince, cleanUnexported,
+  DEFAULT_SEAL_SIZE, applyReshape, batchItems, canCombineBatches,
+  canMergeBatches, changedSince, cleanUnexported,
   nextAllocation, planCombined, planExport, planFinalSeal, planMerge, planReexport, planSeal,
   planSplit, recordBatch, remainingUnexported, reshapeRecords, stampBatch, summarizeLedger,
   unverifiedUnexported,
@@ -474,6 +475,32 @@ function BgRemoverFile() {
       if (restored.length) {
         setItems((prev) => (prev.length ? [...prev, ...restored] : restored));
       }
+
+      /**
+       * The batches themselves, not just the stamps they left on the rows.
+       *
+       * Without this the stamps came back but `ledger` stayed empty, so every batch listed itself
+       * as "restored, contents unverified" and its Download button quietly did nothing — there was
+       * no record for planReexport to take an offset from. A row that stored its numbering can be
+       * rebuilt into a real record and downloaded again; one written before that numbering was
+       * stored cannot, because inventing a starting number would write a ZIP whose file names
+       * collide with the one already on disk. Those stay listed and un-downloadable, which is at
+       * least the truth.
+       */
+      const rebuilt = storedLedger
+        .filter((row) => typeof row.offset === 'number')
+        .map((row) => ({
+          batch: row.batch,
+          offset: row.offset as number,
+          count: row.count ?? row.ids.length,
+          savedAt: row.exportedAt,
+          ...(row.fileName ? { fileName: row.fileName } : null),
+          // Blob identity cannot survive a reload, so nothing here can be verified as unchanged.
+          shipped: new WeakSet<Blob>(),
+          restored: true,
+        }))
+        .sort((a, b) => a.batch - b.batch);
+      if (rebuilt.length) setLedger((prev) => (prev.length ? prev : rebuilt));
       const sheet = loaded.meta[CSV_KEY] as ProjectCsv | undefined;
       // Never displaces a sheet this session already has.
       if (sheet?.text) setCsvInfo((prev) => prev ?? csvInfoFromSheet(sheet));
@@ -1271,9 +1298,18 @@ function BgRemoverFile() {
     ledgerMirrored.current = true;
     const live = ledger.map((row) => ({
       batch: row.batch,
-      ids: batchIdsRef.current.get(row.batch) ?? [],
+      // Restored rows now sit in `ledger` too, and their ids live in the doc's batchIds map. If
+      // that map is ever missing one, fall back to the stored row rather than writing [] — an
+      // empty id list is what makes the next reload strip the stamps and re-ship the images.
+      ids:
+        batchIdsRef.current.get(row.batch)
+        ?? restoredLedgerRef.current.find((r) => r.batch === row.batch)?.ids
+        ?? [],
       exportedAt: row.savedAt,
       fileName: row.fileName ?? '',
+      // The numbering, so reopening the file can offer the same ZIP again under the same names.
+      offset: row.offset,
+      count: row.count,
     }));
     /**
      * Batches this session never wrote, carried forward verbatim.
@@ -3822,6 +3858,7 @@ function BgRemoverFile() {
         onDownload={(batch) => downloadBatch(batch)}
         onDownloadTogether={(picked) => void downloadTogether(picked)}
         mergeBlocked={(picked) => canMergeBatches(ledgerSummary.batches, picked).reason}
+        combineBlocked={(picked) => canCombineBatches(ledgerSummary.batches, picked).reason}
         previewMerge={(picked) => planMerge(itemsRef.current, ledgerSummary.batches, picked, allocate())}
         previewSplit={(batch, at) => planSplit(itemsRef.current, ledgerSummary.batches, batch, at, allocate())}
         onMerge={(picked) => {

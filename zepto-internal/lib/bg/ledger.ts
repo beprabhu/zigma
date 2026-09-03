@@ -382,6 +382,15 @@ export interface BatchRecord {
    * still holding, and a blob no item holds can never be the answer to any question asked below.
    */
   shipped: WeakSet<Blob>;
+  /**
+   * True for a record rebuilt from the stored ledger rather than written by this session.
+   *
+   * Its `shipped` set is necessarily empty — a WeakSet of Blob identities cannot survive a
+   * reload — so the staleness check below would read every member as changed and tell the user
+   * 133 files need re-downloading, which is not something we know. Restored rows report
+   * 'unknown' instead, which is the true answer and the one reshaping already refuses to act on.
+   */
+  restored?: boolean;
 }
 
 /**
@@ -490,7 +499,7 @@ export function summarizeLedger(
       // is also the answer to what happens to an item edited AFTER it shipped — it stays stamped
       // and out of every cohort, and its batch goes stale, because re-exporting the batch (not
       // sneaking the item into a later one) is what keeps the ZIPs a partition of the queue.
-      if (record && (item.cutout === null || !record.shipped.has(item.cutout.blob))) {
+      if (record && !record.restored && (item.cutout === null || !record.shipped.has(item.cutout.blob))) {
         changed.add(batch);
       }
       continue;
@@ -512,7 +521,7 @@ export function summarizeLedger(
       batch,
       shipped: record ? record.count : null,
       present: present.get(batch) ?? 0,
-      staleness: !record ? 'unknown' : changed.has(batch) ? 'stale' : 'current',
+      staleness: !record || record.restored ? 'unknown' : changed.has(batch) ? 'stale' : 'current',
       ...(record ? { offset: record.offset, savedAt: record.savedAt } : null),
       ...(record?.fileName ? { fileName: record.fileName } : null),
     };
@@ -626,14 +635,50 @@ export interface ReshapeCheck {
  * have gaps, and what actually has to be contiguous is the run of files, since that is what the
  * merged offset has to cover exactly.
  */
+/**
+ * Whether these batches can go into ONE ZIP that keeps every file's existing number.
+ *
+ * Numbering facts only. Packaging asks a smaller question than merging does: it needs to know
+ * where each batch's numbers start and that together they cover one unbroken run, and nothing
+ * more. Whether the pictures still match the ZIP already on disk is not its business — a stale
+ * batch is combinable for the same reason it is re-downloadable, and so is a restored one whose
+ * numbering survived. Merging is the one that additionally needs to trust the contents, because
+ * it rewrites the records for good.
+ */
+export function canCombineBatches(
+  summary: readonly LedgerBatch[],
+  picked: readonly number[],
+): ReshapeCheck {
+  if (picked.length < 2) return { ok: false, reason: 'Pick two or more batches.' };
+  const rows = summary.filter((b) => picked.includes(b.batch));
+  if (rows.length !== picked.length) return { ok: false, reason: 'Some picked batches no longer exist.' };
+  if (rows.some((b) => b.offset === undefined)) {
+    return {
+      ok: false,
+      reason: 'A batch restored without its file numbering cannot be combined — the ZIP would have to invent names that collide with the one already on disk.',
+    };
+  }
+  const ordered = [...rows].sort((a, b) => (a.offset ?? 0) - (b.offset ?? 0));
+  for (let i = 1; i < ordered.length; i++) {
+    const prev = ordered[i - 1];
+    if ((ordered[i].offset ?? 0) !== (prev.offset ?? 0) + (prev.shipped ?? prev.present)) {
+      return {
+        ok: false,
+        reason: 'Only batches whose file numbers run back to back can be combined — otherwise the ZIP would renumber over files another batch already owns.',
+      };
+    }
+  }
+  return { ok: true, reason: '' };
+}
+
 export function canMergeBatches(
   summary: readonly LedgerBatch[],
   picked: readonly number[],
 ): ReshapeCheck {
-  if (picked.length < 2) return { ok: false, reason: 'Pick at least two batches to merge.' };
+  const combinable = canCombineBatches(summary, picked);
+  if (!combinable.ok) return combinable;
   const rows = summary.filter((b) => picked.includes(b.batch));
-  if (rows.length !== picked.length) return { ok: false, reason: 'Some picked batches no longer exist.' };
-  if (rows.some((b) => b.staleness === 'unknown' || b.offset === undefined)) {
+  if (rows.some((b) => b.staleness === 'unknown')) {
     return {
       ok: false,
       reason: 'Batches restored from a saved file cannot be merged — this session has no record of what shipped in them.',
@@ -801,15 +846,21 @@ export function planCombined(
   summary: readonly LedgerBatch[],
   picked: readonly number[],
 ): ExportPlan | null {
-  if (!canMergeBatches(summary, picked).ok) return null;
+  if (!canCombineBatches(summary, picked).ok) return null;
   const rows = summary.filter((b) => picked.includes(b.batch));
   const offset = Math.min(...rows.map((b) => b.offset ?? 0));
-  const pickedSet = new Set(picked);
+  const startOf = new Map(rows.map((b) => [b.batch, b.offset ?? 0]));
   const members = items.filter(
     (item): item is CutoutItem =>
-      typeof item.batch === 'number' && pickedSet.has(item.batch) && isShippable(item),
+      typeof item.batch === 'number' && startOf.has(item.batch) && isShippable(item),
   );
   if (!members.length) return null;
+  // Ordered by the batch's own starting number, not by where the rows happen to sit in the queue.
+  // exportItems names files positionally (offset + index + 1), so a queue where batch 3's images
+  // precede batch 2's would have written each of them under the other's number — and the promise
+  // this action makes is that every file keeps the name it already has. Stable within a batch, so
+  // members keep their relative order there.
+  members.sort((a, b) => (startOf.get(a.batch as number) ?? 0) - (startOf.get(b.batch as number) ?? 0));
   return { batch: Math.min(...picked), offset, items: members };
 }
 
