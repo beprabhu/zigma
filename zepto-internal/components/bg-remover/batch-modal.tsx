@@ -54,6 +54,8 @@ export interface BatchModalProps {
   onDownloadTogether: (batches: number[]) => void;
   /** Null when the pick cannot be merged; the string is the reason to show. */
   mergeBlocked: (batches: number[]) => string;
+  /** The same, for packaging several batches into one ZIP — a weaker test than merging. */
+  combineBlocked: (batches: number[]) => string;
   onMerge: (batches: number[]) => void;
   onSplit: (batch: number, at: number) => void;
   /** What a reshape would cost, for the confirm step. Null when the pick is invalid. */
@@ -78,6 +80,7 @@ export function BatchModal({
   onDownload,
   onDownloadTogether,
   mergeBlocked,
+  combineBlocked,
   onMerge,
   onSplit,
   previewMerge,
@@ -111,7 +114,12 @@ export function BatchModal({
     const live = new Set(batches.map((b) => b.batch));
     return [...picked].filter((batch) => live.has(batch)).sort((a, b) => a - b);
   }, [picked, batches]);
-  const blockedReason = pickedList.length >= 2 ? mergeBlocked(pickedList) : '';
+  // Two different questions: packaging needs the numbering to line up, merging needs that AND a
+  // record of what shipped. Sharing one reason disabled Download together for restored batches it
+  // could have handled, and explained the refusal in merge terms.
+  const combineReason = pickedList.length >= 2 ? combineBlocked(pickedList) : '';
+  const mergeReason = pickedList.length >= 2 ? mergeBlocked(pickedList) : '';
+  const blockedReason = combineReason || mergeReason;
   const staleCount = batches.filter((b) => b.staleness === 'stale').length;
 
   const toggle = (batch: number) =>
@@ -183,11 +191,15 @@ export function BatchModal({
           />
         </div>
 
-        <DialogFooter className="shrink-0 flex-col items-stretch gap-2 border-t px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+        {/* mx-0/mb-0 undo DialogFooter's built-in -mx-4 -mb-4. Those exist to let a footer bleed to
+            the edge of a dialog whose body carries the padding; this one sets p-0 on the content
+            and pads each section itself, so the negative margins only pulled the footer 16px left
+            of the header and the rows above it. */}
+        <DialogFooter className="shrink-0 mx-0 mb-0 flex-col items-stretch gap-2 border-t px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
           <span className="text-xs text-muted-foreground">
             {pickedList.length
               ? `${n(pickedList.length)} selected`
-              : 'Select batches to download them as one ZIP, or to merge them.'}
+              : 'Select two or more batches to download them as one ZIP, or to merge them.'}
           </span>
           <div className="flex flex-wrap items-center gap-2">
             {/* The reason lives beside the disabled buttons rather than inside a tooltip on
@@ -201,23 +213,25 @@ export function BatchModal({
             <Button
               variant="outline"
               size="sm"
-              disabled={pickedList.length < 2 || !!blockedReason || busy}
+              disabled={pickedList.length < 2 || !!combineReason || busy}
               onClick={() => onDownloadTogether(pickedList)}
+              title="One ZIP holding these batches. Every file keeps the number it already has, and no batch record changes."
             >
               <DownloadIcon data-icon="inline-start" />
-              Download together
+              Download as one ZIP
             </Button>
             <Button
               variant="outline"
               size="sm"
-              disabled={pickedList.length < 2 || !!blockedReason || busy}
+              disabled={pickedList.length < 2 || !!mergeReason || busy}
+              title="Replace these batches with a single one. Permanent, and it can renumber files — the next step says how many."
               onClick={() => {
                 const reshape = previewMerge(pickedList);
                 if (reshape) setConfirm({ kind: 'merge', batches: pickedList, reshape });
               }}
             >
               <CombineIcon data-icon="inline-start" />
-              Merge
+              Merge into one batch
             </Button>
           </div>
         </DialogFooter>
@@ -280,6 +294,19 @@ function BatchDetailRow({
   // A restored batch cannot be reshaped and has no comparison to show — see the reshape notes in
   // ledger.ts. Its row stays informational rather than offering actions that would have to lie.
   const reshapeable = !unknown && !pending;
+  /**
+   * Whether a rebuild can name the files the way the ZIP on disk names them. A sealed-but-unsent
+   * batch ships from its open plan; any other needs a known starting number, which only a batch
+   * whose numbering reached disk still has.
+   */
+  const downloadable = pending || entry.offset !== undefined;
+  /**
+   * Whether this row may take part in a multi-batch action. Gated on knowing its file numbers,
+   * NOT on being reshapeable: a restored batch cannot be merged, but it can still be packaged
+   * into one ZIP alongside its neighbours, and gating the checkbox on merge rules made that
+   * impossible even to attempt.
+   */
+  const selectable = !pending && entry.offset !== undefined;
 
   return (
     <div
@@ -293,7 +320,7 @@ function BatchDetailRow({
       <div className="flex items-center gap-2 px-2.5 py-2">
         <Checkbox
           checked={picked}
-          disabled={!reshapeable || busy}
+          disabled={!selectable || busy}
           onCheckedChange={onPick}
           aria-label={`Select batch ${entry.batch}`}
         />
@@ -316,7 +343,7 @@ function BatchDetailRow({
             {entry.offset !== undefined && ` · numbered ${n(entry.offset + 1)}–${n(entry.offset + total)}`}
             {missing > 0 && ` · ${n(missing)} deleted since`}
             {pending && ' · not downloaded yet'}
-            {unknown && ' · restored, contents unverified'}
+            {unknown && (downloadable ? ' · restored, contents unverified' : ' · restored from an earlier session')}
           </span>
         </button>
 
@@ -337,13 +364,22 @@ function BatchDetailRow({
             <ScissorsIcon className="size-3.5" />
           </Button>
         )}
+        {/* A batch whose numbering was never stored cannot be rebuilt: its file names would have
+            to start somewhere, and any guess collides with the ZIP already on disk. It used to be
+            offered anyway and the click did nothing at all — a dead control that looked live. */}
         <Button
           variant={stale ? 'default' : 'outline'}
           size="xs"
           className="shrink-0"
-          disabled={downloading || busy}
+          disabled={downloading || busy || !downloadable}
           onClick={onDownload}
-          title={stale ? 'An image changed after this ZIP was built — build it again' : 'Download this batch again'}
+          title={
+            !downloadable
+              ? 'This batch was restored from an earlier session without its file numbering, so it cannot be rebuilt under the same names. The ZIP you already downloaded is still valid.'
+              : stale
+                ? 'An image changed after this ZIP was built — build it again'
+                : 'Download this batch again'
+          }
         >
           {downloading ? (
             <Spinner data-icon="inline-start" />
